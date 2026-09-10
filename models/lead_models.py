@@ -1,6 +1,9 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
+
+LeadStatus = Literal["new", "contacted", "qualified", "converted", "lost"]
+LEAD_STATUSES = ("new", "contacted", "qualified", "converted", "lost")
 
 
 class LeadCreate(BaseModel):
@@ -17,6 +20,19 @@ class LeadCreate(BaseModel):
         extra = "ignore"
 
 
+class LeadOtpSendBody(BaseModel):
+    phone: str = Field(..., min_length=10, max_length=20)
+
+
+class LeadOtpVerifyBody(BaseModel):
+    phone: str = Field(..., min_length=10, max_length=20)
+    otp: str = Field(..., min_length=4, max_length=8)
+
+
+class LeadStatusUpdate(BaseModel):
+    status: LeadStatus
+
+
 class LeadResponse(BaseModel):
     id: str
     name: str
@@ -26,4 +42,5 @@ class LeadResponse(BaseModel):
     source: Optional[str] = None
     branch_id: Optional[str] = None
     branch_name: Optional[str] = None
+    status: LeadStatus = "new"
     created_at: datetime
