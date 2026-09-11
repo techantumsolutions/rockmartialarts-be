@@ -44,6 +44,7 @@ from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
 from routes.upload_routes import router as upload_router
 from routes.cms_routes import router as cms_router
+from routes.camp_registration_routes import router as camp_registration_router
 from routes.homepage_content_routes import router as homepage_content_router
 from routes.achievement_routes import router as achievement_router
 from routes.student_testimonial_routes import router as student_testimonial_router
@@ -262,6 +263,7 @@ app.include_router(attendance_router, prefix="/api/attendance", tags=["Attendanc
 app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches with Courses"])
 app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
+app.include_router(camp_registration_router, prefix="/api/camp-registrations", tags=["Camp Registrations"])
 app.include_router(homepage_content_router, prefix="/api/homepage", tags=["Homepage Content"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
 app.include_router(student_testimonial_router, prefix="/api/testimonials", tags=["Marketing Testimonials"])
