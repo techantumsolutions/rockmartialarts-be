@@ -8,6 +8,14 @@ from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.course_hierarchy import (
+    UUID_RE,
+    assert_course_hierarchy,
+    courses_for_category_query,
+    ensure_course_slug,
+    name_slug,
+)
+from utils.branch_courses import available_course_ids_for_branch, assert_course_available_at_branch
 from controllers.student_showcase_achievement_controller import list_for_course_with_fallback
 
 logger = logging.getLogger(__name__)
@@ -264,7 +272,17 @@ class CourseController:
         if existing_course:
             raise HTTPException(status_code=400, detail=f"A course with the name '{course_data.title}' already exists")
 
-        course = Course(**course_data.dict())
+        category_id, sub_category = await assert_course_hierarchy(
+            db, course_data.category_id, course_data.sub_category
+        )
+        payload = course_data.dict()
+        payload["category_id"] = category_id
+        payload["sub_category"] = sub_category
+        payload["slug"] = await ensure_course_slug(
+            db, course_data.title, existing_slug=payload.get("slug")
+        )
+
+        course = Course(**payload)
 
         # Store the course with nested structure exactly as provided
         course_dict = course.dict()
@@ -292,7 +310,8 @@ class CourseController:
         if active_only:
             filter_query["settings.active"] = True
         if category_id:
-            filter_query["category_id"] = category_id
+            cat_query = await courses_for_category_query(db, category_id)
+            filter_query["$or"] = cat_query["$or"]
         if difficulty_level:
             filter_query["difficulty_level"] = difficulty_level
         if instructor_id:
@@ -415,6 +434,27 @@ class CourseController:
         return serialize_doc(course)
 
     @staticmethod
+    async def get_public_course_by_slug(slug: str):
+        """Public course lookup by slug, with id / title / code fallback for existing URLs."""
+        db = get_db()
+        value = (slug or "").strip()
+        if not value:
+            raise HTTPException(status_code=404, detail="Course not found")
+
+        lowered = value.lower()
+        course = await db.courses.find_one({"slug": lowered, "settings.active": True})
+        if not course and UUID_RE.match(value):
+            course = await db.courses.find_one({"id": value, "settings.active": True})
+        if not course:
+            candidates = await db.courses.find({"settings.active": True}).to_list(500)
+            by_title = next((item for item in candidates if name_slug(item.get("title")) == lowered), None)
+            by_code = next((item for item in candidates if name_slug(item.get("code")) == lowered), None)
+            course = by_title or by_code
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+        return await CourseController.get_public_course_detail(course["id"])
+
+    @staticmethod
     async def get_courses_by_branch(
         branch_id: str,
         current_user: dict = None
@@ -447,8 +487,8 @@ class CourseController:
             if not branch:
                 raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
 
-            # Get course IDs assigned to this branch
-            course_ids = branch.get("assignments", {}).get("courses", [])
+            # Get course IDs assigned and available at this branch
+            course_ids = await available_course_ids_for_branch(db, branch)
 
             if not course_ids:
                 return {"courses": [], "total": 0}
@@ -596,6 +636,27 @@ class CourseController:
             })
             if title_conflict:
                 raise HTTPException(status_code=400, detail=f"A course with the name '{update_data['title']}' already exists")
+
+        if "category_id" in update_data or "sub_category" in update_data:
+            cat_id = update_data.get("category_id") or existing_course.get("category_id")
+            sub_id = update_data["sub_category"] if "sub_category" in update_data else existing_course.get("sub_category")
+            cat_id, sub_id = await assert_course_hierarchy(db, cat_id, sub_id)
+            update_data["category_id"] = cat_id
+            update_data["sub_category"] = sub_id
+
+        if update_data.get("slug"):
+            update_data["slug"] = await ensure_course_slug(
+                db,
+                update_data.get("title") or existing_course.get("title") or "course",
+                exclude_id=course_id,
+                existing_slug=update_data.get("slug"),
+            )
+        elif not existing_course.get("slug"):
+            update_data["slug"] = await ensure_course_slug(
+                db,
+                update_data.get("title") or existing_course.get("title") or "course",
+                exclude_id=course_id,
+            )
 
         # When pricing is updated, set base_fee / fee_per_duration / branch_pricing for payment API
         if "pricing" in update_data:
@@ -751,6 +812,12 @@ class CourseController:
                 "assignments.courses": course["id"],
                 "is_active": True
             }).to_list(length=100)
+            available_branches = []
+            for branch in branches:
+                allowed = await available_course_ids_for_branch(db, branch)
+                if course["id"] in allowed:
+                    available_branches.append(branch)
+            branches = available_branches
 
             # Get instructor assignments (coaches assigned to this course)
             instructors = await db.coaches.find({
@@ -833,6 +900,12 @@ class CourseController:
             "assignments.courses": course_id,
             "is_active": True
         }).to_list(length=100)
+        available_branches = []
+        for b in branches:
+            allowed = await available_course_ids_for_branch(db, b)
+            if course_id in allowed:
+                available_branches.append(b)
+        branches = available_branches
         instructors = await db.coaches.find({
             "is_active": True,
             "$or": [
@@ -903,13 +976,26 @@ class CourseController:
             course_id, fallback_branch_id=fallback_branch_id, limit=30
         )
 
-        branches_offering = [
-            {
+        branches_offering = []
+        for b in branches:
+            info = b.get("branch") or {}
+            addr = info.get("address") or {}
+            name = info.get("name") or b.get("name") or "Branch"
+            area = (addr.get("area") or "").strip()
+            city = (addr.get("city") or "").strip()
+            location = ", ".join([p for p in (area, city) if p]) or name
+            slug = (b.get("slug") or name_slug(name) or b.get("id") or "").strip().lower()
+            branches_offering.append({
                 "id": b["id"],
-                "name": (b.get("branch") or {}).get("name") or b.get("name") or "Branch",
-            }
-            for b in branches
-        ]
+                "branch_id": b["id"],
+                "name": name,
+                "branch_name": name,
+                "slug": slug,
+                "location": location,
+                "area": area,
+                "city": city,
+                "state": (addr.get("state") or "").strip(),
+            })
 
         assigned_coaches = []
         for instructor in instructors:
@@ -929,9 +1015,44 @@ class CourseController:
         serialized_course = serialize_doc(course)
         CourseController._attach_public_about_fields(serialized_course)
         serialized_course.pop("description", None)
+        stored_slug = (course.get("slug") or name_slug(course.get("title") or course.get("code")) or course["id"]).strip().lower()
+        serialized_course["slug"] = stored_slug
+        serialized_course["branch_assignments"] = [
+            {
+                "branch_id": item["branch_id"],
+                "branch_name": item["branch_name"],
+                "location": item.get("location") or "",
+            }
+            for item in branches_offering
+        ]
+        serialized_course["branches_offering"] = branches_offering
+
+        category_payload = None
+        category_id = course.get("category_id")
+        if category_id:
+            category = await db.categories.find_one({"id": category_id, "is_active": True})
+            if category:
+                category_payload = {
+                    "id": category["id"],
+                    "name": category.get("name"),
+                    "slug": (category.get("slug") or name_slug(category.get("name")) or category["id"]).strip().lower(),
+                }
+        serialized_course["category"] = category_payload
+
+        durations = await db.durations.find({"is_active": True}).sort("display_order", 1).to_list(100)
+        serialized_course["available_durations"] = [
+            {
+                "id": d.get("id"),
+                "name": d.get("name"),
+                "duration_months": d.get("duration_months"),
+                "code": d.get("code"),
+            }
+            for d in durations
+        ]
 
         return {
             "course": serialized_course,
+            "category": category_payload,
             "statistics": statistics,
             "curriculum": curriculum,
             "enrolled_students": enrolled_students,
@@ -953,9 +1074,9 @@ class CourseController:
         branch = await db.branches.find_one({"id": branch_id, "is_active": True})
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
-        course_ids = (branch.get("assignments") or {}).get("courses") or []
-        if course_id not in course_ids:
-            raise HTTPException(status_code=400, detail="Course not offered at this branch")
+        await assert_course_available_at_branch(
+            db, branch_id, course_id, require_active_branch=False, require_active_course=True
+        )
 
         branch_name = (branch.get("branch") or {}).get("name") or branch.get("name") or "Branch"
         timings_list = (branch.get("operational_details") or {}).get("timings") or []
@@ -1009,7 +1130,7 @@ class CourseController:
         branch = await db.branches.find_one({"id": branch_id, "is_active": True})
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
-        course_ids = branch.get("assignments", {}).get("courses", [])
+        course_ids = await available_course_ids_for_branch(db, branch)
         if not course_ids:
             timings = (branch.get("operational_details") or {}).get("timings", [])
             return {"courses": [], "branch_timings": timings}
@@ -1089,12 +1210,15 @@ class CourseController:
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
 
-        # Build query
-        query = {"category_id": category_id}
+        # Build query (include courses linked via child subcategories)
+        query = await courses_for_category_query(db, category_id)
+        extra = {}
         if difficulty_level:
-            query["difficulty_level"] = difficulty_level
+            extra["difficulty_level"] = difficulty_level
         if active_only:
-            query["settings.active"] = True
+            extra["settings.active"] = True
+        if extra:
+            query = {"$and": [query, extra]}
 
         # Apply pagination
         if limit > 100:
@@ -1134,6 +1258,9 @@ class CourseController:
 
             location_map = {}
             for branch in branches:
+                allowed = await available_course_ids_for_branch(db, branch)
+                if course["id"] not in allowed:
+                    continue
                 city = branch["branch"]["address"]["city"]
                 if city not in location_map:
                     # Try to find location record
@@ -1153,6 +1280,7 @@ class CourseController:
                 "id": course["id"],
                 "title": course["title"],
                 "code": course["code"],
+                "slug": course.get("slug"),
                 "description": course["description"],
                 "difficulty_level": course["difficulty_level"],
                 "pricing": {
@@ -1219,7 +1347,7 @@ class CourseController:
         branch_course_map = {}
 
         for branch in branches:
-            branch_courses = branch.get("assignments", {}).get("courses", [])
+            branch_courses = await available_course_ids_for_branch(db, branch)
             course_ids.update(branch_courses)
 
             for course_id in branch_courses:
@@ -1235,7 +1363,8 @@ class CourseController:
         # Build course query
         course_query = {"id": {"$in": list(course_ids)}}
         if category_id:
-            course_query["category_id"] = category_id
+            cat_query = await courses_for_category_query(db, category_id)
+            course_query = {"$and": [course_query, cat_query]}
         if difficulty_level:
             course_query["difficulty_level"] = difficulty_level
         if active_only:

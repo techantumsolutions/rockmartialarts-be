@@ -7,6 +7,20 @@ from models.branch_models import BranchCreate, BranchUpdate, Branch
 from models.holiday_models import HolidayCreate, Holiday
 from models.user_models import UserRole
 from utils.auth import require_role, get_current_active_user
+from utils.branch_geography import (
+    apply_city_to_branch_doc,
+    assert_unique_branch_code,
+    ensure_unique_branch_slug,
+    is_uuid,
+    public_branch_discovery_query,
+    resolve_city_for_write,
+)
+from utils.branch_courses import (
+    available_course_ids_for_branch,
+    prepare_assignments_for_write,
+    sync_branch_courses_from_assignments,
+)
+from utils.course_hierarchy import name_slug
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.student_branch_sync import count_students_for_branch
@@ -75,12 +89,26 @@ class BranchController:
             raise HTTPException(status_code=401, detail="Authentication required")
             
         db = get_db()
-        branch = Branch(**branch_data.dict())
+        payload = branch_data.dict()
+        city, state = await resolve_city_for_write(db, payload.get("location_id"))
+        apply_city_to_branch_doc(payload, city, state)
+        code = ((payload.get("branch") or {}).get("code") or "").strip()
+        await assert_unique_branch_code(db, code)
+        name = ((payload.get("branch") or {}).get("name") or "").strip()
+        payload["slug"] = await ensure_unique_branch_slug(
+            db, name, existing_slug=payload.get("slug")
+        )
+        payload["allows_collaboration"] = bool(payload.get("allows_collaboration", False))
+        if isinstance(payload.get("assignments"), dict):
+            payload["assignments"] = prepare_assignments_for_write(payload.get("assignments"))
+
+        branch = Branch(**payload)
         
         # Store the branch with nested structure exactly as provided
         branch_dict = branch.dict()
         
         await db.branches.insert_one(branch_dict)
+        await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
         return {"message": "Branch created successfully", "branch_id": branch.id}
 
     @staticmethod
@@ -194,43 +222,10 @@ class BranchController:
         # Get total count
         total = await db.branches.count_documents(query)
 
-        # Format branches for public consumption (include operational_details + assignments for detail page)
         formatted_branches = []
         for branch in branches:
             await _enrich_course_schedule_trainers(db, branch)
-            branch_info = branch.get("branch") or {}
-            operational = branch.get("operational_details") or {}
-            assignments = branch.get("assignments") or {}
-            formatted_branch = {
-                "id": branch.get("id"),
-                "name": branch_info.get("name"),
-                "code": branch_info.get("code"),
-                "email": branch_info.get("email"),
-                "phone": branch_info.get("phone"),
-                "address": branch_info.get("address", {}),
-                "branch": {
-                    "name": branch_info.get("name"),
-                    "code": branch_info.get("code"),
-                    "email": branch_info.get("email"),
-                    "phone": branch_info.get("phone"),
-                    "address": branch_info.get("address", {}),
-                },
-                "location_id": branch.get("location_id"),
-                "manager_id": branch.get("manager_id"),
-                "is_active": branch.get("is_active", True),
-                "admission_fee": branch.get("admission_fee", 500.0),
-                "operational_details": {
-                    "timings": operational.get("timings", []),
-                    "courses_offered": operational.get("courses_offered", []),
-                    "holidays": operational.get("holidays", []),
-                },
-                "assignments": {
-                    "accessories_available": assignments.get("accessories_available", False),
-                    "courses": assignments.get("courses", []),
-                    "course_schedule": assignments.get("course_schedule") or [],
-                },
-            }
-            formatted_branches.append(formatted_branch)
+            formatted_branches.append(BranchController._public_list_item(branch))
 
         return {
             "message": f"Retrieved {len(formatted_branches)} branches successfully",
@@ -241,14 +236,172 @@ class BranchController:
         }
 
     @staticmethod
+    def _public_list_item(branch: dict) -> dict:
+        branch_info = branch.get("branch") or {}
+        operational = branch.get("operational_details") or {}
+        assignments = branch.get("assignments") or {}
+        return {
+            "id": branch.get("id"),
+            "name": branch_info.get("name"),
+            "code": branch_info.get("code"),
+            "email": branch_info.get("email"),
+            "phone": branch_info.get("phone"),
+            "address": branch_info.get("address", {}),
+            "branch": {
+                "name": branch_info.get("name"),
+                "code": branch_info.get("code"),
+                "email": branch_info.get("email"),
+                "phone": branch_info.get("phone"),
+                "address": branch_info.get("address", {}),
+            },
+            "location_id": branch.get("location_id"),
+            "slug": branch.get("slug") or BranchController._name_to_slug(
+                str(branch_info.get("name") or "")
+            ),
+            "allows_collaboration": bool(branch.get("allows_collaboration", False)),
+            "is_active": branch.get("is_active", True),
+            "admission_fee": branch.get("admission_fee", 500.0),
+            "operational_details": {
+                "timings": operational.get("timings", []),
+                "courses_offered": operational.get("courses_offered", []),
+                "holidays": operational.get("holidays", []),
+            },
+            "assignments": {
+                "accessories_available": assignments.get("accessories_available", False),
+                "courses": assignments.get("courses", []),
+                "course_schedule": assignments.get("course_schedule") or [],
+            },
+        }
+
+    @staticmethod
+    async def _public_courses_for_branch(db, branch: dict) -> list:
+        course_ids = await available_course_ids_for_branch(db, branch)
+        if not course_ids:
+            return []
+        courses = await db.courses.find({
+            "id": {"$in": course_ids},
+            "settings.active": True,
+        }).to_list(100)
+        durations = await db.durations.find({"is_active": True}).sort("display_order", 1).to_list(100)
+        duration_rows = [
+            {
+                "id": d.get("id"),
+                "name": d.get("name"),
+                "code": d.get("code"),
+                "duration_months": d.get("duration_months", 1),
+            }
+            for d in durations
+        ]
+        branch_id = branch.get("id")
+        cards = []
+        for course in courses:
+            pricing = course.get("pricing") or {}
+            branch_prices = pricing.get("branch_prices") or []
+            branch_entry = next((row for row in branch_prices if row.get("branch_id") == branch_id), None)
+            src = branch_entry or pricing
+            media = course.get("media_resources") or {}
+            hero = ((course.get("page_content") or {}).get("hero_section") or {}).get("hero_image")
+            cards.append({
+                "id": course.get("id"),
+                "title": course.get("title"),
+                "code": course.get("code"),
+                "slug": (
+                    course.get("slug")
+                    or name_slug(course.get("title") or course.get("code"))
+                    or course.get("id")
+                    or ""
+                ).strip().lower(),
+                "description": course.get("description"),
+                "difficulty_level": course.get("difficulty_level"),
+                "media_resources": {
+                    "course_image_url": media.get("course_image_url") or hero,
+                },
+                "pricing": {
+                    "currency": src.get("currency") or pricing.get("currency", "INR"),
+                    "amount": src.get("amount"),
+                    "fee_1_month": src.get("fee_1_month"),
+                    "fee_3_months": src.get("fee_3_months"),
+                    "fee_6_months": src.get("fee_6_months"),
+                    "fee_1_year": src.get("fee_1_year"),
+                    "fee_per_duration": src.get("fee_per_duration"),
+                },
+                "available_durations": duration_rows,
+            })
+        return cards
+
+    @staticmethod
+    async def _public_branch_detail(db, branch: dict) -> dict:
+        await _enrich_course_schedule_trainers(db, branch)
+        payload = BranchController._public_list_item(branch)
+        payload["description"] = branch.get("description")
+        payload["gallery_images"] = branch.get("gallery_images") or []
+        payload["map_link"] = branch.get("map_link")
+        payload["facilities"] = branch.get("facilities") or []
+        payload["coordinates"] = branch.get("coordinates")
+        payload["courses"] = await BranchController._public_courses_for_branch(db, branch)
+        available_ids = {c.get("id") for c in payload["courses"] if c.get("id")}
+        assignments = payload.get("assignments") or {}
+        assignments["courses"] = [
+            cid for cid in (assignments.get("courses") or []) if cid in available_ids
+        ]
+        assignments["course_schedule"] = [
+            row
+            for row in (assignments.get("course_schedule") or [])
+            if isinstance(row, dict)
+            and (row.get("course_id") or row.get("courseId")) in available_ids
+        ]
+        payload["assignments"] = assignments
+        for key in ("manager_id", "bank_details", "bank_info", "bank_account"):
+            payload.pop(key, None)
+        return payload
+
+    @staticmethod
+    async def search_branches_public(
+        state_id: Optional[str] = None,
+        city_id: Optional[str] = None,
+        q: Optional[str] = None,
+        active_only: bool = True,
+        skip: int = 0,
+        limit: int = 100,
+    ):
+        """Public branch discovery: state, city, and text search, alone or combined."""
+        db = get_db()
+        if limit > 100:
+            limit = 100
+        query = await public_branch_discovery_query(
+            db,
+            state_id=state_id,
+            city_id=city_id,
+            q=q,
+            active_only=active_only,
+        )
+        total = await db.branches.count_documents(query)
+        branches = await db.branches.find(query).skip(skip).limit(limit).to_list(limit)
+        formatted = []
+        for branch in branches:
+            await _enrich_course_schedule_trainers(db, branch)
+            formatted.append(BranchController._public_list_item(branch))
+        return {
+            "message": f"Retrieved {len(formatted)} branches successfully",
+            "branches": formatted,
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "filters": {
+                "state_id": (state_id or "").strip() or None,
+                "city_id": (city_id or "").strip() or None,
+                "q": (q or "").strip() or None,
+            },
+        }
+
+    @staticmethod
     async def get_branch_public(branch_id: str):
         """Get one branch by ID for public detail page (no auth)."""
         db = get_db()
         branch = await db.branches.find_one({"id": branch_id, "is_active": True})
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
-        await _enrich_course_schedule_trainers(db, branch)
-        return serialize_doc(branch)
+        return await BranchController._public_branch_detail(db, branch)
 
     @staticmethod
     def _name_to_slug(name: str) -> str:
@@ -268,12 +421,15 @@ class BranchController:
             raise HTTPException(status_code=404, detail="Branch not found")
         slug = slug.strip().lower()
         db = get_db()
+        # Prefer stored slug (S02); fall back to name-derived slug for older rows.
+        stored = await db.branches.find_one({"slug": slug, "is_active": True})
+        if stored:
+            return await BranchController._public_branch_detail(db, stored)
         # If slug looks like UUID, try by id first
         if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", slug, re.I):
             branch = await db.branches.find_one({"id": slug, "is_active": True})
             if branch:
-                await _enrich_course_schedule_trainers(db, branch)
-                return serialize_doc(branch)
+                return await BranchController._public_branch_detail(db, branch)
         # Find by name slug (check both nested branch.name and top-level name)
         branches = await db.branches.find({"is_active": True}).to_list(length=500)
         for b in branches:
@@ -281,8 +437,7 @@ class BranchController:
             if not name:
                 continue
             if BranchController._name_to_slug(str(name).strip()) == slug:
-                await _enrich_course_schedule_trainers(db, b)
-                return serialize_doc(b)
+                return await BranchController._public_branch_detail(db, b)
         raise HTTPException(status_code=404, detail="Branch not found")
 
     @staticmethod
@@ -517,6 +672,49 @@ class BranchController:
         if not update_data:
             raise HTTPException(status_code=400, detail="No update data provided")
 
+        existing_for_geo = await db.branches.find_one({"id": branch_id})
+        if not existing_for_geo:
+            raise HTTPException(status_code=404, detail="Branch not found")
+
+        if "location_id" in update_data or "branch" in update_data:
+            location_ref = (update_data.get("location_id") or existing_for_geo.get("location_id") or "").strip()
+            changing_location = (
+                "location_id" in update_data
+                and (update_data.get("location_id") or "") != (existing_for_geo.get("location_id") or "")
+            )
+            city = None
+            state = None
+            try:
+                city, state = await resolve_city_for_write(db, location_ref)
+            except HTTPException:
+                # Keep unmigrated branches editable; only reject a newly chosen invalid city.
+                if changing_location or is_uuid(location_ref):
+                    raise
+            if city:
+                if "branch" in update_data and isinstance(update_data["branch"], dict):
+                    apply_city_to_branch_doc(update_data, city, state)
+                else:
+                    update_data["location_id"] = city["id"]
+                    update_data["branch.address.city"] = city.get("name") or ""
+                    update_data["branch.address.state"] = (
+                        (state.get("name") if state else None)
+                        or city.get("state")
+                        or ""
+                    )
+
+            code = ((update_data.get("branch") or existing_for_geo.get("branch") or {}).get("code") or "").strip()
+            if code:
+                await assert_unique_branch_code(db, code, exclude_id=branch_id)
+            name = ((update_data.get("branch") or existing_for_geo.get("branch") or {}).get("name") or "").strip()
+            if not existing_for_geo.get("slug"):
+                update_data["slug"] = await ensure_unique_branch_slug(
+                    db, name, exclude_id=branch_id, existing_slug=update_data.get("slug")
+                )
+            elif "slug" in update_data:
+                update_data["slug"] = await ensure_unique_branch_slug(
+                    db, name, exclude_id=branch_id, existing_slug=update_data.get("slug")
+                )
+
         # $set replaces the whole `assignments` document. If the client omits
         # `course_schedule`, model_dump(exclude_unset=True) drops the key and Mongo
         # would erase saved batch data — carry forward the previous schedule.
@@ -530,6 +728,7 @@ class BranchController:
                 prev_cs = (prev_doc or {}).get("assignments", {}).get("course_schedule")
                 if prev_cs is not None:
                     new_asg["course_schedule"] = prev_cs
+            update_data["assignments"] = prepare_assignments_for_write(new_asg)
 
         update_data["updated_at"] = datetime.utcnow()
         
@@ -540,6 +739,10 @@ class BranchController:
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Branch not found")
+
+        if "assignments" in update_data:
+            refreshed = await db.branches.find_one({"id": branch_id})
+            await sync_branch_courses_from_assignments(db, branch_id, refreshed)
         
         return {"message": "Branch updated successfully"}
 

@@ -115,6 +115,11 @@ async def get_public_courses_by_branch(branch_id: str):
     """Get courses at a branch with details and fees - Public (no auth)."""
     return await CourseController.get_public_courses_by_branch(branch_id)
 
+@router.get("/public/by-slug/{slug}")
+async def get_public_course_by_slug(slug: str):
+    """Get public course detail by slug, with id/title/code fallback."""
+    return await CourseController.get_public_course_by_slug(slug)
+
 @router.get("/public/by-category/{category_id}")
 async def get_courses_by_category(
     category_id: str,

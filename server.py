@@ -23,6 +23,8 @@ from routes import (
     category_router,
     duration_router,
     location_router,
+    state_router,
+    city_router,
     branch_public_router,
     public_branch_router,
     public_branch_by_slug_router,
@@ -42,6 +44,7 @@ from routes import (
 )
 from routes.superadmin_routes import router as superadmin_router
 from routes.branches_with_courses_routes import router as branches_with_courses_router
+from routes.branch_course_routes import router as branch_course_router
 from routes.upload_routes import router as upload_router
 from routes.cms_routes import router as cms_router
 from routes.camp_registration_routes import router as camp_registration_router
@@ -170,6 +173,30 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.exception("Failed to ensure student performance dashboard indexes")
 
+    try:
+        from utils.geography import ensure_geography_indexes
+        await ensure_geography_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure geography indexes")
+
+    try:
+        from utils.branch_geography import ensure_branch_indexes
+        await ensure_branch_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure branch indexes")
+
+    try:
+        from utils.course_hierarchy import ensure_course_hierarchy_indexes
+        await ensure_course_hierarchy_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure course hierarchy indexes")
+
+    try:
+        from utils.branch_courses import ensure_branch_course_indexes
+        await ensure_branch_course_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure branch course indexes")
+
     # Start scheduled reconciliation (additive; safe when disabled)
     reconcile_task = asyncio.create_task(_payments_reconciliation_loop(app.mongodb))
     
@@ -247,6 +274,8 @@ app.include_router(course_router, prefix="/api/courses", tags=["Courses"])
 app.include_router(category_router, prefix="/api/categories", tags=["Categories"])
 app.include_router(duration_router, prefix="/api/durations", tags=["Durations"])
 app.include_router(location_router, prefix="/api/locations", tags=["Locations"])
+app.include_router(state_router, prefix="/api/states", tags=["States"])
+app.include_router(city_router, prefix="/api/cities", tags=["Cities"])
 app.include_router(enrollment_router, prefix="/api/enrollments", tags=["Enrollments"])
 app.include_router(payment_router, prefix="/api/payments", tags=["Payments"])
 app.include_router(request_router, prefix="/api/requests", tags=["Requests"])
@@ -261,6 +290,7 @@ app.include_router(message_router, prefix="/api/messages", tags=["Messages"])
 app.include_router(reports_router, prefix="/api/reports", tags=["Reports"])
 app.include_router(attendance_router, prefix="/api/attendance", tags=["Attendance"])
 app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches with Courses"])
+app.include_router(branch_course_router, prefix="/api/branch-courses", tags=["Branch Courses"])
 app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
 app.include_router(camp_registration_router, prefix="/api/camp-registrations", tags=["Camp Registrations"])

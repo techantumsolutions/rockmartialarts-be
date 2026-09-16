@@ -38,6 +38,25 @@ async def get_public_categories(
     """Get all categories - Public endpoint (no authentication required)"""
     return await CategoryController.get_public_categories(active_only, include_subcategories, skip, limit)
 
+@router.get("/public/nav")
+async def get_public_category_nav():
+    """Top-level active categories for website navigation — id, name, slug only."""
+    return await CategoryController.get_public_category_nav()
+
+@router.get("/public/by-slug/{slug}")
+async def get_public_category_by_slug(slug: str):
+    """Public category landing: category, subcategories, and active courses for this category only."""
+    return await CategoryController.get_public_category_by_slug(slug)
+
+@router.get("/{category_id}/subcategories")
+async def get_subcategories(
+    category_id: str,
+    active_only: bool = True,
+    current_user: dict = Depends(get_current_user_or_superadmin)
+):
+    """List subcategories for a category - authenticated endpoint"""
+    return await CategoryController.get_subcategories(category_id, active_only, current_user)
+
 @router.get("/{category_id}")
 async def get_category(
     category_id: str,

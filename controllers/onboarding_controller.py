@@ -5,6 +5,8 @@ from fastapi import HTTPException
 
 from utils.database import get_db
 from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
+from utils.branch_geography import assert_branch_accepts_enrollment
+from utils.branch_courses import assert_course_available_at_branch
 from utils.auth import hash_password
 from models.enrollment_models import Enrollment, PaymentStatus
 from models.payment_models import Payment, PaymentType, PaymentMethod, PaymentStatus as PayStatus
@@ -187,12 +189,13 @@ class OnboardingController:
             else:
                 start_date = datetime.combine(joining_date, datetime.min.time())
 
-        branch = await db.branches.find_one({"id": branch_id})
-        if not branch:
-            raise HTTPException(status_code=400, detail="Branch not found")
+        branch = await assert_branch_accepts_enrollment(db, branch_id)
         course = await db.courses.find_one({"id": course_id})
         if not course:
             raise HTTPException(status_code=400, detail="Course not found")
+        await assert_course_available_at_branch(
+            db, branch_id, course_id, require_active_branch=False
+        )
         duration_doc = await db.durations.find_one({"id": duration_id})
         if not duration_doc:
             raise HTTPException(status_code=400, detail="Duration not found")

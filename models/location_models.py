@@ -8,6 +8,8 @@ class Location(BaseModel):
     name: str  # e.g., "Hyderabad", "Mumbai", "Delhi"
     code: str  # e.g., "HYD", "MUM", "DEL"
     state: str
+    state_id: Optional[str] = None  # FK to states; additive, existing docs may omit
+    slug: Optional[str] = None
     country: str = "India"
     timezone: str = "Asia/Kolkata"
     is_active: bool = True
@@ -20,6 +22,8 @@ class LocationCreate(BaseModel):
     name: str
     code: str
     state: str
+    state_id: Optional[str] = None
+    slug: Optional[str] = None
     country: str = "India"
     timezone: str = "Asia/Kolkata"
     is_active: bool = True
@@ -30,6 +34,31 @@ class LocationUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     state: Optional[str] = None
+    state_id: Optional[str] = None
+    slug: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None
+    is_active: Optional[bool] = None
+    display_order: Optional[int] = None
+    description: Optional[str] = None
+
+class CityCreate(BaseModel):
+    """Admin city payload; persisted in the existing locations collection."""
+    name: str
+    state_id: str
+    code: Optional[str] = None
+    slug: Optional[str] = None
+    country: str = "India"
+    timezone: str = "Asia/Kolkata"
+    is_active: bool = True
+    display_order: int = 0
+    description: Optional[str] = None
+
+class CityUpdate(BaseModel):
+    name: Optional[str] = None
+    state_id: Optional[str] = None
+    code: Optional[str] = None
+    slug: Optional[str] = None
     country: Optional[str] = None
     timezone: Optional[str] = None
     is_active: Optional[bool] = None
@@ -41,6 +70,8 @@ class LocationWithBranches(BaseModel):
     name: str
     code: str
     state: str
+    state_id: Optional[str] = None
+    slug: Optional[str] = None
     country: str
     timezone: str
     is_active: bool
@@ -56,6 +87,8 @@ class LocationResponse(BaseModel):
     name: str
     code: str
     state: str
+    state_id: Optional[str] = None
+    slug: Optional[str] = None
     country: str
     timezone: str
     is_active: bool

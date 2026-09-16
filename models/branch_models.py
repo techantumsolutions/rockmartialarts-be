@@ -82,6 +82,7 @@ class CourseAssignmentDetail(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     course_id: str = Field(validation_alias=AliasChoices("course_id", "courseId"))
+    is_available: bool = True
     batches: List[AssignmentBatch] = Field(default_factory=list)
 
 
@@ -104,31 +105,37 @@ class BankDetails(BaseModel):
 class Branch(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     branch: BranchInfo
-    location_id: str  # Reference to location
+    location_id: str  # City UUID (locations.id); legacy docs may still store a city name
     manager_id: str
     operational_details: OperationalDetails
     assignments: Assignments
     bank_details: BankDetails
     admission_fee: float = 500.0
+    slug: Optional[str] = None
+    allows_collaboration: bool = False  # Reserved for M21; unused in S02
     is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 class BranchCreate(BaseModel):
     branch: BranchInfo
-    location_id: str  # Reference to location
+    location_id: str  # City UUID (locations.id)
     manager_id: str
     operational_details: OperationalDetails
     assignments: Assignments
     bank_details: BankDetails
     admission_fee: float = 500.0
+    slug: Optional[str] = None
+    allows_collaboration: bool = False
 
 class BranchUpdate(BaseModel):
     branch: Optional[BranchInfo] = None
-    location_id: Optional[str] = None  # Reference to location
+    location_id: Optional[str] = None
     manager_id: Optional[str] = None
     operational_details: Optional[OperationalDetails] = None
     assignments: Optional[Assignments] = None
     bank_details: Optional[BankDetails] = None
     admission_fee: Optional[float] = None
+    slug: Optional[str] = None
+    allows_collaboration: Optional[bool] = None
     is_active: Optional[bool] = None
