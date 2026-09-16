@@ -223,6 +223,12 @@ class UserController:
         if user_data.role == UserRole.STUDENT and user_data.student_level:
             user_dict["student_level"] = user_data.student_level
 
+        if user_data.role == UserRole.STUDENT and user_data.course and user_data.branch:
+            from utils.branch_courses import assert_course_available_at_branch
+            await assert_course_available_at_branch(
+                db, user_data.branch.branch_id, user_data.course.course_id
+            )
+
         await db.users.insert_one(user_dict)
 
         # Create enrollment record if course information is provided (for students)
@@ -548,6 +554,9 @@ class UserController:
                         print(f"✅ Updated existing enrollment branch: {existing_enrollment['id']}")
                     else:
                         from models.enrollment_models import Enrollment, PaymentStatus
+                        from utils.branch_courses import assert_course_available_at_branch
+
+                        await assert_course_available_at_branch(db, branch_id, course_id)
 
                         start_date = datetime.utcnow()
                         end_date = await resolve_enrollment_end_date(

@@ -9,6 +9,8 @@ from .course_routes import router as course_router
 from .category_routes import router as category_router
 from .duration_routes import router as duration_router
 from .location_routes import router as location_router
+from .state_routes import router as state_router
+from .city_routes import router as city_router
 from .branch_public_routes import router as branch_public_router
 from .public_branch_routes import router as public_branch_router
 from .public_branch_by_slug_routes import router as public_branch_by_slug_router
@@ -38,6 +40,8 @@ __all__ = [
     'category_router',
     'duration_router',
     'location_router',
+    'state_router',
+    'city_router',
     'branch_public_router',
     'public_branch_router',
     'public_branch_by_slug_router',

@@ -8,6 +8,15 @@ from utils.auth import require_role, get_current_active_user
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.course_hierarchy import (
+    assert_parent_for_subcategory,
+    course_count_query,
+    courses_for_category_query,
+    ensure_category_slug,
+    name_slug,
+    public_category_nav_item,
+    resolve_public_category,
+)
 
 class CategoryController:
     @staticmethod
@@ -25,14 +34,17 @@ class CategoryController:
         existing_category = await db.categories.find_one({"code": category_data.code})
         if existing_category:
             raise HTTPException(status_code=400, detail="Category code already exists")
-        
-        # Validate parent category if provided
-        if category_data.parent_category_id:
-            parent_category = await db.categories.find_one({"id": category_data.parent_category_id})
-            if not parent_category:
-                raise HTTPException(status_code=400, detail="Parent category not found")
-        
-        category = Category(**category_data.dict())
+
+        payload = category_data.dict()
+        parent_id = (payload.get("parent_category_id") or "").strip() or None
+        if parent_id:
+            await assert_parent_for_subcategory(db, parent_id)
+        payload["parent_category_id"] = parent_id
+        payload["slug"] = await ensure_category_slug(
+            db, payload.get("name") or "category", existing_slug=payload.get("slug")
+        )
+
+        category = Category(**payload)
         category_dict = category.dict()
         
         await db.categories.insert_one(category_dict)
@@ -68,7 +80,7 @@ class CategoryController:
         enriched_categories = []
         for category in categories:
             # Count courses in this category
-            course_count = await db.courses.count_documents({"category_id": category["id"]})
+            course_count = await db.courses.count_documents(course_count_query(category["id"]))
             
             category_response = {
                 "id": category["id"],
@@ -76,6 +88,7 @@ class CategoryController:
                 "code": category["code"],
                 "description": category.get("description"),
                 "parent_category_id": category.get("parent_category_id"),
+                "slug": category.get("slug"),
                 "is_active": category["is_active"],
                 "display_order": category["display_order"],
                 "icon_url": category.get("icon_url"),
@@ -94,13 +107,14 @@ class CategoryController:
                 
                 subcategory_list = []
                 for subcat in subcategories:
-                    subcat_course_count = await db.courses.count_documents({"category_id": subcat["id"]})
+                    subcat_course_count = await db.courses.count_documents(course_count_query(subcat["id"]))
                     subcategory_list.append({
                         "id": subcat["id"],
                         "name": subcat["name"],
                         "code": subcat["code"],
                         "description": subcat.get("description"),
                         "parent_category_id": subcat.get("parent_category_id"),
+                        "slug": subcat.get("slug"),
                         "is_active": subcat["is_active"],
                         "display_order": subcat["display_order"],
                         "icon_url": subcat.get("icon_url"),
@@ -152,13 +166,14 @@ class CategoryController:
         public_categories = []
         for category in categories:
             # Count courses in this category
-            course_count = await db.courses.count_documents({"category_id": category["id"]})
+            course_count = await db.courses.count_documents(course_count_query(category["id"]))
             
             public_category = {
                 "id": category["id"],
                 "name": category["name"],
                 "code": category["code"],
                 "description": category.get("description"),
+                "slug": category.get("slug"),
                 "icon_url": category.get("icon_url"),
                 "color_code": category.get("color_code"),
                 "course_count": course_count
@@ -173,12 +188,13 @@ class CategoryController:
                 
                 subcategory_list = []
                 for subcat in subcategories:
-                    subcat_course_count = await db.courses.count_documents({"category_id": subcat["id"]})
+                    subcat_course_count = await db.courses.count_documents(course_count_query(subcat["id"]))
                     subcategory_list.append({
                         "id": subcat["id"],
                         "name": subcat["name"],
                         "code": subcat["code"],
                         "description": subcat.get("description"),
+                        "slug": subcat.get("slug"),
                         "icon_url": subcat.get("icon_url"),
                         "color_code": subcat.get("color_code"),
                         "course_count": subcat_course_count
@@ -197,6 +213,83 @@ class CategoryController:
         }
 
     @staticmethod
+    def _public_course_card(course: dict) -> dict:
+        hero = ((course.get("page_content") or {}).get("hero_section") or {}).get("hero_image")
+        media = course.get("media_resources") or {}
+        return {
+            "id": course.get("id"),
+            "title": course.get("title"),
+            "code": course.get("code"),
+            "slug": course.get("slug") or name_slug(course.get("title") or course.get("code")),
+            "description": course.get("description"),
+            "difficulty_level": course.get("difficulty_level"),
+            "category_id": course.get("category_id"),
+            "sub_category": course.get("sub_category"),
+            "media_resources": {
+                "course_image_url": media.get("course_image_url"),
+            },
+            "page_content": {
+                "hero_section": {"hero_image": hero} if hero else {},
+            },
+        }
+
+    @staticmethod
+    async def get_public_category_nav():
+        """Slim top-level categories for website Courses navigation."""
+        db = get_db()
+        categories = await db.categories.find({
+            "parent_category_id": None,
+            "is_active": True,
+        }).sort("display_order", 1).to_list(100)
+        items = [public_category_nav_item(category) for category in categories]
+        return {
+            "categories": items,
+            "total": len(items),
+        }
+
+    @staticmethod
+    async def get_public_category_by_slug(slug: str):
+        """Public category landing payload: category, active subcategories, active courses."""
+        db = get_db()
+        category = await resolve_public_category(db, slug)
+        parent = None
+        parent_id = (category.get("parent_category_id") or "").strip() or None
+        if parent_id:
+            parent_doc = await db.categories.find_one({"id": parent_id, "is_active": True})
+            if parent_doc:
+                parent = public_category_nav_item(parent_doc)
+
+        subcategories = await db.categories.find({
+            "parent_category_id": category["id"],
+            "is_active": True,
+        }).sort("display_order", 1).to_list(100)
+
+        course_query = await courses_for_category_query(db, category["id"])
+        course_query = {"$and": [course_query, {"settings.active": True}]}
+        courses = await db.courses.find(course_query).sort("title", 1).to_list(100)
+
+        allowed_ids = {category["id"]}
+        allowed_ids.update(sub.get("id") for sub in subcategories if sub.get("id"))
+        scoped_courses = []
+        for course in courses:
+            cid = course.get("category_id")
+            sid = course.get("sub_category")
+            if cid in allowed_ids or sid in allowed_ids:
+                scoped_courses.append(CategoryController._public_course_card(course))
+
+        return {
+            "category": {
+                **public_category_nav_item(category),
+                "description": category.get("description"),
+                "parent_category_id": parent_id,
+            },
+            "parent": parent,
+            "subcategories": [public_category_nav_item(sub) for sub in subcategories],
+            "courses": scoped_courses,
+            "course_count": len(scoped_courses),
+        }
+
+    @staticmethod
     async def get_category(
         category_id: str,
         current_user: dict = None
@@ -209,7 +302,7 @@ class CategoryController:
             raise HTTPException(status_code=404, detail="Category not found")
         
         # Count courses in this category
-        course_count = await db.courses.count_documents({"category_id": category_id})
+        course_count = await db.courses.count_documents(course_count_query(category_id))
         
         # Get subcategories
         subcategories = await db.categories.find({
@@ -219,12 +312,13 @@ class CategoryController:
         
         subcategory_list = []
         for subcat in subcategories:
-            subcat_course_count = await db.courses.count_documents({"category_id": subcat["id"]})
+            subcat_course_count = await db.courses.count_documents(course_count_query(subcat["id"]))
             subcategory_list.append({
                 "id": subcat["id"],
                 "name": subcat["name"],
                 "code": subcat["code"],
                 "description": subcat.get("description"),
+                "slug": subcat.get("slug"),
                 "course_count": subcat_course_count
             })
         
@@ -234,6 +328,7 @@ class CategoryController:
             "code": category["code"],
             "description": category.get("description"),
             "parent_category_id": category.get("parent_category_id"),
+            "slug": category.get("slug"),
             "is_active": category["is_active"],
             "display_order": category["display_order"],
             "icon_url": category.get("icon_url"),
@@ -273,17 +368,35 @@ class CategoryController:
                 raise HTTPException(status_code=400, detail="Category code already exists")
         
         # Validate parent category if provided
-        if category_update.parent_category_id:
-            parent_category = await db.categories.find_one({"id": category_update.parent_category_id})
-            if not parent_category:
-                raise HTTPException(status_code=400, detail="Parent category not found")
-            
-            # Prevent circular references
-            if category_update.parent_category_id == category_id:
-                raise HTTPException(status_code=400, detail="Category cannot be its own parent")
+        if "parent_category_id" in category_update.dict(exclude_unset=True):
+            parent_id = (category_update.parent_category_id or "").strip() or None
+            if parent_id:
+                await assert_parent_for_subcategory(db, parent_id, exclude_id=category_id)
+                child_count = await db.categories.count_documents({"parent_category_id": category_id})
+                if child_count > 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot convert a category with subcategories into a subcategory",
+                    )
+            category_update.parent_category_id = parent_id
         
         # Prepare update data
-        update_data = {k: v for k, v in category_update.dict().items() if v is not None}
+        update_data = {k: v for k, v in category_update.dict(exclude_unset=True).items()}
+        if "parent_category_id" in update_data:
+            update_data["parent_category_id"] = (update_data.get("parent_category_id") or "").strip() or None
+        if update_data.get("slug"):
+            update_data["slug"] = await ensure_category_slug(
+                db,
+                update_data.get("name") or existing_category.get("name") or "category",
+                exclude_id=category_id,
+                existing_slug=update_data.get("slug"),
+            )
+        elif not existing_category.get("slug"):
+            update_data["slug"] = await ensure_category_slug(
+                db,
+                update_data.get("name") or existing_category.get("name") or "category",
+                exclude_id=category_id,
+            )
         update_data["updated_at"] = datetime.utcnow()
         
         # Update category
@@ -313,12 +426,12 @@ class CategoryController:
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
         
-        # Check if category has courses
-        course_count = await db.courses.count_documents({"category_id": category_id})
+        # Check if category has courses (including as a subcategory)
+        course_count = await db.courses.count_documents(course_count_query(category_id))
         if course_count > 0:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Cannot delete category. It has {course_count} associated courses."
+                detail=f"Cannot delete category. It has {course_count} associated courses. Deactivate it instead."
             )
         
         # Check if category has subcategories
@@ -336,6 +449,45 @@ class CategoryController:
             raise HTTPException(status_code=404, detail="Category not found")
         
         return {"message": "Category deleted successfully"}
+
+    @staticmethod
+    async def get_subcategories(
+        category_id: str,
+        active_only: bool = True,
+        current_user: dict = None
+    ):
+        """List subcategories of a top-level category."""
+        db = get_db()
+        parent = await db.categories.find_one({"id": category_id})
+        if not parent:
+            raise HTTPException(status_code=404, detail="Category not found")
+
+        query = {"parent_category_id": category_id}
+        if active_only:
+            query["is_active"] = True
+        children = await db.categories.find(query).sort("name", 1).to_list(200)
+        items = []
+        for subcat in children:
+            items.append({
+                "id": subcat["id"],
+                "name": subcat["name"],
+                "code": subcat["code"],
+                "description": subcat.get("description"),
+                "parent_category_id": subcat.get("parent_category_id"),
+                "slug": subcat.get("slug"),
+                "is_active": subcat.get("is_active", True),
+                "course_count": await db.courses.count_documents(course_count_query(subcat["id"])),
+            })
+        return {
+            "message": f"Retrieved {len(items)} subcategories successfully",
+            "parent": {
+                "id": parent["id"],
+                "name": parent["name"],
+                "code": parent["code"],
+            },
+            "subcategories": items,
+            "total": len(items),
+        }
 
     @staticmethod
     async def get_categories_with_details(
@@ -372,9 +524,9 @@ class CategoryController:
             # Get courses in this category
             courses = []
             if include_courses:
-                course_query = {"category_id": category["id"]}
+                course_query = await courses_for_category_query(db, category["id"])
                 if active_only:
-                    course_query["settings.active"] = True
+                    course_query = {"$and": [course_query, {"settings.active": True}]}
 
                 course_list = await db.courses.find(course_query).to_list(100)
 
@@ -411,7 +563,7 @@ class CategoryController:
 
             subcategory_list = []
             for subcat in subcategories:
-                subcat_course_count = await db.courses.count_documents({"category_id": subcat["id"]})
+                subcat_course_count = await db.courses.count_documents(course_count_query(subcat["id"]))
                 subcategory_list.append({
                     "id": subcat["id"],
                     "name": subcat["name"],
@@ -472,9 +624,9 @@ class CategoryController:
         enriched_categories = []
         for category in categories:
             # Get courses in this category
-            course_query = {"category_id": category["id"]}
+            course_query = await courses_for_category_query(db, category["id"])
             if active_only:
-                course_query["settings.active"] = True
+                course_query = {"$and": [course_query, {"settings.active": True}]}
 
             course_list = await db.courses.find(course_query).to_list(100)
 
@@ -581,9 +733,9 @@ class CategoryController:
             raise HTTPException(status_code=404, detail="Category not found")
 
         # Get courses in this category
-        course_query = {"category_id": category_id}
+        course_query = await courses_for_category_query(db, category_id)
         if active_only:
-            course_query["settings.active"] = True
+            course_query = {"$and": [course_query, {"settings.active": True}]}
 
         courses = await db.courses.find(course_query).to_list(100)
 

@@ -66,6 +66,7 @@ class Course(BaseModel):
     category_id: str
     # New: explicit sub-category id (child category) stored separately from parent category
     sub_category: Optional[str] = None
+    slug: Optional[str] = None
     instructor_id: str
     student_requirements: StudentRequirements
     course_content: CourseContent
@@ -87,6 +88,7 @@ class CourseCreate(BaseModel):
     category_id: str
     # New: sub-category id on create
     sub_category: Optional[str] = None
+    slug: Optional[str] = None
     instructor_id: str
     student_requirements: StudentRequirements
     course_content: CourseContent
@@ -106,6 +108,7 @@ class CourseUpdate(BaseModel):
     category_id: Optional[str] = None
     # New: allow updating stored sub-category id
     sub_category: Optional[str] = None
+    slug: Optional[str] = None
     instructor_id: Optional[str] = None
     student_requirements: Optional[StudentRequirements] = None
     course_content: Optional[CourseContent] = None

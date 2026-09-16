@@ -135,6 +135,11 @@ class RequestController:
         if not new_course:
             raise HTTPException(status_code=404, detail="New course not found.")
 
+        from utils.branch_courses import assert_course_available_at_branch
+        await assert_course_available_at_branch(
+            db, current_enrollment["branch_id"], request_data.new_course_id
+        )
+
         course_change_request = CourseChangeRequest(
             student_id=current_user["id"],
             branch_id=current_enrollment["branch_id"],
@@ -197,6 +202,11 @@ class RequestController:
             new_course = await db.courses.find_one({"id": change_request["new_course_id"]})
             if not new_course:
                 raise HTTPException(status_code=404, detail="New course not found during approval process.")
+
+            from utils.branch_courses import assert_course_available_at_branch
+            await assert_course_available_at_branch(
+                db, change_request["branch_id"], change_request["new_course_id"]
+            )
 
             fee_amount = new_course.get("base_fee")
             branch_pricing = new_course.get("branch_pricing", {})

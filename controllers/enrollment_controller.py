@@ -11,6 +11,8 @@ from utils.auth import require_role, get_current_active_user
 from utils.database import db, get_db
 from utils.helpers import serialize_doc, send_whatsapp
 from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
+from utils.branch_geography import assert_branch_accepts_enrollment
+from utils.branch_courses import assert_course_available_at_branch
 
 class EnrollmentController:
     @staticmethod
@@ -51,10 +53,10 @@ class EnrollmentController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
-        branch = await db.branches.find_one({"id": enrollment_data.branch_id})
-        if not branch:
-            raise HTTPException(status_code=404, detail="Branch not found")
-        
+        branch = await assert_branch_accepts_enrollment(db, enrollment_data.branch_id) 
+        await assert_course_available_at_branch(
+            db, enrollment_data.branch_id, enrollment_data.course_id, require_active_branch=False
+        )
         # Calculate end date
         end_date = enrollment_data.start_date + timedelta(days=course["duration_months"] * 30)
         
@@ -194,9 +196,10 @@ class EnrollmentController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
-        branch = await db.branches.find_one({"id": enrollment_data.branch_id})
-        if not branch:
-            raise HTTPException(status_code=404, detail="Branch not found")
+        branch = await assert_branch_accepts_enrollment(db, enrollment_data.branch_id)
+        await assert_course_available_at_branch(
+            db, enrollment_data.branch_id, enrollment_data.course_id, require_active_branch=False
+        )
 
         # Check if student is already enrolled in this course
         existing_enrollment = await db.enrollments.find_one({
@@ -365,26 +368,14 @@ class EnrollmentController:
         if not enrollment:
             raise HTTPException(status_code=404, detail="Enrollment not found or you do not have access to it.")
 
-        new_branch = await db.branches.find_one({"id": body.new_branch_id})
-        if not new_branch:
-            raise HTTPException(status_code=404, detail="New branch not found.")
+        new_branch = await assert_branch_accepts_enrollment(db, body.new_branch_id)
 
         if enrollment["branch_id"] == body.new_branch_id:
             raise HTTPException(status_code=400, detail="New branch must be different from current branch.")
 
-        # Check that the new branch offers this course (optional: branch assignments)
-        course_id = enrollment["course_id"]
-        branch_assignments = await db.branches.find_one(
-            {"id": body.new_branch_id},
-            {"assignments": 1}
+        await assert_course_available_at_branch(
+            db, body.new_branch_id, enrollment["course_id"], require_active_branch=False
         )
-        if branch_assignments and "assignments" in branch_assignments:
-            courses = branch_assignments.get("assignments", {}).get("courses", [])
-            if courses and course_id not in courses:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This course is not offered at the selected branch."
-                )
 
         # Avoid duplicate pending request
         existing = await db.enrollment_branch_change_requests.find_one({

@@ -48,6 +48,7 @@ from utils.razorpay_reconciliation import (
 )
 from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
 from utils.student_branch_sync import get_student_assigned_branch_id
+from utils.branch_courses import assert_course_available_at_branch
 from controllers.course_controller import _expand_branch_prices_to_branch_pricing
 
 
@@ -434,6 +435,20 @@ class PaymentController:
                             },
                             {"$set": {"payment_status": "cancelled", "status": "cancelled", "updated_at": now}},
                         )
+                    # M05-S05: cart checkout fulfillment (idempotent; safe on webhook retries)
+                    if mapped["payment_status"] == "paid" and (
+                        row.get("cart_checkout_id") or patch.get("cart_checkout_id")
+                    ):
+                        try:
+                            from utils.cart_fulfillment import fulfill_from_payment_row
+
+                            merged = {**row, **patch}
+                            await fulfill_from_payment_row(merged, actor="razorpay_webhook")
+                        except Exception:
+                            logger.exception(
+                                "Cart checkout fulfillment failed payment_id=%s",
+                                row.get("id"),
+                            )
                 else:
                     out = await reconcile_one_payment_row(
                         db,
@@ -1249,6 +1264,15 @@ class PaymentController:
             branch = await db.branches.find_one({"id": branch_id})
             if not branch:
                 raise HTTPException(status_code=404, detail="Branch not found")
+
+            await assert_course_available_at_branch(
+                db,
+                branch_id,
+                course_id,
+                require_active_branch=False,
+                require_active_course=False,
+                allow_if_enrolled_student_id=optional_student_id,
+            )
 
             # Get category details
             category = await db.categories.find_one({"id": course.get("category_id")}) if course.get("category_id") else None

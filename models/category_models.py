@@ -9,6 +9,7 @@ class Category(BaseModel):
     code: str  # Unique category code
     description: Optional[str] = None
     parent_category_id: Optional[str] = None  # For hierarchical categories
+    slug: Optional[str] = None
     is_active: bool = True
     display_order: int = 0  # For sorting categories
     icon_url: Optional[str] = None
@@ -21,6 +22,7 @@ class CategoryCreate(BaseModel):
     code: str
     description: Optional[str] = None
     parent_category_id: Optional[str] = None
+    slug: Optional[str] = None
     is_active: bool = True
     display_order: int = 0
     icon_url: Optional[str] = None
@@ -31,6 +33,7 @@ class CategoryUpdate(BaseModel):
     code: Optional[str] = None
     description: Optional[str] = None
     parent_category_id: Optional[str] = None
+    slug: Optional[str] = None
     is_active: Optional[bool] = None
     display_order: Optional[int] = None
     icon_url: Optional[str] = None
@@ -42,6 +45,7 @@ class CategoryResponse(BaseModel):
     code: str
     description: Optional[str] = None
     parent_category_id: Optional[str] = None
+    slug: Optional[str] = None
     is_active: bool
     display_order: int
     icon_url: Optional[str] = None

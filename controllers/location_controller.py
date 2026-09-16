@@ -8,6 +8,7 @@ from utils.auth import require_role, get_current_active_user
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.branch_geography import branches_matching_location_query
 
 class LocationController:
     @staticmethod
@@ -477,10 +478,11 @@ class LocationController:
 
         # Find location in DB (may be missing when locations are derived from branches)
         location = await db.locations.find_one({"id": location_id})
-
-        branch_query = {"location_id": location_id}
-        if active_only:
-            branch_query["is_active"] = True
+        branch_query, matched_city = await branches_matching_location_query(
+            db, location_id, active_only=active_only
+        )
+        if matched_city and not location:
+            location = matched_city
 
         if limit > 100:
             limit = 100
