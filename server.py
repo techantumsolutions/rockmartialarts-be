@@ -53,6 +53,8 @@ from routes.achievement_routes import router as achievement_router
 from routes.student_testimonial_routes import router as student_testimonial_router
 from routes.student_showcase_achievement_routes import router as showcase_achievement_router
 from routes.onboarding_routes import router as onboarding_router
+from routes.cart_routes import router as cart_router
+from routes.discount_rule_routes import router as discount_rule_router
 
 # Import database utility
 from utils.database import db
@@ -134,6 +136,19 @@ async def lifespan(app: FastAPI):
     # Initialize the database connection in utils
     from utils.database import init_db
     init_db(app.mongodb)
+
+    from utils.cart_helpers import ensure_cart_indexes
+    await ensure_cart_indexes(app.mongodb)
+    try:
+        from utils.discount_helpers import ensure_discount_rule_indexes
+        await ensure_discount_rule_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure discount rule indexes")
+    try:
+        from utils.cart_fulfillment import ensure_cart_checkout_indexes
+        await ensure_cart_checkout_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure cart checkout indexes")
 
     # Additive indexes (safe to re-run).
     try:
@@ -301,6 +316,8 @@ app.include_router(
     showcase_achievement_router, prefix="/api/showcase-achievements", tags=["Marketing Achievements"]
 )
 app.include_router(onboarding_router, prefix="/api/onboarding", tags=["Onboarding"])
+app.include_router(cart_router, prefix="/api/carts", tags=["Enrollment Cart"])
+app.include_router(discount_rule_router, prefix="/api/discount-rules", tags=["Discount Rules"])
 app.include_router(reg_checkout_router, prefix="/api/reg-checkout", tags=["Registration Checkout"])
 app.include_router(student_performance_router, prefix="/api/student", tags=["Student Performance"])
 

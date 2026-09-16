@@ -435,6 +435,20 @@ class PaymentController:
                             },
                             {"$set": {"payment_status": "cancelled", "status": "cancelled", "updated_at": now}},
                         )
+                    # M05-S05: cart checkout fulfillment (idempotent; safe on webhook retries)
+                    if mapped["payment_status"] == "paid" and (
+                        row.get("cart_checkout_id") or patch.get("cart_checkout_id")
+                    ):
+                        try:
+                            from utils.cart_fulfillment import fulfill_from_payment_row
+
+                            merged = {**row, **patch}
+                            await fulfill_from_payment_row(merged, actor="razorpay_webhook")
+                        except Exception:
+                            logger.exception(
+                                "Cart checkout fulfillment failed payment_id=%s",
+                                row.get("id"),
+                            )
                 else:
                     out = await reconcile_one_payment_row(
                         db,
