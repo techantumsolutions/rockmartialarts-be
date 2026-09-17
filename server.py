@@ -152,6 +152,11 @@ async def lifespan(app: FastAPI):
 
     # Additive indexes (safe to re-run).
     try:
+        from utils.family_accounts import ensure_account_indexes
+        await ensure_account_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure family account indexes")
+    try:
         # ESSL mapping: enforce unique employee code when set.
         await app.mongodb.users.create_index("essl_user_id", unique=True, sparse=True)
     except Exception:

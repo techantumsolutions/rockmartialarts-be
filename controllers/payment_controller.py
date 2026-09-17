@@ -7,7 +7,7 @@ import io
 import os
 import logging
 import requests
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List, Any
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,7 @@ from models.payment_models import (
     RegistrationPaymentCreate,
     RegistrationPaymentResponse,
     AdminPaymentRecoveryBody,
+    FamilyStudentEnrollment,
 )
 from models.enrollment_models import Enrollment as EnrollmentModel, PaymentStatus as EnrollmentPaymentStatus
 from models.student_models import (
@@ -1537,8 +1538,265 @@ class PaymentController:
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
     @staticmethod
+    def _parse_registration_dob(val: Any):
+        from datetime import date as date_cls
+        if not val:
+            return None
+        if isinstance(val, date_cls):
+            return val
+        try:
+            return date_cls.fromisoformat(str(val)[:10])
+        except ValueError:
+            return None
+
+    @staticmethod
+    async def _pay_and_activate_enrollment(
+        db,
+        *,
+        student_id: str,
+        enrollment_id: Optional[str],
+        course_id: str,
+        branch_id: str,
+        category_id: str,
+        duration: str,
+        duration_months: Optional[int],
+        batch_ref: Optional[str],
+        payment_method: PaymentMethod,
+        transaction_id: str,
+        student_data: dict,
+    ) -> Tuple[str, float, CoursePaymentInfo, str]:
+        payment_info = await PaymentController.get_course_payment_info(
+            course_id,
+            branch_id,
+            duration,
+            batch_ref=batch_ref,
+        )
+        months_hint = duration_months
+        if not enrollment_id:
+            start_date = datetime.utcnow()
+            end_date = await resolve_enrollment_end_date(
+                db, duration, start_date, months_hint=months_hint
+            )
+            enrollment = EnrollmentModel(
+                student_id=student_id,
+                course_id=course_id,
+                branch_id=branch_id,
+                start_date=start_date,
+                end_date=end_date,
+                fee_amount=payment_info.pricing.course_fee,
+                admission_fee=payment_info.pricing.admission_fee,
+                payment_status="paid",
+                enrollment_date=start_date,
+                is_active=True,
+            )
+            enrollment_doc = enrollment.dict()
+            if duration:
+                enrollment_doc["duration_id"] = duration
+            await db.enrollments.insert_one(enrollment_doc)
+            enrollment_id = enrollment.id
+        else:
+            enroll = await db.enrollments.find_one({"id": enrollment_id})
+            if enroll:
+                st = enroll.get("start_date") or enroll.get("enrollment_date")
+                if isinstance(st, str):
+                    try:
+                        st = datetime.fromisoformat(st.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except ValueError:
+                        st = datetime.utcnow()
+                elif isinstance(st, datetime):
+                    st = st.replace(tzinfo=None) if st.tzinfo else st
+                else:
+                    st = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, duration, st, months_hint=months_hint
+                )
+                await db.enrollments.update_one(
+                    {"id": enrollment_id},
+                    {
+                        "$set": {
+                            "end_date": end_date,
+                            "fee_amount": payment_info.pricing.course_fee,
+                            "admission_fee": payment_info.pricing.admission_fee,
+                            "payment_status": PaymentStatus.PAID.value,
+                            "duration_id": duration,
+                        }
+                    },
+                )
+
+        payment = Payment(
+            student_id=student_id,
+            enrollment_id=enrollment_id,
+            amount=payment_info.pricing.total_amount,
+            payment_type=PaymentType.REGISTRATION_FEE,
+            payment_method=payment_method,
+            payment_status=PaymentStatus.PAID,
+            transaction_id=transaction_id,
+            payment_date=datetime.utcnow(),
+            due_date=datetime.utcnow() + timedelta(days=7),
+            registration_data=student_data,
+            course_details={
+                "course_id": course_id,
+                "course_name": payment_info.course_name,
+                "category_id": category_id,
+                "duration": duration,
+            },
+            branch_details={
+                "branch_id": branch_id,
+                "branch_name": payment_info.branch_name,
+            },
+        )
+        await db.payments.insert_one(payment.dict())
+        return enrollment_id, payment_info.pricing.total_amount, payment_info, payment.id
+
+    @staticmethod
+    async def _process_family_registration(payment_data: RegistrationPaymentCreate):
+        db = get_db()
+        family: List[FamilyStudentEnrollment] = list(payment_data.family_students or [])
+        if not family:
+            raise HTTPException(status_code=400, detail="family_students is required for family registration")
+
+        from controllers.auth_controller import AuthController
+        from models.user_models import CourseInfo, BranchInfo
+        from utils.family_accounts import ensure_account_for_student
+
+        holder = dict(payment_data.student_data or {})
+        if not holder.get("password"):
+            holder["password"] = secrets.token_urlsafe(8)
+
+        first = family[0]
+        first_payload = {
+            **holder,
+            "first_name": first.first_name or holder.get("first_name"),
+            "last_name": first.last_name or holder.get("last_name"),
+            "full_name": f"{first.first_name or holder.get('first_name', '')} {first.last_name or holder.get('last_name', '')}".strip(),
+            "date_of_birth": PaymentController._parse_registration_dob(
+                first.date_of_birth or holder.get("date_of_birth")
+            ),
+            "gender": first.gender or holder.get("gender"),
+            "role": "student",
+            "relationship": first.relationship or "self",
+            "course": {
+                "category_id": first.category_id,
+                "course_id": first.course_id,
+                "duration": first.duration,
+            },
+            "branch": {
+                "location_id": first.location_id or first.branch_id,
+                "branch_id": first.branch_id,
+            },
+        }
+        user_create = UserCreate(**first_payload)
+        user_result = await AuthController.register_user(user_create, None)
+        first_student_id = user_result["user_id"]
+
+        transaction_id = f"TXN{datetime.utcnow().strftime('%Y%m%d')}{secrets.token_hex(4).upper()}"
+        total_amount = 0.0
+        last_payment_id = ""
+        last_info = None
+
+        _, amt, info, pay_id = await PaymentController._pay_and_activate_enrollment(
+            db,
+            student_id=first_student_id,
+            enrollment_id=user_result.get("enrollment_id"),
+            course_id=first.course_id,
+            branch_id=first.branch_id,
+            category_id=first.category_id,
+            duration=first.duration,
+            duration_months=first.duration_months,
+            batch_ref=first.batch_ref,
+            payment_method=payment_data.payment_method,
+            transaction_id=f"{transaction_id}-1",
+            student_data=holder,
+        )
+        total_amount += amt
+        last_payment_id = pay_id
+        last_info = info
+
+        first_user = await db.users.find_one({"id": first_student_id})
+        acc = await ensure_account_for_student(db, first_user)
+
+        for idx, extra in enumerate(family[1:], start=2):
+            created = await AuthController.create_student_under_account(
+                acc,
+                first_name=extra.first_name,
+                last_name=extra.last_name,
+                date_of_birth=PaymentController._parse_registration_dob(extra.date_of_birth),
+                gender=extra.gender,
+                relationship=extra.relationship or "child",
+                course=CourseInfo(
+                    category_id=extra.category_id,
+                    course_id=extra.course_id,
+                    duration=extra.duration,
+                    batch_ref=extra.batch_ref,
+                ),
+                branch=BranchInfo(
+                    location_id=extra.location_id or extra.branch_id,
+                    branch_id=extra.branch_id,
+                ),
+                send_welcome_sms=False,
+            )
+            _, amt, info, pay_id = await PaymentController._pay_and_activate_enrollment(
+                db,
+                student_id=created["user_id"],
+                enrollment_id=created.get("enrollment_id"),
+                course_id=extra.course_id,
+                branch_id=extra.branch_id,
+                category_id=extra.category_id,
+                duration=extra.duration,
+                duration_months=extra.duration_months,
+                batch_ref=extra.batch_ref,
+                payment_method=payment_data.payment_method,
+                transaction_id=f"{transaction_id}-{idx}",
+                student_data=holder,
+            )
+            total_amount += amt
+            last_payment_id = pay_id
+            last_info = info
+
+        phone = holder.get("phone", "")
+        if phone:
+            message = (
+                f"Welcome! Family registration is complete. Payment of ₹{total_amount} received. "
+                f"Transaction ID: {transaction_id}"
+            )
+            await send_whatsapp(phone, message)
+
+        if last_info:
+            await PaymentController.create_payment_notification(
+                last_payment_id,
+                first_student_id,
+                last_info,
+                {
+                    "id": first_student_id,
+                    "full_name": first_payload.get("full_name", ""),
+                    "email": holder.get("email", ""),
+                    "phone": holder.get("phone", ""),
+                },
+            )
+
+        return RegistrationPaymentResponse(
+            payment_id=last_payment_id,
+            student_id=first_student_id,
+            transaction_id=transaction_id,
+            amount=total_amount,
+            status=PaymentStatus.PAID,
+            message=f"Family registration completed for {len(family)} students",
+        )
+
+    @staticmethod
     async def process_registration_payment(payment_data: RegistrationPaymentCreate):
         """Process payment for student registration"""
+        if payment_data.family_students:
+            try:
+                return await PaymentController._process_family_registration(payment_data)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Payment processing failed: {str(e)}",
+                )
+
         db = get_db()
 
         try:
