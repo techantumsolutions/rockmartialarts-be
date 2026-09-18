@@ -25,6 +25,8 @@ from models.user_models import (
     StudentAddress,
     StudentEmergencyContact,
     StudentMedicalInfo,
+    SwitchStudentBody,
+    LinkedStudentCreate,
 )
 from utils.auth import hash_password, verify_password, create_access_token, get_current_active_user, SECRET_KEY, ALGORITHM
 from utils.database import get_db
@@ -37,6 +39,15 @@ from utils.reg_checkout_sms import (
     public_sms_failure_hint,
     send_registration_sms,
     sms_provider_expects_delivery,
+)
+from utils.family_accounts import (
+    ensure_account_for_student,
+    get_account_by_email,
+    get_account_by_phone,
+    list_profiles,
+    pick_login_student,
+    student_login_user_payload,
+    sync_account_password,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,7 +124,13 @@ def _student_phone_match_variants(canonical: str) -> List[str]:
 
 
 async def _find_student_user_by_canonical_phone(db, canonical: str) -> Optional[Dict[str, Any]]:
+    """Resolve the login account by phone, then its default student. Avoid picking a random child."""
     variants = _student_phone_match_variants(canonical)
+    acc = await get_account_by_phone(db, canonical)
+    if acc:
+        student = await pick_login_student(db, acc)
+        if student:
+            return student
     return await db.users.find_one({"role": UserRole.STUDENT.value, "phone": {"$in": variants}})
 
 
@@ -224,6 +241,10 @@ class AuthController:
             user_dict["emergency_contact"] = user_data.emergency_contact
         if user_data.role == UserRole.STUDENT and user_data.student_level:
             user_dict["student_level"] = user_data.student_level
+        if user_data.role == UserRole.STUDENT:
+            user_dict["relationship"] = user_data.relationship or "self"
+            if user_data.account_id:
+                user_dict["account_id"] = user_data.account_id
 
         if user_data.role == UserRole.STUDENT and user_data.course and user_data.branch:
             from utils.branch_courses import assert_course_available_at_branch
@@ -232,6 +253,12 @@ class AuthController:
             )
 
         result = await db.users.insert_one(user_dict)
+
+        if user_data.role == UserRole.STUDENT:
+            try:
+                await ensure_account_for_student(db, user_dict)
+            except Exception:
+                logger.exception("Failed to create family account for new student")
 
         # Create enrollment record if course information is provided (for students)
         enrollment_id = None
@@ -365,7 +392,16 @@ class AuthController:
             user_dict["address"] = user_data.address
         if getattr(user_data, "emergency_contact", None) is not None:
             user_dict["emergency_contact"] = user_data.emergency_contact
+        if user_data.role == UserRole.STUDENT:
+            user_dict["relationship"] = user_data.relationship or "self"
+            if user_data.account_id:
+                user_dict["account_id"] = user_data.account_id
         await db.users.insert_one(user_dict)
+        if user_data.role == UserRole.STUDENT:
+            try:
+                await ensure_account_for_student(db, user_dict)
+            except Exception:
+                logger.exception("Failed to create family account for silent student create")
         enrollment_id = None
         if user_data.course and user_data.branch and user_data.role == UserRole.STUDENT:
             try:
@@ -395,50 +431,77 @@ class AuthController:
         return {"user_id": user_dict["id"], "enrollment_id": enrollment_id}
 
     @staticmethod
+    async def _reject_login(request: Request, email: str, reason: str, user: Optional[dict] = None, status_code: int = 401, detail: str = "Incorrect email or password"):
+        try:
+            await log_activity(
+                request=request,
+                action="login_attempt",
+                status="failure",
+                user_id=(user or {}).get("id"),
+                user_name=(user or {}).get("full_name", ""),
+                details={"email": email, "reason": reason},
+            )
+        except Exception:
+            pass
+        logger.warning("POST /api/auth/login: rejected (%s)", reason)
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    @staticmethod
     async def login(user_credentials: UserLogin, request: Request):
-        """User login"""
+        """User login. Students authenticate against `accounts` when present so one login can hold multiple profiles."""
         try:
             db = get_db()
             if db is None:
                 raise HTTPException(status_code=503, detail="Database not initialized")
 
             logger.info("POST /api/auth/login: attempt")
-            
-            user = await db.users.find_one({"email": user_credentials.email})
-            # Support both "password" and "password_hash" for stored hash
-            stored_hash = user.get("password") if user else None
-            if user and not stored_hash:
-                stored_hash = user.get("password_hash")
-            if not user or not stored_hash or not verify_password(user_credentials.password, stored_hash):
-                try:
-                    await log_activity(
-                        request=request,
-                        action="login_attempt",
-                        status="failure",
-                        details={"email": user_credentials.email, "reason": "Incorrect email or password"}
+            email = (user_credentials.email or "").strip().lower()
+            acc = await get_account_by_email(db, email)
+            user = None
+            profiles: List[Dict[str, Any]] = []
+            account_id = None
+
+            if acc:
+                stored_hash = acc.get("password")
+                if not stored_hash or not verify_password(user_credentials.password, stored_hash):
+                    await AuthController._reject_login(request, user_credentials.email, "Incorrect email or password")
+                if acc.get("is_active") is False:
+                    await AuthController._reject_login(
+                        request, user_credentials.email, "Account is deactivated",
+                        status_code=400, detail="Account is deactivated",
                     )
-                except Exception:
-                    pass
-                logger.warning("POST /api/auth/login: rejected (invalid credentials)")
-                raise HTTPException(status_code=401, detail="Incorrect email or password")
-            
-            # Missing is_active: treat as active (legacy documents); explicit False blocks login
-            if user.get("is_active") is False:
-                try:
-                    await log_activity(
-                        request=request,
-                        action="login_attempt",
-                        status="failure",
-                        user_id=user["id"],
-                        user_name=user.get("full_name", ""),
-                        details={"email": user_credentials.email, "reason": "Account is deactivated"}
+                user = await pick_login_student(db, acc)
+                if not user:
+                    await AuthController._reject_login(request, user_credentials.email, "No active student on account")
+                account_id = acc["id"]
+                if not user.get("account_id"):
+                    await db.users.update_one(
+                        {"id": user["id"]},
+                        {"$set": {"account_id": account_id, "relationship": user.get("relationship") or "self"}},
                     )
-                except Exception:
-                    pass
-                logger.warning("POST /api/auth/login: rejected (inactive user id=%s)", user.get("id"))
-                raise HTTPException(status_code=400, detail="Account is deactivated")
-            
-            access_token = create_access_token(data={"sub": user["id"], "role": user.get("role", "student")})
+                    user["account_id"] = account_id
+                profiles = await list_profiles(db, account_id)
+            else:
+                user = await db.users.find_one({"email": user_credentials.email})
+                stored_hash = user.get("password") if user else None
+                if user and not stored_hash:
+                    stored_hash = user.get("password_hash")
+                if not user or not stored_hash or not verify_password(user_credentials.password, stored_hash):
+                    await AuthController._reject_login(request, user_credentials.email, "Incorrect email or password")
+                if user.get("is_active") is False:
+                    await AuthController._reject_login(
+                        request, user_credentials.email, "Account is deactivated", user,
+                        status_code=400, detail="Account is deactivated",
+                    )
+                if user.get("role") == "student":
+                    acc = await ensure_account_for_student(db, user)
+                    account_id = acc["id"]
+                    profiles = await list_profiles(db, account_id)
+
+            token_data = {"sub": user["id"], "role": user.get("role", "student")}
+            if account_id:
+                token_data["account_id"] = account_id
+            access_token = create_access_token(data=token_data)
 
             try:
                 await log_activity(
@@ -446,32 +509,23 @@ class AuthController:
                     action="login_success",
                     user_id=user["id"],
                     user_name=user.get("full_name", ""),
-                    details={"email": user["email"]}
+                    details={"email": user.get("email")},
                 )
             except Exception:
                 pass
 
-            # Extract branch_id for easier access
-            branch_id = user.get("branch_id")
-            if not branch_id and user.get("branch"):
-                branch_id = user["branch"].get("branch_id")
-
             logger.info("POST /api/auth/login: success user_id=%s", user.get("id"))
-            profile_img = user.get("profile_image") or user.get("profile_photo") or user.get("photo")
-            return {"access_token": access_token, "token_type": "bearer", "expires_in": 86400, "user": {
-                "id": user["id"],
-                "email": user["email"],
-                "role": user.get("role", "student"),
-                "first_name": user.get("first_name"),
-                "last_name": user.get("last_name"),
-                "full_name": user.get("full_name", ""),
-                "date_of_birth": user.get("date_of_birth"),
-                "gender": user.get("gender"),
-                "branch_id": branch_id,
-                "course": user.get("course"),
-                "branch": user.get("branch"),
-                "profile_image": profile_img,
-            }}
+            payload = {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": 86400,
+                "user": student_login_user_payload(user),
+            }
+            if user.get("role") == "student":
+                payload["profiles"] = profiles
+                payload["account_id"] = account_id
+                payload["active_student_id"] = user["id"]
+            return payload
         except HTTPException:
             raise
         except Exception as e:
@@ -482,7 +536,11 @@ class AuthController:
     async def forgot_password(forgot_password_data: ForgotPassword):
         """Initiate password reset process with email functionality"""
         db = get_db()
-        user = await db.users.find_one({"email": forgot_password_data.email})
+        acc = await get_account_by_email(db, forgot_password_data.email)
+        if acc:
+            user = await pick_login_student(db, acc)
+        else:
+            user = await db.users.find_one({"email": forgot_password_data.email})
         if not user:
             # Don't reveal that the user does not exist
             return {"message": "If an account with that email exists, a password reset link has been sent."}
@@ -547,13 +605,10 @@ class AuthController:
 
         new_hashed_password = hash_password(reset_password_data.new_password)
         db = get_db()
-        result = await db.users.update_one(
-            {"id": user_id},
-            {"$set": {"password": new_hashed_password, "updated_at": datetime.utcnow()}}
-        )
-
-        if result.matched_count == 0:
+        user = await db.users.find_one({"id": user_id})
+        if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        await sync_account_password(db, user, new_hashed_password)
 
         return {"message": "Password has been reset successfully."}
 
@@ -679,6 +734,17 @@ class AuthController:
         user_info.pop("password", None)
         user_info["date_of_birth"] = current_user.get("date_of_birth")
         user_info["gender"] = current_user.get("gender")
+        if current_user.get("role") == "student":
+            try:
+                db = get_db()
+                acc = await ensure_account_for_student(db, current_user)
+                user_info["account_id"] = acc["id"]
+                user_info["relationship"] = current_user.get("relationship") or "self"
+                user_info["profiles"] = await list_profiles(db, acc["id"])
+                user_info["active_student_id"] = current_user.get("id")
+            except Exception:
+                logger.exception("Failed to attach family profiles to /auth/me")
+                user_info["profiles"] = []
         return user_info
 
     @staticmethod
@@ -727,13 +793,13 @@ class AuthController:
         db = get_db()
 
         try:
-            # Find user by email
+            acc = await get_account_by_email(db, email)
             user = await db.users.find_one({"email": email})
 
-            if user:
+            if acc or user:
                 return {
                     "exists": True,
-                    "name": user.get("name", "User"),
+                    "name": (user or {}).get("full_name") or (user or {}).get("name", "User"),
                     "email": email
                 }
             else:
@@ -771,6 +837,9 @@ class AuthController:
             f"+91 {norm}",
         ]
         try:
+            acc = await get_account_by_phone(db, norm)
+            if acc:
+                return {"exists": True}
             u = await db.users.find_one({"phone": {"$in": variants}})
             if u:
                 return {"exists": True}
@@ -1049,4 +1118,184 @@ class AuthController:
         return {
             "message": "Profile photo updated successfully",
             "profile_image": file_url,
+        }
+
+    @staticmethod
+    async def create_student_under_account(
+        acc: dict,
+        *,
+        first_name: str,
+        last_name: str,
+        date_of_birth=None,
+        gender: Optional[str] = None,
+        relationship: str = "child",
+        course=None,
+        branch=None,
+        send_welcome_sms: bool = False,
+    ) -> Dict[str, Any]:
+        """Insert a student user that shares login credentials with an existing account."""
+        db = get_db()
+        full_name = f"{first_name} {last_name}".strip()
+        dob_val = None
+        if date_of_birth is not None:
+            dob_val = date_of_birth.isoformat() if hasattr(date_of_birth, "isoformat") else str(date_of_birth)
+        user_dict = {
+            "id": str(uuid.uuid4()),
+            "email": acc.get("email") or "",
+            "phone": acc.get("phone") or "",
+            "first_name": first_name,
+            "last_name": last_name,
+            "full_name": full_name,
+            "role": "student",
+            "is_active": True,
+            "has_credentials": True,
+            "date_of_birth": dob_val,
+            "gender": gender,
+            "password": acc.get("password"),
+            "account_id": acc["id"],
+            "relationship": relationship or "child",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        if course:
+            user_dict["course"] = {
+                "category_id": getattr(course, "category_id", None) or (course.get("category_id") if isinstance(course, dict) else None),
+                "course_id": getattr(course, "course_id", None) or (course.get("course_id") if isinstance(course, dict) else None),
+                "duration": getattr(course, "duration", None) or (course.get("duration") if isinstance(course, dict) else None),
+            }
+        if branch:
+            branch_id = getattr(branch, "branch_id", None) or (branch.get("branch_id") if isinstance(branch, dict) else None)
+            location_id = getattr(branch, "location_id", None) or (branch.get("location_id") if isinstance(branch, dict) else None)
+            user_dict["branch"] = {"location_id": location_id or branch_id, "branch_id": branch_id}
+            user_dict["branch_id"] = branch_id
+            course_id = user_dict.get("course", {}).get("course_id") if user_dict.get("course") else None
+            if course_id and branch_id:
+                from utils.branch_courses import assert_course_available_at_branch
+                await assert_course_available_at_branch(db, branch_id, course_id)
+
+        await db.users.insert_one(user_dict)
+
+        enrollment_id = None
+        if user_dict.get("course") and user_dict.get("branch"):
+            try:
+                from models.enrollment_models import Enrollment, PaymentStatus
+                start_date = datetime.utcnow()
+                end_date = await resolve_enrollment_end_date(
+                    db, user_dict["course"]["duration"], start_date
+                )
+                enrollment = Enrollment(
+                    student_id=user_dict["id"],
+                    course_id=user_dict["course"]["course_id"],
+                    branch_id=user_dict["branch"]["branch_id"],
+                    start_date=start_date,
+                    end_date=end_date,
+                    fee_amount=0.0,
+                    admission_fee=0.0,
+                    payment_status=PaymentStatus.PENDING,
+                    enrollment_date=start_date,
+                    is_active=True,
+                )
+                enrollment_doc = enrollment.dict()
+                enrollment_doc["duration_id"] = user_dict["course"]["duration"]
+                await db.enrollments.insert_one(enrollment_doc)
+                enrollment_id = enrollment.id
+            except Exception:
+                logger.exception("Failed creating enrollment for linked student")
+
+        if send_welcome_sms and user_dict.get("phone"):
+            try:
+                await send_sms(
+                    user_dict["phone"],
+                    f"Welcome {full_name}! A student profile was added to your Rock Martial Arts account.",
+                )
+            except Exception:
+                logger.exception("Failed sending linked-student SMS")
+
+        return {"user_id": user_dict["id"], "enrollment_id": enrollment_id, "user": user_dict}
+
+    @staticmethod
+    async def list_linked_profiles(current_user: dict):
+        db = get_db()
+        if current_user.get("role") != "student":
+            return {"profiles": [], "account_id": None, "current_student_id": current_user.get("id")}
+        acc = await ensure_account_for_student(db, current_user)
+        return {
+            "profiles": await list_profiles(db, acc["id"]),
+            "account_id": acc["id"],
+            "current_student_id": current_user["id"],
+            "active_student_id": current_user["id"],
+        }
+
+    @staticmethod
+    async def switch_student(body: SwitchStudentBody, current_user: dict, request: Request):
+        db = get_db()
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can switch profiles")
+        acc = await ensure_account_for_student(db, current_user)
+        target = await db.users.find_one({
+            "id": body.student_id,
+            "account_id": acc["id"],
+            "role": "student",
+        })
+        if not target or target.get("is_active") is False:
+            raise HTTPException(status_code=403, detail="Student is not linked to this account")
+
+        access_token = create_access_token(data={
+            "sub": target["id"],
+            "role": "student",
+            "account_id": acc["id"],
+        })
+        profiles = await list_profiles(db, acc["id"])
+        try:
+            await log_activity(
+                request=request,
+                action="switch_student",
+                user_id=target["id"],
+                user_name=target.get("full_name", ""),
+                details={"from_student_id": current_user.get("id"), "account_id": acc["id"]},
+            )
+        except Exception:
+            pass
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": 86400,
+            "user": student_login_user_payload(target),
+            "profiles": profiles,
+            "account_id": acc["id"],
+            "active_student_id": target["id"],
+        }
+
+    @staticmethod
+    async def create_linked_student(body: LinkedStudentCreate, current_user: dict, request: Request):
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can add linked profiles")
+        db = get_db()
+        acc = await ensure_account_for_student(db, current_user)
+        created = await AuthController.create_student_under_account(
+            acc,
+            first_name=body.first_name,
+            last_name=body.last_name,
+            date_of_birth=body.date_of_birth,
+            gender=body.gender,
+            relationship=body.relationship or "child",
+            course=body.course,
+            branch=body.branch,
+            send_welcome_sms=True,
+        )
+        try:
+            await log_activity(
+                request=request,
+                action="linked_student_created",
+                user_id=created["user_id"],
+                user_name=created["user"].get("full_name", ""),
+                details={"account_id": acc["id"], "added_by": current_user.get("id")},
+            )
+        except Exception:
+            pass
+        return {
+            "student_id": created["user_id"],
+            "enrollment_id": created.get("enrollment_id"),
+            "profiles": await list_profiles(db, acc["id"]),
+            "message": "Student profile added",
         }

@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 from fastapi import HTTPException, UploadFile, status
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from controllers.cms_residential_camp_controller import CMSResidentialCampController, _date_range
 from controllers.upload_controller import ALLOWED_IMAGES, UPLOAD_ROOT, _safe_filename
@@ -109,7 +111,12 @@ class CampRegistrationController:
         doc["created_at"] = now
         doc["updated_at"] = now
         db = get_db()
-        result = await db[CampRegistrationController.COLLECTION].insert_one(doc)
+        doc["registration_code"] = await CampRegistrationController._next_registration_code(db)
+        try:
+            result = await db[CampRegistrationController.COLLECTION].insert_one(doc)
+        except DuplicateKeyError:
+            doc["registration_code"] = await CampRegistrationController._next_registration_code(db)
+            result = await db[CampRegistrationController.COLLECTION].insert_one(doc)
         saved = await db[CampRegistrationController.COLLECTION].find_one({"_id": result.inserted_id})
 
         # M15-S01: additive lead from camp registration (best-effort)
@@ -167,6 +174,7 @@ class CampRegistrationController:
                 {"participant.parent_guardian_mobile": {"$regex": term, "$options": "i"}},
                 {"payment.transaction_id": {"$regex": term, "$options": "i"}},
                 {"event.event_name": {"$regex": term, "$options": "i"}},
+                {"registration_code": {"$regex": term, "$options": "i"}},
             ]
         total = await collection.count_documents(query)
         cursor = collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
@@ -255,6 +263,7 @@ class CampRegistrationController:
         if stored_order and stored_order != body.razorpay_order_id:
             raise HTTPException(status_code=400, detail="Order does not match this registration")
         if (doc.get("status") or "") == "paid" and (doc.get("razorpay_payment_id") or "") == body.razorpay_payment_id:
+            doc = await CampRegistrationController._ensure_registration_code(doc)
             return CampRegistrationController._payment_result(doc)
         if not verify_razorpay_signature(
             body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
@@ -280,7 +289,8 @@ class CampRegistrationController:
             },
         )
         saved = await db[CampRegistrationController.COLLECTION].find_one({"_id": doc["_id"]})
-        return CampRegistrationController._payment_result(saved or doc)
+        saved = await CampRegistrationController._ensure_registration_code(saved or doc)
+        return CampRegistrationController._payment_result(saved)
 
     @staticmethod
     def _payment_result(doc: Dict[str, Any]) -> dict:
@@ -288,6 +298,8 @@ class CampRegistrationController:
         participant = doc.get("participant") or {}
         return {
             "id": str(doc.get("_id") or ""),
+            "registration_id": (doc.get("registration_code") or "").strip(),
+            "registration_code": (doc.get("registration_code") or "").strip(),
             "status": doc.get("status") or "paid",
             "event_name": event.get("event_name") or "",
             "event_dates": event.get("event_dates") or "",
@@ -300,6 +312,31 @@ class CampRegistrationController:
             "razorpay_payment_id": doc.get("razorpay_payment_id") or "",
             "amount_paise": doc.get("amount_paise") or 0,
         }
+
+    @staticmethod
+    async def _next_registration_code(db) -> str:
+        year = datetime.utcnow().year
+        result = await db.system_counters.find_one_and_update(
+            {"_id": f"camp_reg_{year}"},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        seq = int((result or {}).get("seq") or 1)
+        return f"RC-{year}-{seq:05d}"
+
+    @staticmethod
+    async def _ensure_registration_code(doc: Dict[str, Any]) -> Dict[str, Any]:
+        if (doc.get("registration_code") or "").strip():
+            return doc
+        db = get_db()
+        code = await CampRegistrationController._next_registration_code(db)
+        await db[CampRegistrationController.COLLECTION].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"registration_code": code, "updated_at": datetime.utcnow()}},
+        )
+        doc["registration_code"] = code
+        return doc
 
     @staticmethod
     async def _distinct_events() -> List[dict]:
@@ -376,6 +413,7 @@ class CampRegistrationController:
         return CampRegistrationSummary(
             id=ser.get("id") or "",
             status=ser.get("status") or "received",
+            registration_code=ser.get("registration_code") or "",
             event_id=event.get("event_id") or "",
             event_name=event.get("event_name") or "",
             event_dates=event.get("event_dates") or "",
@@ -394,6 +432,7 @@ class CampRegistrationController:
         return CampRegistrationResponse(
             id=ser.get("id") or "",
             status=ser.get("status") or "received",
+            registration_code=ser.get("registration_code") or "",
             event=CampRegistrationEventSnapshot(**(ser.get("event") or {})),
             participant=ser.get("participant") or {},
             training=ser.get("training") or {},
