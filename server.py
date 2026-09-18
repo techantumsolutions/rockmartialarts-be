@@ -157,6 +157,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.exception("Failed to ensure family account indexes")
     try:
+        await app.mongodb.camp_registrations.create_index(
+            "registration_code", unique=True, sparse=True
+        )
+    except Exception:
+        logging.exception("Failed to create camp_registrations.registration_code unique index")
+    try:
         # ESSL mapping: enforce unique employee code when set.
         await app.mongodb.users.create_index("essl_user_id", unique=True, sparse=True)
     except Exception:
