@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from typing import Optional
 
 from controllers.student_performance_controller import StudentPerformanceController
 from models.student_performance_models import (
@@ -10,27 +11,86 @@ from models.student_performance_models import (
     WarriorStatsUpsert,
 )
 from models.user_models import UserRole
+from utils.kpi_performance_metrics_service import get_performance_metrics
+from utils.course_syllabus_student_service import (
+    assert_student_can_stream_syllabus,
+    list_accessible_student_profiles,
+    list_student_syllabi,
+)
+from utils.course_syllabus_service import stream_syllabus_file
 from utils.unified_auth import require_role_unified
 
 router = APIRouter()
+
+DASHBOARD_ROLES = [
+    UserRole.STUDENT,
+    UserRole.SUPER_ADMIN,
+    UserRole.COACH_ADMIN,
+    UserRole.COACH,
+    UserRole.BRANCH_MANAGER,
+]
 
 
 @router.get("/dashboard/{student_id}")
 async def get_student_performance_dashboard(
     student_id: str,
-    current_user: dict = Depends(
-        require_role_unified(
-            [
-                UserRole.STUDENT,
-                UserRole.SUPER_ADMIN,
-                UserRole.COACH_ADMIN,
-                UserRole.COACH,
-                UserRole.BRANCH_MANAGER,
-            ]
-        )
-    ),
+    current_user: dict = Depends(require_role_unified(DASHBOARD_ROLES)),
 ):
     return await StudentPerformanceController.get_dashboard(student_id, current_user)
+
+
+@router.get("/performance-metrics/{student_id}")
+async def get_student_kpi_performance_metrics(
+    student_id: str,
+    period_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    current_user: dict = Depends(require_role_unified(DASHBOARD_ROLES)),
+):
+    """
+    M10-S05 additive KPI / rating / ranking summary for the performance dashboard.
+    Does not alter existing /dashboard/{id} payload.
+    """
+    return await get_performance_metrics(
+        student_id,
+        current_user=current_user,
+        period_id=period_id,
+        course_id=course_id,
+    )
+
+
+@router.get("/syllabus-profiles")
+async def get_syllabus_student_profiles(
+    current_user: dict = Depends(require_role_unified(DASHBOARD_ROLES)),
+):
+    """M11-S02-T04 — profiles available for student syllabus switcher."""
+    return await list_accessible_student_profiles(current_user=current_user)
+
+
+@router.get("/syllabi/{student_id}")
+async def get_student_course_syllabi(
+    student_id: str,
+    current_user: dict = Depends(require_role_unified(DASHBOARD_ROLES)),
+):
+    """
+    M11-S02 — list active syllabi for actively enrolled courses of the selected student.
+    """
+    return await list_student_syllabi(student_id, current_user=current_user)
+
+
+@router.get("/syllabi/{student_id}/file/{syllabus_id}")
+async def get_student_syllabus_file(
+    student_id: str,
+    syllabus_id: str,
+    current_user: dict = Depends(require_role_unified(DASHBOARD_ROLES)),
+):
+    """
+    Authenticated PDF stream for an enrolled student (enrollment-gated).
+    Prep for M11-S03 viewer; no public URL.
+    """
+    await assert_student_can_stream_syllabus(
+        syllabus_id, current_user=current_user, student_id=student_id
+    )
+    return await stream_syllabus_file(syllabus_id)
 
 
 @router.put("/achievements/{student_id}")

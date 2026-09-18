@@ -28,6 +28,8 @@ from models.student_models import (
     ConfirmRazorpayPayment,
     PrepareStudentCheckoutBody,
     CreateStudentRazorpayOrderBody,
+    RenewalQuoteBody,
+    PrepareRenewalCheckoutBody,
 )
 from models.user_models import UserRole, UserCreate
 from models.notification_models import PaymentNotification, PaymentNotificationCreate
@@ -111,7 +113,8 @@ def _course_branch_pricing_map(course: dict) -> dict:
 def _enrollment_checkout_total_inr(enrollment: dict) -> float:
     fee = float(enrollment.get("fee_amount") or 0)
     adm = float(enrollment.get("admission_fee") or 0)
-    return fee + adm
+    arrear = float(enrollment.get("arrear_amount") or 0)
+    return fee + adm + arrear
 
 
 def _duration_price_keys(duration: str, duration_info: Optional[dict]) -> list:
@@ -421,13 +424,35 @@ class PaymentController:
                     # Ensure enrollment is active/paid on success (subscription auto repair).
                     if mapped["payment_status"] == "paid" and (row.get("enrollment_id") or patch.get("enrollment_id")):
                         eid = patch.get("enrollment_id") or row.get("enrollment_id")
-                        await db.enrollments.update_one(
-                            {"id": eid},
-                            {
-                                "$set": {"payment_status": "paid", "is_active": True, "updated_at": now},
-                                "$unset": {"status": ""},
-                            },
-                        )
+                        try:
+                            from utils.renewal_service import finalize_renewal_after_payment
+
+                            enr = await db.enrollments.find_one({"id": eid})
+                            if enr:
+                                merged_pay = {**row, **patch}
+                                await finalize_renewal_after_payment(
+                                    db,
+                                    enrollment=enr,
+                                    payment_doc=merged_pay,
+                                    now=now,
+                                )
+                            else:
+                                await db.enrollments.update_one(
+                                    {"id": eid},
+                                    {
+                                        "$set": {"payment_status": "paid", "is_active": True, "updated_at": now},
+                                        "$unset": {"status": ""},
+                                    },
+                                )
+                        except Exception:
+                            logger.exception("Webhook renewal finalize failed enrollment_id=%s", eid)
+                            await db.enrollments.update_one(
+                                {"id": eid},
+                                {
+                                    "$set": {"payment_status": "paid", "is_active": True, "updated_at": now},
+                                    "$unset": {"status": ""},
+                                },
+                            )
                         await db.payments.update_many(
                             {
                                 "enrollment_id": eid,
@@ -448,6 +473,28 @@ class PaymentController:
                         except Exception:
                             logger.exception(
                                 "Cart checkout fulfillment failed payment_id=%s",
+                                row.get("id"),
+                            )
+                    # M07-S01: invoice for non-cart (and cart via fulfill hook) payments
+                    if mapped["payment_status"] == "paid":
+                        try:
+                            from utils.invoice_service import safe_generate_invoice_for_payment
+
+                            merged = {**row, **patch}
+                            await safe_generate_invoice_for_payment(payment_doc=merged)
+                        except Exception:
+                            logger.exception(
+                                "Invoice generation failed on webhook payment_id=%s",
+                                row.get("id"),
+                            )
+                        try:
+                            from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+                            merged = {**row, **patch}
+                            await safe_upsert_billing_cycles_for_payment(payment_doc=merged)
+                        except Exception:
+                            logger.exception(
+                                "Billing cycle upsert failed on webhook payment_id=%s",
                                 row.get("id"),
                             )
                 else:
@@ -733,6 +780,344 @@ class PaymentController:
         }
 
     @staticmethod
+    async def quote_student_renewal(
+        body: RenewalQuoteBody,
+        current_user: dict,
+    ):
+        """
+        M07-S03 renewal quote:
+        - normal renewal course fee (admission usually 0 after first paid enrollment)
+        - overdue days + grace window
+        - arrear component (0 until client formula confirmed)
+        - final payable amount
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        from utils.billing_state import calculate_arrear_amount, compute_enrollment_billing_state
+        from utils.renewal_service import package_quote_response
+
+        student_id = current_user["id"]
+        enrollment = await db.enrollments.find_one(
+            {"id": body.enrollment_id, "student_id": student_id}
+        )
+        if not enrollment:
+            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
+
+        course_id = enrollment.get("course_id")
+        branch_id = enrollment.get("branch_id")
+        if not course_id or not branch_id:
+            raise HTTPException(status_code=400, detail="Enrollment is missing course or branch.")
+
+        await _enforce_student_assigned_branch(db, student_id, branch_id, current_user)
+
+        duration = (body.duration or enrollment.get("duration_id") or "").strip()
+        if not duration:
+            raise HTTPException(
+                status_code=400,
+                detail="Duration is required for renewal quote.",
+            )
+
+        br = (body.batch_ref or enrollment.get("batch_ref") or "").strip() or None
+        beneficiary_payload = (
+            body.beneficiary.dict()
+            if body.beneficiary
+            else (enrollment.get("beneficiary") or {"beneficiary_type": "self"})
+        )
+        if not isinstance(beneficiary_payload, dict):
+            beneficiary_payload = {"beneficiary_type": "self"}
+
+        should_charge_admission = await should_charge_admission_fee_for_checkout(
+            db,
+            student_id=student_id,
+            beneficiary=beneficiary_payload,
+        )
+        info = await PaymentController.get_course_payment_info(
+            course_id,
+            branch_id,
+            duration,
+            batch_ref=br,
+            optional_student_id=student_id,
+            admission_fee_beneficiary=beneficiary_payload,
+        )
+        course_fee = float(info.pricing.course_fee)
+        admission_fee = float(info.pricing.admission_fee) if should_charge_admission else 0.0
+
+        billing = compute_enrollment_billing_state(enrollment.get("end_date"))
+        duration_months = 1
+        try:
+            dur_row = await db.durations.find_one({"id": duration})
+            if not dur_row:
+                dur_row = await db.durations.find_one({"code": duration})
+            if dur_row and dur_row.get("duration_months") is not None:
+                duration_months = max(1, int(dur_row["duration_months"]))
+        except (TypeError, ValueError):
+            duration_months = 1
+
+        arrear = calculate_arrear_amount(
+            overdue_days=int(billing.get("overdue_days") or 0),
+            course_fee=course_fee,
+            duration_months=duration_months,
+            billing_state=str(billing.get("billing_state") or "active"),
+        )
+
+        cycle = None
+        try:
+            from utils.billing_cycle_service import get_active_cycle_for_enrollment
+
+            cycle = await get_active_cycle_for_enrollment(body.enrollment_id)
+        except Exception:
+            cycle = None
+
+        return package_quote_response(
+            enrollment_id=body.enrollment_id,
+            course_id=course_id,
+            branch_id=branch_id,
+            duration=duration,
+            batch_ref=br,
+            course_name=info.course_name,
+            branch_name=info.branch_name,
+            course_fee=course_fee,
+            admission_fee=admission_fee,
+            arrear=arrear,
+            billing=billing,
+            duration_months=duration_months,
+            cycle=cycle,
+            enrollment=enrollment,
+        )
+
+    @staticmethod
+    async def prepare_student_renewal_checkout(
+        body: PrepareRenewalCheckoutBody,
+        current_user: dict,
+    ):
+        """
+        M07-S04: create a pending renewal enrollment from an existing enrollment + quote.
+        Reuses shared M06 Razorpay order/confirm afterward.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        from utils.billing_state import calculate_arrear_amount
+        from utils.renewal_service import compute_renewal_validity_start
+
+        student_id = current_user["id"]
+        source = await db.enrollments.find_one({"id": body.enrollment_id, "student_id": student_id})
+        if not source:
+            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
+
+        course_id = source.get("course_id")
+        branch_id = source.get("branch_id")
+        if not course_id or not branch_id:
+            raise HTTPException(status_code=400, detail="Enrollment is missing course or branch.")
+
+        await _enforce_student_assigned_branch(db, student_id, branch_id, current_user)
+
+        duration = (body.duration or source.get("duration_id") or "").strip()
+        if not duration:
+            raise HTTPException(status_code=400, detail="Duration is required for renewal.")
+
+        # Cancel stale renewal pending checkouts for this course (do not touch paid source).
+        stale_pending = await db.enrollments.find(
+            {
+                "student_id": student_id,
+                "course_id": course_id,
+                "payment_status": EnrollmentPaymentStatus.PENDING.value,
+                "is_renewal": True,
+            },
+            {"id": 1},
+        ).to_list(length=None)
+        stale_ids = [str(e.get("id")) for e in stale_pending if e.get("id")]
+        if stale_ids:
+            await db.payments.update_many(
+                {
+                    "student_id": student_id,
+                    "enrollment_id": {"$in": stale_ids},
+                    "payment_status": {"$in": [PaymentStatus.PENDING.value, "processing", "failed"]},
+                },
+                {
+                    "$set": {
+                        "payment_status": "cancelled",
+                        "status": "cancelled",
+                        "updated_at": datetime.utcnow(),
+                        "notes": "Auto-cancelled stale renewal checkout attempt",
+                    }
+                },
+            )
+            await db.enrollments.delete_many({"id": {"$in": stale_ids}})
+
+        batch_ref = (body.batch_ref or source.get("batch_ref") or "").strip() or None
+        beneficiary_payload = (
+            body.beneficiary.dict()
+            if body.beneficiary
+            else (source.get("beneficiary") or {"beneficiary_type": "self"})
+        )
+        if not isinstance(beneficiary_payload, dict):
+            beneficiary_payload = {"beneficiary_type": "self"}
+
+        should_charge_admission = await should_charge_admission_fee_for_checkout(
+            db,
+            student_id=student_id,
+            beneficiary=beneficiary_payload,
+        )
+        info = await PaymentController.get_course_payment_info(
+            course_id,
+            branch_id,
+            duration,
+            batch_ref=batch_ref,
+            optional_student_id=student_id,
+            admission_fee_beneficiary=beneficiary_payload,
+        )
+
+        validity = compute_renewal_validity_start(source.get("end_date"))
+        start_date = validity["start_date"]
+        billing = validity["billing"]
+
+        duration_row = await db.durations.find_one({"id": duration})
+        if not duration_row:
+            duration_row = await db.durations.find_one({"code": duration})
+        months_hint = None
+        if duration_row and duration_row.get("duration_months") is not None:
+            try:
+                months_hint = int(duration_row["duration_months"])
+            except (TypeError, ValueError):
+                months_hint = None
+
+        # Provisional end_date for display; authoritative end is recomputed after verified payment.
+        end_date = await resolve_enrollment_end_date(
+            db, duration, start_date, months_hint=months_hint
+        )
+
+        course_fee = float(info.pricing.course_fee)
+        admission_fee = float(info.pricing.admission_fee) if should_charge_admission else 0.0
+        arrear = calculate_arrear_amount(
+            overdue_days=int(billing.get("overdue_days") or 0),
+            course_fee=course_fee,
+            duration_months=max(1, months_hint or 1),
+            billing_state=str(billing.get("billing_state") or "active"),
+        )
+        arrear_amount = float(arrear.get("arrear_amount") or 0)
+        total_amount = round(course_fee + admission_fee + arrear_amount, 2)
+
+        enrollment = EnrollmentModel(
+            student_id=student_id,
+            course_id=course_id,
+            branch_id=branch_id,
+            start_date=start_date,
+            end_date=end_date,
+            fee_amount=course_fee,
+            admission_fee=admission_fee,
+            payment_status=EnrollmentPaymentStatus.PENDING,
+            is_active=True,
+        )
+        enrollment_doc = enrollment.dict()
+        enrollment_doc["duration_id"] = duration
+        enrollment_doc["duration_months"] = months_hint
+        enrollment_doc["enrollment_date"] = start_date
+        enrollment_doc["is_renewal"] = True
+        enrollment_doc["renewed_from_enrollment_id"] = source.get("id")
+        enrollment_doc["renewal_prior_end_date"] = source.get("end_date")
+        enrollment_doc["renewal_billing_state"] = billing.get("billing_state")
+        enrollment_doc["renewal_overdue_days"] = billing.get("overdue_days")
+        enrollment_doc["renewal_start_mode"] = validity.get("mode")
+        enrollment_doc["arrear_amount"] = arrear_amount
+        enrollment_doc["arrear_rule"] = arrear.get("arrear_rule")
+        enrollment_doc["renewal_checkout_pending"] = True
+        if batch_ref:
+            enrollment_doc["batch_ref"] = batch_ref
+        if beneficiary_payload and beneficiary_payload.get("beneficiary_type") != "self":
+            enrollment_doc["beneficiary"] = beneficiary_payload
+        await db.enrollments.insert_one(enrollment_doc)
+
+        return {
+            "enrollment_id": enrollment.id,
+            "source_enrollment_id": source.get("id"),
+            "amount": total_amount,
+            "course_name": info.course_name,
+            "branch_name": info.branch_name,
+            "duration_months": months_hint,
+            "is_renewal": True,
+            "billing_state": billing.get("billing_state"),
+            "overdue_days": billing.get("overdue_days"),
+            "grace_days_remaining": billing.get("grace_days_remaining"),
+            "prior_end_date": source.get("end_date"),
+            "provisional_end_date": end_date,
+            "pricing": {
+                "course_fee": course_fee,
+                "admission_fee": admission_fee,
+                "arrear_amount": arrear_amount,
+                "total_amount": total_amount,
+                "currency": "INR",
+            },
+            "arrear": arrear,
+            "message": (
+                "Renewal checkout ready. Validity updates only after verified payment."
+            ),
+        }
+
+    @staticmethod
+    async def get_student_renewal_history(
+        current_user: dict,
+        enrollment_id: Optional[str] = None,
+    ):
+        """M07-S04: list renewal history for the student (optionally filtered by enrollment)."""
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        student_id = current_user["id"]
+        query: Dict = {"student_id": student_id}
+        if enrollment_id:
+            # Match either source or renewal enrollment ownership
+            owned = await db.enrollments.find_one(
+                {"id": enrollment_id, "student_id": student_id},
+                {"id": 1},
+            )
+            if not owned:
+                raise HTTPException(status_code=404, detail="Enrollment not found")
+            query = {
+                "$or": [
+                    {"source_enrollment_id": enrollment_id},
+                    {"renewal_enrollment_id": enrollment_id},
+                    {"enrollment_id": enrollment_id},
+                ]
+            }
+
+        rows = []
+        try:
+            cursor = db.renewal_history.find(query).sort("renewal_date", -1)
+            rows = await cursor.to_list(length=100)
+        except Exception:
+            # Fallback: read embedded history from enrollments
+            enr_q: Dict = {"student_id": student_id}
+            if enrollment_id:
+                enr_q["id"] = enrollment_id
+            enrollments = await db.enrollments.find(
+                enr_q, {"id": 1, "renewal_history": 1, "course_id": 1}
+            ).to_list(length=50)
+            for enr in enrollments:
+                for item in enr.get("renewal_history") or []:
+                    if isinstance(item, dict):
+                        rows.append({**item, "enrollment_id": enr.get("id")})
+
+        cleaned = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            item = {k: v for k, v in r.items() if k != "_id"}
+            cleaned.append(item)
+        cleaned.sort(key=lambda x: str(x.get("renewal_date") or ""), reverse=True)
+        return {"renewals": cleaned, "total": len(cleaned)}
+
+    @staticmethod
     async def student_process_payment(
         payment_data: StudentPaymentCreate,
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
@@ -875,23 +1260,57 @@ class PaymentController:
                     }
                 },
             )
-            paid_patch = {
-                "payment_status": PaymentStatus.PAID.value,
-                "is_active": True,
-                "updated_at": now,
-            }
-            recomputed = await enrollment_subscription_end_after_payment(db, enrollment)
-            if recomputed:
-                paid_patch["end_date"] = recomputed
-            await db.enrollments.update_one(
-                {"id": enrollment["id"]},
-                {"$set": paid_patch, "$unset": {"status": ""}},
-            )
-            return {
+            renewal_meta = {}
+            try:
+                from utils.renewal_service import finalize_renewal_after_payment
+
+                renewal_meta = await finalize_renewal_after_payment(
+                    db,
+                    enrollment=enrollment,
+                    payment_doc=existing_paid,
+                    now=now,
+                )
+            except Exception:
+                logger.exception("Renewal finalize failed on idempotent confirm enrollment_id=%s", enrollment.get("id"))
+                paid_patch = {
+                    "payment_status": PaymentStatus.PAID.value,
+                    "is_active": True,
+                    "updated_at": now,
+                }
+                recomputed = await enrollment_subscription_end_after_payment(db, enrollment)
+                if recomputed:
+                    paid_patch["end_date"] = recomputed
+                await db.enrollments.update_one(
+                    {"id": enrollment["id"]},
+                    {"$set": paid_patch, "$unset": {"status": ""}},
+                )
+            invoice = None
+            try:
+                from utils.invoice_service import safe_generate_invoice_for_payment
+
+                invoice = await safe_generate_invoice_for_payment(payment_doc=existing_paid)
+            except Exception:
+                pass
+            try:
+                from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+                await safe_upsert_billing_cycles_for_payment(payment_doc=existing_paid)
+            except Exception:
+                pass
+            out = {
                 "message": "Payment already verified",
                 "payment_id": existing_paid.get("id") or str(existing_paid.get("_id")),
             }
+            if invoice and invoice.get("id"):
+                out["invoice_id"] = invoice.get("id")
+                out["invoice_number"] = invoice.get("invoice_number")
+            if renewal_meta.get("renewal"):
+                out["is_renewal"] = True
+                out["new_end_date"] = renewal_meta.get("end_date")
+                out["prior_end_date"] = renewal_meta.get("prior_end_date")
+            return out
 
+        is_renewal_enr = bool(enrollment.get("is_renewal") or enrollment.get("renewed_from_enrollment_id"))
         payment_doc = {
             "id": str(uuid.uuid4()),
             "user_id": student_id,  # alias for reporting compatibility
@@ -916,6 +1335,14 @@ class PaymentController:
             "created_at": now,
             "updated_at": now,
         }
+        if is_renewal_enr:
+            payment_doc["is_renewal"] = True
+            payment_doc["renewed_from_enrollment_id"] = enrollment.get("renewed_from_enrollment_id")
+            payment_doc["arrear_amount"] = float(enrollment.get("arrear_amount") or 0)
+            payment_doc["notes"] = (
+                f"Renewal via Razorpay order: {data.razorpay_order_id or 'N/A'}"
+            )
+
         # Update pending row created at order time when available; otherwise insert paid row.
         pending_filter = {
             "student_id": student_id,
@@ -933,21 +1360,33 @@ class PaymentController:
         else:
             await db.payments.insert_one(payment_doc)
 
-        update_enrollment = {
-            "payment_status": PaymentStatus.PAID.value,
-            "is_active": True,
-            "updated_at": now,
-        }
-        recomputed_end = await enrollment_subscription_end_after_payment(db, enrollment)
-        if recomputed_end:
-            update_enrollment["end_date"] = recomputed_end
+        renewal_meta = {}
+        try:
+            from utils.renewal_service import finalize_renewal_after_payment
 
-        enr_upd = await db.enrollments.update_one(
-            {"id": enrollment["id"]},
-            {"$set": update_enrollment, "$unset": {"status": ""}},
-        )
-        if enr_upd.matched_count == 0:
-            raise HTTPException(status_code=500, detail="Failed to activate enrollment after payment.")
+            renewal_meta = await finalize_renewal_after_payment(
+                db,
+                enrollment=enrollment,
+                payment_doc=payment_doc,
+                now=now,
+            )
+        except Exception:
+            logger.exception("Renewal finalize failed on confirm enrollment_id=%s", enrollment.get("id"))
+            update_enrollment = {
+                "payment_status": PaymentStatus.PAID.value,
+                "is_active": True,
+                "updated_at": now,
+            }
+            recomputed_end = await enrollment_subscription_end_after_payment(db, enrollment)
+            if recomputed_end:
+                update_enrollment["end_date"] = recomputed_end
+
+            enr_upd = await db.enrollments.update_one(
+                {"id": enrollment["id"]},
+                {"$set": update_enrollment, "$unset": {"status": ""}},
+            )
+            if enr_upd.matched_count == 0:
+                raise HTTPException(status_code=500, detail="Failed to activate enrollment after payment.")
 
         # Mark any sibling pending attempts for the same enrollment as cancelled.
         await db.payments.update_many(
@@ -967,7 +1406,30 @@ class PaymentController:
             },
         )
 
-        return {"message": "Payment recorded successfully", "payment_id": payment_doc["id"]}
+        invoice = None
+        try:
+            from utils.invoice_service import safe_generate_invoice_for_payment
+
+            invoice = await safe_generate_invoice_for_payment(payment_doc=payment_doc)
+        except Exception:
+            pass
+        try:
+            from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+            await safe_upsert_billing_cycles_for_payment(payment_doc=payment_doc)
+        except Exception:
+            pass
+
+        out = {"message": "Payment recorded successfully", "payment_id": payment_doc["id"]}
+        if invoice and invoice.get("id"):
+            out["invoice_id"] = invoice.get("id")
+            out["invoice_number"] = invoice.get("invoice_number")
+        if renewal_meta.get("renewal"):
+            out["is_renewal"] = True
+            out["new_end_date"] = renewal_meta.get("end_date")
+            out["prior_end_date"] = renewal_meta.get("prior_end_date")
+            out["message"] = "Renewal payment recorded successfully"
+        return out
 
     @staticmethod
     async def create_student_razorpay_order(
@@ -1908,6 +2370,23 @@ class PaymentController:
             )
 
             await db.payments.insert_one(payment.dict())
+
+            # M07-S01: automatic invoice (non-blocking)
+            try:
+                from utils.invoice_service import safe_generate_invoice_for_payment
+
+                await safe_generate_invoice_for_payment(
+                    payment_doc=payment.dict(),
+                    source_hint="registration",
+                )
+            except Exception:
+                pass
+            try:
+                from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+                await safe_upsert_billing_cycles_for_payment(payment_doc=payment.dict())
+            except Exception:
+                pass
 
             # Create notification for superadmin
             student_data = {

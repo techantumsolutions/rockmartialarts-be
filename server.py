@@ -55,6 +55,63 @@ from routes.student_showcase_achievement_routes import router as showcase_achiev
 from routes.onboarding_routes import router as onboarding_router
 from routes.cart_routes import router as cart_router
 from routes.discount_rule_routes import router as discount_rule_router
+from routes.invoice_routes import router as invoice_router
+from routes.billing_routes import router as billing_router
+from routes.public_student_id_routes import router as public_student_id_router
+from routes.biometric_device_routes import router as biometric_device_router
+from routes.kpi_routes import router as kpi_router
+from routes.kpi_assessment_routes import (
+    periods_router as kpi_periods_router,
+    assessments_router as kpi_assessments_router,
+)
+from routes.kpi_rating_routes import router as kpi_ratings_router
+from routes.kpi_ranking_routes import router as kpi_rankings_router
+from routes.course_syllabus_routes import router as course_syllabus_router
+from routes.training_request_routes import router as training_request_router
+from routes.demo_schedule_routes import router as demo_schedule_router
+from routes.demo_session_routes import router as demo_session_router
+from routes.demo_booking_admin_routes import router as demo_booking_admin_router
+from routes.coach_subscription_routes import router as coach_subscription_router
+from routes.callback_routes import router as callback_router
+from routes.lead_coach_assignment_routes import (
+    lead_assignment_router,
+    coach_assignment_router,
+)
+from routes.coach_session_booking_routes import (
+    router as coach_session_booking_router,
+    lead_session_router,
+    coach_me_session_router,
+)
+from routes.learning_course_routes import router as learning_course_router
+from routes.learning_hierarchy_routes import hierarchy_router as learning_hierarchy_router
+from routes.learning_subscription_routes import router as learning_subscription_router
+from routes.learning_access_routes import router as learning_access_router
+from routes.learning_progress_routes import router as learning_progress_router
+from routes.academy_event_routes import router as academy_event_router
+from routes.academy_event_registration_routes import (
+    router as academy_event_registration_router,
+)
+from routes.academy_event_registration_admin_routes import (
+    router as academy_event_registration_admin_router,
+)
+from routes.academy_event_reminder_routes import (
+    router as academy_event_reminder_router,
+)
+from routes.notification_template_routes import (
+    router as notification_template_router,
+)
+from routes.notification_send_routes import (
+    router as notification_send_router,
+)
+from routes.student_promotion_routes import (
+    router as student_promotion_router,
+)
+from routes.champion_routes import (
+    router as champion_router,
+)
+from routes.collaboration_partner_routes import (
+    router as collaboration_partner_router,
+)
 
 # Import database utility
 from utils.database import db
@@ -149,6 +206,26 @@ async def lifespan(app: FastAPI):
         await ensure_cart_checkout_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure cart checkout indexes")
+    try:
+        from utils.invoice_service import ensure_invoice_indexes
+        await ensure_invoice_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure invoice indexes")
+    try:
+        from utils.invoice_whatsapp_service import ensure_invoice_whatsapp_indexes
+        await ensure_invoice_whatsapp_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure invoice WhatsApp delivery indexes")
+    try:
+        from utils.student_status_service import ensure_student_status_indexes
+        await ensure_student_status_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure student status history indexes")
+    try:
+        from utils.billing_cycle_service import ensure_billing_cycle_indexes
+        await ensure_billing_cycle_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure billing cycle indexes")
 
     # Additive indexes (safe to re-run).
     try:
@@ -222,6 +299,200 @@ async def lifespan(app: FastAPI):
         await ensure_branch_course_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure branch course indexes")
+
+    try:
+        from utils.kpi_service import ensure_kpi_indexes
+        await ensure_kpi_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure KPI definition indexes")
+
+    try:
+        from utils.kpi_assessment_service import ensure_kpi_assessment_indexes
+        await ensure_kpi_assessment_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure KPI assessment indexes")
+
+    try:
+        from utils.kpi_rating_service import ensure_kpi_rating_indexes
+        await ensure_kpi_rating_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure KPI rating indexes")
+
+    try:
+        from utils.kpi_ranking_service import ensure_kpi_ranking_indexes
+        await ensure_kpi_ranking_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure KPI ranking indexes")
+
+    try:
+        from utils.course_syllabus_service import ensure_course_syllabus_indexes
+        await ensure_course_syllabus_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure course syllabus indexes")
+
+    try:
+        from utils.training_request_service import ensure_training_request_indexes
+        await ensure_training_request_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure training request indexes")
+
+    try:
+        from utils.demo_schedule_service import ensure_demo_schedule_indexes
+        await ensure_demo_schedule_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure demo schedule indexes")
+
+    try:
+        from utils.demo_booking_service import ensure_demo_booking_indexes
+        await ensure_demo_booking_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure demo booking indexes")
+
+    try:
+        from utils.coach_registration_service import ensure_coach_registration_indexes
+        await ensure_coach_registration_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure coach registration indexes")
+
+    try:
+        from utils.coach_approval_service import ensure_coach_approval_indexes
+        await ensure_coach_approval_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure coach approval indexes")
+
+    try:
+        from utils.coach_availability_service import ensure_coach_availability_indexes
+        await ensure_coach_availability_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure coach availability indexes")
+
+    try:
+        from utils.coach_subscription_service import (
+            ensure_coach_subscription_indexes,
+            seed_default_plan_if_empty,
+        )
+        await ensure_coach_subscription_indexes(app.mongodb)
+        await seed_default_plan_if_empty(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure coach subscription indexes")
+
+    try:
+        from utils.lead_service import ensure_lead_indexes
+        await ensure_lead_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure lead indexes")
+
+    try:
+        from utils.callback_service import ensure_callback_indexes
+        await ensure_callback_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure callback indexes")
+
+    try:
+        from utils.lead_coach_assignment_service import (
+            ensure_lead_coach_assignment_indexes,
+        )
+        await ensure_lead_coach_assignment_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure lead coach assignment indexes")
+
+    try:
+        from utils.coach_session_booking_service import (
+            ensure_coach_session_booking_indexes,
+        )
+        await ensure_coach_session_booking_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure coach session booking indexes")
+
+    try:
+        from utils.learning_course_service import ensure_learning_course_indexes
+        await ensure_learning_course_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure learning course indexes")
+
+    try:
+        from utils.learning_hierarchy_service import ensure_learning_hierarchy_indexes
+        await ensure_learning_hierarchy_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure learning hierarchy indexes")
+
+    try:
+        from utils.learning_subscription_service import (
+            ensure_learning_subscription_indexes,
+        )
+        await ensure_learning_subscription_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure learning subscription indexes")
+
+    try:
+        from utils.learning_progress_service import ensure_learning_progress_indexes
+        await ensure_learning_progress_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure learning progress indexes")
+
+    try:
+        from utils.academy_event_service import ensure_academy_event_indexes
+        await ensure_academy_event_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure academy event indexes")
+
+    try:
+        from utils.academy_event_registration_service import (
+            ensure_academy_event_registration_indexes,
+        )
+        await ensure_academy_event_registration_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure academy event registration indexes")
+
+    try:
+        from utils.academy_event_registration_otp_service import (
+            ensure_academy_event_registration_otp_indexes,
+        )
+        await ensure_academy_event_registration_otp_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure academy event registration OTP indexes")
+
+    try:
+        from utils.academy_event_reminder_service import (
+            ensure_academy_event_reminder_indexes,
+        )
+        await ensure_academy_event_reminder_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure academy event reminder indexes")
+
+    try:
+        from utils.notification_template_service import (
+            ensure_notification_template_indexes,
+        )
+        await ensure_notification_template_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure notification template indexes")
+
+    try:
+        from utils.notification_send_service import ensure_notification_send_indexes
+        await ensure_notification_send_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure notification send indexes")
+
+    try:
+        from utils.student_promotion_service import ensure_student_promotion_indexes
+        from utils.student_promotion_student_service import (
+            ensure_promotion_event_indexes,
+        )
+        await ensure_student_promotion_indexes(app.mongodb)
+        await ensure_promotion_event_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure student promotion indexes")
+
+    try:
+        from utils.champion_service import ensure_champion_indexes
+        from utils.champion_achievement_service import (
+            ensure_champion_achievement_indexes,
+        )
+        await ensure_champion_indexes(app.mongodb)
+        await ensure_champion_achievement_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure champion indexes")
 
     # Start scheduled reconciliation (additive; safe when disabled)
     reconcile_task = asyncio.create_task(_payments_reconciliation_loop(app.mongodb))
@@ -311,6 +582,92 @@ app.include_router(email_router, prefix="/api/email", tags=["Email"])
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
 app.include_router(lead_router, prefix="/api/leads", tags=["Leads"])
+app.include_router(lead_assignment_router, prefix="/api/leads", tags=["Lead Coach Assignment"])
+app.include_router(lead_session_router, prefix="/api/leads", tags=["Lead Coach Sessions"])
+app.include_router(
+    coach_assignment_router,
+    prefix="/api/lead-coach-assignments",
+    tags=["Lead Coach Assignment"],
+)
+app.include_router(
+    coach_session_booking_router,
+    prefix="/api/coach-session-bookings",
+    tags=["Coach Session Bookings"],
+)
+app.include_router(
+    coach_me_session_router, prefix="/api/coaches", tags=["Coach Session Bookings"]
+)
+app.include_router(
+    learning_course_router,
+    prefix="/api/learning-courses",
+    tags=["Online Learning"],
+)
+app.include_router(
+    learning_hierarchy_router,
+    prefix="/api/learning-courses",
+    tags=["Online Learning Hierarchy"],
+)
+app.include_router(
+    learning_subscription_router,
+    prefix="/api/learning-subscriptions",
+    tags=["Online Learning Subscriptions"],
+)
+app.include_router(
+    learning_access_router,
+    prefix="/api/learning-access",
+    tags=["Online Learning Access"],
+)
+app.include_router(
+    learning_progress_router,
+    prefix="/api/learning-progress",
+    tags=["Online Learning Progress"],
+)
+app.include_router(
+    academy_event_router,
+    prefix="/api/academy-events",
+    tags=["Academy Events"],
+)
+app.include_router(
+    academy_event_registration_router,
+    prefix="/api/academy-event-registrations",
+    tags=["Academy Event Registrations"],
+)
+app.include_router(
+    academy_event_registration_admin_router,
+    prefix="/api/academy-event-registration-admin",
+    tags=["Academy Event Registration Admin"],
+)
+app.include_router(
+    academy_event_reminder_router,
+    prefix="/api/academy-events",
+    tags=["Academy Event Reminders"],
+)
+app.include_router(
+    notification_template_router,
+    prefix="/api/notification-templates",
+    tags=["Notification Templates"],
+)
+app.include_router(
+    notification_send_router,
+    prefix="/api/notifications",
+    tags=["Notification Sending"],
+)
+app.include_router(
+    student_promotion_router,
+    prefix="/api/student-promotions",
+    tags=["Student Promotions"],
+)
+app.include_router(
+    champion_router,
+    prefix="/api/champions",
+    tags=["Champions"],
+)
+app.include_router(
+    collaboration_partner_router,
+    prefix="/api/collaboration-partners",
+    tags=["Collaboration Partners"],
+)
+app.include_router(callback_router, prefix="/api/callbacks", tags=["Callbacks"])
 app.include_router(dropdown_settings_router, prefix="/api/dropdown-settings", tags=["Master Data"])
 app.include_router(message_router, prefix="/api/messages", tags=["Messages"])
 app.include_router(reports_router, prefix="/api/reports", tags=["Reports"])
@@ -329,6 +686,43 @@ app.include_router(
 app.include_router(onboarding_router, prefix="/api/onboarding", tags=["Onboarding"])
 app.include_router(cart_router, prefix="/api/carts", tags=["Enrollment Cart"])
 app.include_router(discount_rule_router, prefix="/api/discount-rules", tags=["Discount Rules"])
+app.include_router(invoice_router, prefix="/api/invoices", tags=["Invoices"])
+app.include_router(billing_router, prefix="/api/billing-cycles", tags=["Billing Cycles"])
+app.include_router(
+    public_student_id_router, prefix="/api/public", tags=["Public Student ID"]
+)
+app.include_router(
+    biometric_device_router, prefix="/api/biometric-devices", tags=["Biometric Devices"]
+)
+app.include_router(kpi_router, prefix="/api/kpi-definitions", tags=["KPI Definitions"])
+app.include_router(
+    kpi_periods_router, prefix="/api/kpi-assessment-periods", tags=["KPI Assessment Periods"]
+)
+app.include_router(
+    kpi_assessments_router, prefix="/api/kpi-assessments", tags=["KPI Assessments"]
+)
+app.include_router(kpi_ratings_router, prefix="/api/kpi-ratings", tags=["KPI Ratings"])
+app.include_router(kpi_rankings_router, prefix="/api/kpi-rankings", tags=["KPI Rankings"])
+app.include_router(
+    course_syllabus_router, prefix="/api/course-syllabi", tags=["Course Syllabi"]
+)
+app.include_router(
+    training_request_router, prefix="/api/training-requests", tags=["Training Requests"]
+)
+app.include_router(
+    demo_schedule_router, prefix="/api/demo-schedules", tags=["Demo Schedules"]
+)
+app.include_router(
+    demo_session_router, prefix="/api/demo-sessions", tags=["Demo Sessions"]
+)
+app.include_router(
+    demo_booking_admin_router, prefix="/api/demo-bookings", tags=["Demo Bookings Admin"]
+)
+app.include_router(
+    coach_subscription_router,
+    prefix="/api/coach-subscriptions",
+    tags=["Coach Subscriptions"],
+)
 app.include_router(reg_checkout_router, prefix="/api/reg-checkout", tags=["Registration Checkout"])
 app.include_router(student_performance_router, prefix="/api/student", tags=["Student Performance"])
 

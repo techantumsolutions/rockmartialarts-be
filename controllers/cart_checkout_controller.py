@@ -273,12 +273,33 @@ class CartCheckoutController:
             raise HTTPException(status_code=403, detail="This checkout does not belong to you")
 
         if checkout.get("status") == CartCheckoutStatus.FULFILLED.value:
-            return {
+            invoice = None
+            try:
+                from utils.invoice_service import safe_generate_invoice_for_payment
+
+                invoice = await safe_generate_invoice_for_payment(
+                    cart_checkout_id=body.cart_checkout_id
+                )
+            except Exception:
+                pass
+            try:
+                from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+                await safe_upsert_billing_cycles_for_payment(
+                    cart_checkout_id=body.cart_checkout_id
+                )
+            except Exception:
+                pass
+            out = {
                 "message": "Checkout already completed",
                 "already_fulfilled": True,
                 "cart_checkout_id": body.cart_checkout_id,
                 "enrollment_ids": [l.get("enrollment_id") for l in (checkout.get("enrollment_links") or [])],
             }
+            if invoice and invoice.get("id"):
+                out["invoice_id"] = invoice.get("id")
+                out["invoice_number"] = invoice.get("invoice_number")
+            return out
 
         if not verify_razorpay_signature(
             body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature

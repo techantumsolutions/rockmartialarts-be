@@ -57,6 +57,57 @@ async def get_student_reports(
         current_user, branch_id, course_id, start_date, end_date
     )
 
+
+@router.get("/students/list")
+async def list_student_report_rows(
+    q: Optional[str] = Query(None, description="Search name/email/phone"),
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    is_active: Optional[bool] = Query(None, description="Account status filter"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(get_current_user_or_superadmin),
+):
+    """M08-S02: filtered student rows for Admin/Branch Manager reports."""
+    return await ReportsController.list_student_report_rows(
+        current_user,
+        q=q,
+        branch_id=branch_id,
+        course_id=course_id,
+        is_active=is_active,
+        start_date=start_date,
+        end_date=end_date,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/students/export")
+async def export_student_reports(
+    format: str = Query("csv", description="csv or excel"),
+    q: Optional[str] = Query(None),
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    is_active: Optional[bool] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user_or_superadmin),
+):
+    """M08-S02: CSV/Excel export using current authorized filters."""
+    return await ReportsController.export_student_reports(
+        current_user,
+        format=format,
+        q=q,
+        branch_id=branch_id,
+        course_id=course_id,
+        is_active=is_active,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 @router.get("/students/filters")
 async def get_student_report_filters(
     current_user: dict = Depends(get_current_user_or_superadmin)
