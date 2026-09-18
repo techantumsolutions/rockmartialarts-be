@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 import uuid
 from enum import Enum
 
@@ -66,6 +66,21 @@ class PaymentCreate(BaseModel):
     course_details: Optional[Dict[str, Any]] = None
     branch_details: Optional[Dict[str, Any]] = None
 
+class FamilyStudentEnrollment(BaseModel):
+    first_name: str
+    last_name: str
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    relationship: str = "self"
+    course_id: str
+    branch_id: str
+    category_id: str
+    duration: str
+    duration_months: Optional[int] = None
+    batch_ref: Optional[str] = None
+    location_id: Optional[str] = None
+
+
 # New model for registration payment processing
 class RegistrationPaymentCreate(BaseModel):
     student_data: Dict[str, Any]  # Complete student registration data
@@ -79,6 +94,8 @@ class RegistrationPaymentCreate(BaseModel):
     duration_months: Optional[int] = None
     # Matches course payment-info batch_ref (per-batch fee at branch)
     batch_ref: Optional[str] = None
+    # When set, create one family account with N students. Single-student flow omits this.
+    family_students: Optional[List[FamilyStudentEnrollment]] = None
 
 class RegistrationPaymentResponse(BaseModel):
     payment_id: str

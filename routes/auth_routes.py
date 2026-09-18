@@ -8,6 +8,8 @@ from models.user_models import (
     StudentProfileUpdate,
     PasswordResetSendOtpBody,
     PasswordResetVerifyOtpBody,
+    SwitchStudentBody,
+    LinkedStudentCreate,
 )
 from pydantic import BaseModel, EmailStr
 from utils.auth import require_role, get_current_active_user
@@ -88,3 +90,45 @@ async def upload_student_profile_photo(
 ):
     """Upload profile photo (JPG/PNG, max ~2MB)."""
     return await AuthController.upload_student_profile_photo(file, current_user)
+
+
+@router.get("/profiles")
+async def list_linked_profiles(current_user: dict = Depends(require_role([UserRole.STUDENT]))):
+    """Linked student profiles on the current family account."""
+    return await AuthController.list_linked_profiles(current_user)
+
+
+@router.get("/linked-students")
+async def list_linked_students(current_user: dict = Depends(require_role([UserRole.STUDENT]))):
+    """Alias of GET /auth/profiles."""
+    return await AuthController.list_linked_profiles(current_user)
+
+
+@router.post("/switch-student")
+async def switch_student(
+    body: SwitchStudentBody,
+    request: Request,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Mint a JWT whose `sub` is another student on the same account."""
+    return await AuthController.switch_student(body, current_user, request)
+
+
+@router.post("/linked-students")
+async def create_linked_student(
+    body: LinkedStudentCreate,
+    request: Request,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Add another student profile under the logged-in family account."""
+    return await AuthController.create_linked_student(body, current_user, request)
+
+
+@router.post("/students")
+async def create_linked_student_alias(
+    body: LinkedStudentCreate,
+    request: Request,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Alias of POST /auth/linked-students."""
+    return await AuthController.create_linked_student(body, current_user, request)

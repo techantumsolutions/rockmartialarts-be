@@ -899,12 +899,8 @@ class UserController:
         # Generate a new temporary password
         new_password = secrets.token_urlsafe(8)
         hashed_password = hash_password(new_password)
-
-        # Update the user's password in the database
-        await get_db().users.update_one(
-            {"id": user_id},
-            {"$set": {"password": hashed_password, "updated_at": datetime.utcnow()}}
-        )
+        from utils.family_accounts import sync_account_password
+        await sync_account_password(get_db(), target_user, hashed_password)
 
         # Log the activity
         await log_activity(

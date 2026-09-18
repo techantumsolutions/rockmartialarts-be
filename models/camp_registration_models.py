@@ -131,6 +131,7 @@ class CampRegistrationCreate(_CampReg):
 class CampRegistrationSummary(_CampReg):
     id: str
     status: str = "received"
+    registration_code: str = ""
     event_id: str = ""
     event_name: str = ""
     event_dates: str = ""
@@ -146,6 +147,7 @@ class CampRegistrationSummary(_CampReg):
 class CampRegistrationResponse(CampRegistrationCreate):
     id: str
     status: str = "received"
+    registration_code: str = ""
     event: CampRegistrationEventSnapshot = Field(default_factory=CampRegistrationEventSnapshot)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

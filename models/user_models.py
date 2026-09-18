@@ -60,6 +60,9 @@ class UserCreate(BaseModel):
     branch: Optional[BranchInfo] = None
     # Master Data key student_levels (e.g. Beginner, Intermediate, Expert)
     student_level: Optional[str] = None
+    # Family account: relation of this student to the account holder
+    relationship: Optional[str] = None
+    account_id: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -150,6 +153,20 @@ class StudentProfileResponse(BaseModel):
     updated_at: datetime
     # Enrollment information
     enrollments: Optional[list] = []
+
+class SwitchStudentBody(BaseModel):
+    student_id: str
+
+
+class LinkedStudentCreate(BaseModel):
+    first_name: str
+    last_name: str
+    date_of_birth: Optional[date] = None
+    gender: Optional[str] = None
+    relationship: str = "child"
+    course: Optional[CourseInfo] = None
+    branch: Optional[BranchInfo] = None
+
 
 class StudentProfileUpdate(BaseModel):
     first_name: Optional[str] = None
