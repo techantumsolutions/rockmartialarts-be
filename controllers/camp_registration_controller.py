@@ -111,6 +111,40 @@ class CampRegistrationController:
         db = get_db()
         result = await db[CampRegistrationController.COLLECTION].insert_one(doc)
         saved = await db[CampRegistrationController.COLLECTION].find_one({"_id": result.inserted_id})
+
+        # M15-S01: additive lead from camp registration (best-effort)
+        try:
+            from utils.lead_service import upsert_from_source
+
+            part = doc.get("participant") or {}
+            contact = doc.get("contact") or {}
+            name = (
+                part.get("participant_name")
+                or part.get("full_name")
+                or contact.get("name")
+                or "Camp registrant"
+            )
+            phone = (
+                contact.get("phone")
+                or part.get("parent_guardian_mobile")
+                or (doc.get("parent_consent") or {}).get("parent_guardian_mobile")
+                or ""
+            )
+            reg_id = str(saved.get("id") or saved.get("_id") or result.inserted_id)
+            if phone:
+                await upsert_from_source(
+                    source_type="camp_registration",
+                    source_ref_type="camp_registration",
+                    source_ref_id=reg_id,
+                    name=str(name),
+                    phone=str(phone),
+                    email=contact.get("email"),
+                    course="residential_camp",
+                    source_label="camp_registration",
+                )
+        except Exception:
+            logger.exception("Lead hook after camp registration failed")
+
         return CampRegistrationController._to_response(saved)
 
     @staticmethod

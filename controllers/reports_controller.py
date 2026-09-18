@@ -488,6 +488,64 @@ class ReportsController:
             raise HTTPException(status_code=500, detail=f"Error generating student reports: {str(e)}")
 
     @staticmethod
+    async def list_student_report_rows(
+        current_user: dict,
+        *,
+        q: Optional[str] = None,
+        branch_id: Optional[str] = None,
+        course_id: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ):
+        """M08-S02 filtered student list for reports UI."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_report_query import query_student_report_rows
+
+        return await query_student_report_rows(
+            current_user,
+            q=q,
+            branch_id=branch_id,
+            course_id=course_id,
+            is_active=is_active,
+            start_date=start_date,
+            end_date=end_date,
+            skip=skip,
+            limit=limit,
+        )
+
+    @staticmethod
+    async def export_student_reports(
+        current_user: dict,
+        *,
+        format: str = "csv",
+        q: Optional[str] = None,
+        branch_id: Optional[str] = None,
+        course_id: Optional[str] = None,
+        is_active: Optional[bool] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
+        """M08-S02 CSV/Excel export with BM branch enforcement."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_report_query import export_student_report
+
+        return await export_student_report(
+            current_user,
+            format=format,
+            q=q,
+            branch_id=branch_id,
+            course_id=course_id,
+            is_active=is_active,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    @staticmethod
     async def get_student_report_filters(current_user: dict):
         """Get available filter options for student reports (branch-specific for branch managers)"""
         if not current_user:

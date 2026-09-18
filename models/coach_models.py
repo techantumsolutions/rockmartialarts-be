@@ -50,6 +50,54 @@ class ProfessionalInfo(BaseModel):
     category_id: Optional[str] = None  # New field for category
     sub_category_id: Optional[str] = None  # New field for sub-category
 
+
+class CoachApprovalStatus(str, Enum):
+    """M14 coach registration / approval gate (additive)."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class CoachRegistrationCreate(BaseModel):
+    """
+    M14-S01 public self-registration payload.
+    Does not replace admin CoachCreate.
+    """
+
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    gender: str = Field(..., min_length=1, max_length=40)
+    date_of_birth: str = Field(..., description="YYYY-MM-DD")
+    email: EmailStr
+    country_code: str = Field(default="+91", max_length=8)
+    phone: str = Field(..., min_length=5, max_length=20)
+    password: str = Field(..., min_length=6, max_length=128)
+    address: str = Field(..., min_length=1, max_length=300)
+    area: str = Field(default="", max_length=120)
+    city: str = Field(..., min_length=1, max_length=120)
+    state: str = Field(..., min_length=1, max_length=120)
+    zip_code: str = Field(default="", max_length=20)
+    country: str = Field(default="India", max_length=80)
+    professional_experience: str = Field(
+        ..., min_length=1, max_length=500, description="Experience summary or range"
+    )
+    education_qualification: Optional[str] = Field(default=None, max_length=200)
+    designation: Optional[str] = Field(default="Coach", max_length=120)
+    specializations: List[str] = Field(..., min_length=1)
+    certifications: List[str] = Field(default_factory=list)
+    service_location_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        description="Branch IDs where the coach can serve",
+    )
+    profile_image_url: Optional[str] = Field(default=None, max_length=500)
+    about_short: Optional[str] = Field(default=None, max_length=1000)
+    user_id: Optional[str] = Field(
+        default=None, max_length=64, description="Optional linked user id"
+    )
+
+
 class CoachCreate(BaseModel):
     personal_info: PersonalInfo
     contact_info: ContactInfo
@@ -115,6 +163,11 @@ class Coach(BaseModel):
     featured_on_homepage: bool = False
     homepage_rating: Optional[float] = None
     display_order: Optional[int] = None
+    # M14 additive fields (optional on legacy records)
+    approval_status: str = CoachApprovalStatus.APPROVED.value
+    user_id: Optional[str] = None
+    service_location_ids: List[str] = Field(default_factory=list)
+    registration_source: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -135,6 +188,10 @@ class CoachResponse(BaseModel):
     featured_on_homepage: bool = False
     homepage_rating: Optional[float] = None
     display_order: Optional[int] = None
+    approval_status: Optional[str] = None
+    user_id: Optional[str] = None
+    service_location_ids: Optional[List[str]] = None
+    registration_source: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -144,3 +201,37 @@ class CoachForgotPassword(BaseModel):
 class CoachResetPassword(BaseModel):
     token: str
     new_password: str
+
+
+class CoachApprovalActionBody(BaseModel):
+    """M14-S02 approve action (optional admin note)."""
+
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class CoachRejectBody(BaseModel):
+    """M14-S02 reject action — note recommended for audit."""
+
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class CoachActiveStatusBody(BaseModel):
+    """M14-S02 set active/inactive (approved coaches only)."""
+
+    is_active: bool
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class CoachApprovalHistoryEntry(BaseModel):
+    id: str
+    coach_id: str
+    from_status: Optional[str] = None
+    to_status: str
+    action: str
+    note: Optional[str] = None
+    is_active_before: Optional[bool] = None
+    is_active_after: Optional[bool] = None
+    actor_id: Optional[str] = None
+    actor_name: Optional[str] = None
+    actor_role: Optional[str] = None
+    created_at: datetime

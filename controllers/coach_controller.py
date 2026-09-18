@@ -116,6 +116,14 @@ class CoachController:
             "country_code": coach_data.contact_info.country_code,
             "phone": coach_data.contact_info.phone
         }
+        # M14 additive defaults for admin-created coaches (keep existing UX)
+        coach_dict["approval_status"] = "approved"
+        coach_dict["registration_source"] = "admin"
+        coach_dict["user_id"] = None
+        if coach_data.branch_id:
+            coach_dict["service_location_ids"] = [coach_data.branch_id]
+        else:
+            coach_dict["service_location_ids"] = []
         
         # Insert into coaches collection
         result = await db.coaches.insert_one(coach_dict)
@@ -152,7 +160,8 @@ class CoachController:
         limit: int = 50,
         active_only: bool = True,
         area_of_expertise: Optional[str] = None,
-        current_user: dict = None
+        current_user: dict = None,
+        approval_status: Optional[str] = None,
     ):
         """Get coaches with filtering. Branch managers see only coaches in their managed branches."""
         db = get_db()
@@ -162,6 +171,18 @@ class CoachController:
             filter_query["is_active"] = True
         if area_of_expertise:
             filter_query["areas_of_expertise"] = {"$in": [area_of_expertise]}
+        # M14-S02 additive filter (default: no change to existing list behavior)
+        if approval_status:
+            status = str(approval_status).lower().strip()
+            if status == "approved":
+                filter_query["$or"] = [
+                    {"approval_status": "approved"},
+                    {"approval_status": {"$exists": False}},
+                    {"approval_status": None},
+                    {"approval_status": ""},
+                ]
+            elif status in ("pending", "rejected"):
+                filter_query["approval_status"] = status
 
         if current_user and current_user.get("role") == "branch_manager":
             branch_manager_id = current_user.get("id")
@@ -195,6 +216,10 @@ class CoachController:
                 featured_on_homepage=coach.get("featured_on_homepage", False),
                 homepage_rating=coach.get("homepage_rating"),
                 display_order=coach.get("display_order"),
+                approval_status=coach.get("approval_status"),
+                user_id=coach.get("user_id"),
+                service_location_ids=coach.get("service_location_ids"),
+                registration_source=coach.get("registration_source"),
                 created_at=coach["created_at"],
                 updated_at=coach["updated_at"]
             )
@@ -236,6 +261,10 @@ class CoachController:
             featured_on_homepage=coach.get("featured_on_homepage", False),
             homepage_rating=coach.get("homepage_rating"),
             display_order=coach.get("display_order"),
+            approval_status=coach.get("approval_status"),
+            user_id=coach.get("user_id"),
+            service_location_ids=coach.get("service_location_ids"),
+            registration_source=coach.get("registration_source"),
             created_at=coach["created_at"],
             updated_at=coach["updated_at"]
         )
@@ -248,7 +277,14 @@ class CoachController:
         db = get_db()
         safe_limit = max(1, min(int(limit), 8))
         pipeline = [
-            {"$match": {"is_active": True}},
+            {"$match": {
+                "is_active": True,
+                "$or": [
+                    {"approval_status": {"$exists": False}},
+                    {"approval_status": "approved"},
+                    {"approval_status": None},
+                ],
+            }},
             {"$addFields": {"_sort_ord": {"$ifNull": ["$display_order", 999999]}}},
             {"$sort": {"_sort_ord": 1, "created_at": -1}},
             {"$limit": safe_limit},
@@ -643,6 +679,31 @@ class CoachController:
                     status_code=401,
                     detail="Invalid email or password"
                 )
+
+            # M14: pending/rejected registrations cannot log in (legacy coaches without field = approved)
+            approval = str(coach.get("approval_status") or "approved").lower()
+            if approval == "pending":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your coach registration is pending admin approval.",
+                )
+            if approval == "rejected":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your coach registration was rejected. Please contact administrator.",
+                )
+
+            # M14-S04: expired subscription past grace (only if they have a sub record)
+            try:
+                from utils.coach_subscription_service import (
+                    assert_coach_subscription_allows_login,
+                )
+
+                await assert_coach_subscription_allows_login(coach)
+            except HTTPException:
+                raise
+            except Exception:
+                pass
             
             # Check if coach is active
             if not coach.get("is_active", True):

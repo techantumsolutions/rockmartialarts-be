@@ -34,6 +34,7 @@ async def search_branches_public(
     location_id: Optional[str] = None,
     q: Optional[str] = None,
     active_only: bool = True,
+    collaboration_partners_only: bool = False,
     skip: int = 0,
     limit: int = 100,
 ):
@@ -43,6 +44,7 @@ async def search_branches_public(
         city_id=city_id or location_id,
         q=q,
         active_only=active_only,
+        collaboration_partners_only=collaboration_partners_only,
         skip=skip,
         limit=limit,
     )

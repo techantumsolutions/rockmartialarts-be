@@ -24,6 +24,11 @@ from utils.course_hierarchy import name_slug
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.student_branch_sync import count_students_for_branch
+from utils.collaboration_partner import (
+    apply_collaboration_flag,
+    enrich_collaboration_flag,
+    resolve_collaboration_flag_from_payload,
+)
 
 
 async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
@@ -98,7 +103,12 @@ class BranchController:
         payload["slug"] = await ensure_unique_branch_slug(
             db, name, existing_slug=payload.get("slug")
         )
-        payload["allows_collaboration"] = bool(payload.get("allows_collaboration", False))
+        flag = resolve_collaboration_flag_from_payload(payload, default=False)
+        if flag:
+            from utils.collaboration_partner import assert_can_toggle_collaboration_flag
+
+            assert_can_toggle_collaboration_flag(current_user)
+        apply_collaboration_flag(payload, flag)
         if isinstance(payload.get("assignments"), dict):
             payload["assignments"] = prepare_assignments_for_write(payload.get("assignments"))
 
@@ -106,6 +116,7 @@ class BranchController:
         
         # Store the branch with nested structure exactly as provided
         branch_dict = branch.dict()
+        apply_collaboration_flag(branch_dict, flag)
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
@@ -193,6 +204,7 @@ class BranchController:
                     "active_courses": len(branch.get("assignments", {}).get("courses", []))
                 }
             }
+            enrich_collaboration_flag(branch_with_stats)
             enhanced_branches.append(branch_with_stats)
 
         return {"branches": serialize_doc(enhanced_branches)}
@@ -258,7 +270,10 @@ class BranchController:
             "slug": branch.get("slug") or BranchController._name_to_slug(
                 str(branch_info.get("name") or "")
             ),
-            "allows_collaboration": bool(branch.get("allows_collaboration", False)),
+            "allows_collaboration": bool(branch.get("allows_collaboration", False))
+            or bool(branch.get("is_collaboration_partner", False)),
+            "is_collaboration_partner": bool(branch.get("allows_collaboration", False))
+            or bool(branch.get("is_collaboration_partner", False)),
             "is_active": branch.get("is_active", True),
             "admission_fee": branch.get("admission_fee", 500.0),
             "operational_details": {
@@ -361,6 +376,7 @@ class BranchController:
         city_id: Optional[str] = None,
         q: Optional[str] = None,
         active_only: bool = True,
+        collaboration_partners_only: bool = False,
         skip: int = 0,
         limit: int = 100,
     ):
@@ -375,6 +391,14 @@ class BranchController:
             q=q,
             active_only=active_only,
         )
+        if collaboration_partners_only:
+            partner_clause = {
+                "$or": [
+                    {"allows_collaboration": True},
+                    {"is_collaboration_partner": True},
+                ]
+            }
+            query = {"$and": [query, partner_clause]} if query else partner_clause
         total = await db.branches.count_documents(query)
         branches = await db.branches.find(query).skip(skip).limit(limit).to_list(limit)
         formatted = []
@@ -391,6 +415,7 @@ class BranchController:
                 "state_id": (state_id or "").strip() or None,
                 "city_id": (city_id or "").strip() or None,
                 "q": (q or "").strip() or None,
+                "collaboration_partners_only": collaboration_partners_only,
             },
         }
 
@@ -502,6 +527,7 @@ class BranchController:
         }
 
         await _enrich_course_schedule_trainers(db, branch_with_stats)
+        enrich_collaboration_flag(branch_with_stats)
 
         return serialize_doc(branch_with_stats)
 
@@ -675,6 +701,18 @@ class BranchController:
         existing_for_geo = await db.branches.find_one({"id": branch_id})
         if not existing_for_geo:
             raise HTTPException(status_code=404, detail="Branch not found")
+
+        if (
+            "allows_collaboration" in update_data
+            or "is_collaboration_partner" in update_data
+        ):
+            from utils.collaboration_partner import assert_can_toggle_collaboration_flag
+
+            assert_can_toggle_collaboration_flag(current_user)
+            flag = resolve_collaboration_flag_from_payload(
+                update_data, existing=existing_for_geo
+            )
+            apply_collaboration_flag(update_data, flag)
 
         if "location_id" in update_data or "branch" in update_data:
             location_ref = (update_data.get("location_id") or existing_for_geo.get("location_id") or "").strip()

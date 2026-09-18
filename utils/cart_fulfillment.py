@@ -221,12 +221,29 @@ async def fulfill_cart_checkout(
         raise HTTPException(status_code=404, detail="Cart checkout not found")
 
     if checkout.get("status") == CartCheckoutStatus.FULFILLED.value:
-        return {
+        invoice = None
+        try:
+            from utils.invoice_service import safe_generate_invoice_for_payment
+
+            invoice = await safe_generate_invoice_for_payment(cart_checkout_id=checkout_id)
+        except Exception:
+            pass
+        try:
+            from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+            await safe_upsert_billing_cycles_for_payment(cart_checkout_id=checkout_id)
+        except Exception:
+            pass
+        out = {
             "already_fulfilled": True,
             "cart_checkout_id": checkout_id,
             "enrollment_ids": [l.get("enrollment_id") for l in (checkout.get("enrollment_links") or [])],
             "status": checkout.get("status"),
         }
+        if invoice and invoice.get("id"):
+            out["invoice_id"] = invoice.get("id")
+            out["invoice_number"] = invoice.get("invoice_number")
+        return out
 
     # Atomic claim: only one worker moves pending → paid (then fulfilled)
     claim = await db.cart_checkouts.update_one(
@@ -336,13 +353,34 @@ async def fulfill_cart_checkout(
         },
     )
 
-    return {
+    # M07-S01: generate multi-line invoice after cart fulfillment (idempotent)
+    invoice = None
+    try:
+        from utils.invoice_service import safe_generate_invoice_for_payment
+
+        invoice = await safe_generate_invoice_for_payment(cart_checkout_id=checkout_id)
+    except Exception:
+        logger.exception("Invoice generation failed for cart_checkout_id=%s", checkout_id)
+
+    # M07-S02: billing cycles per enrollment (paid-date based)
+    try:
+        from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
+
+        await safe_upsert_billing_cycles_for_payment(cart_checkout_id=checkout_id)
+    except Exception:
+        logger.exception("Billing cycle upsert failed for cart_checkout_id=%s", checkout_id)
+
+    result = {
         "already_fulfilled": False,
         "cart_checkout_id": checkout_id,
         "enrollment_ids": enrollment_ids,
         "status": CartCheckoutStatus.FULFILLED.value,
         "item_count": len(enrollment_ids),
     }
+    if invoice and invoice.get("id"):
+        result["invoice_id"] = invoice.get("id")
+        result["invoice_number"] = invoice.get("invoice_number")
+    return result
 
 
 async def fulfill_from_payment_row(payment_row: dict, *, actor: str = "razorpay_webhook") -> Optional[Dict[str, Any]]:
