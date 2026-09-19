@@ -67,7 +67,8 @@ class AttendanceController:
         branch_id: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        current_user: dict = None
+        current_user: dict = None,
+        limit: Optional[int] = None,
     ):
         """Get attendance reports with filtering and role-based access control"""
         try:
@@ -111,9 +112,18 @@ class AttendanceController:
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid date format")
 
+            fetch_limit = 1000
+            if limit is not None:
+                try:
+                    fetch_limit = max(1, min(int(limit), 1000))
+                except (TypeError, ValueError):
+                    fetch_limit = 1000
+
             # Get attendance records with student and course information
             pipeline = [
                 {"$match": filter_query},
+                {"$sort": {"attendance_date": -1}},
+                {"$limit": fetch_limit},
                 {
                     "$lookup": {
                         "from": "users",
@@ -166,7 +176,7 @@ class AttendanceController:
                 {"$sort": {"attendance_date": -1}}
             ]
 
-            attendance_records = await db.attendance.aggregate(pipeline).to_list(length=1000)
+            attendance_records = await db.attendance.aggregate(pipeline).to_list(length=fetch_limit)
 
             # Convert to serializable format
             serialized_records = []

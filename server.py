@@ -51,6 +51,7 @@ from routes.camp_registration_routes import router as camp_registration_router
 from routes.homepage_content_routes import router as homepage_content_router
 from routes.achievement_routes import router as achievement_router
 from routes.student_testimonial_routes import router as student_testimonial_router
+from routes.registration_form_routes import router as registration_form_router
 from routes.student_showcase_achievement_routes import router as showcase_achievement_router
 from routes.onboarding_routes import router as onboarding_router
 from routes.cart_routes import router as cart_router
@@ -195,6 +196,13 @@ async def lifespan(app: FastAPI):
         logging.exception("Failed to normalize null/empty biometric mapping fields on users")
 
     try:
+        await app.mongodb.users.create_index([("role", 1), ("created_at", -1)])
+        await app.mongodb.enrollments.create_index("student_id")
+        await app.mongodb.enrollments.create_index([("branch_id", 1), ("is_active", 1)])
+    except Exception:
+        logging.exception("Failed to create student list indexes")
+
+    try:
         await ensure_student_performance_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure student performance dashboard indexes")
@@ -323,6 +331,7 @@ app.include_router(camp_registration_router, prefix="/api/camp-registrations", t
 app.include_router(homepage_content_router, prefix="/api/homepage", tags=["Homepage Content"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
 app.include_router(student_testimonial_router, prefix="/api/testimonials", tags=["Marketing Testimonials"])
+app.include_router(registration_form_router, prefix="/api/registration-forms", tags=["Registration Forms"])
 app.include_router(
     showcase_achievement_router, prefix="/api/showcase-achievements", tags=["Marketing Achievements"]
 )

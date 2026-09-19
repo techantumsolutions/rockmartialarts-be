@@ -21,9 +21,10 @@ async def get_branches(
     skip: int = 0,
     limit: int = 50,
     active_only: bool = Query(True, description="When false, include disabled branches (admin list)"),
+    include_stats: bool = Query(True, description="When false, skip per-branch coach/student counts"),
     current_user: dict = Depends(get_current_user_or_superadmin)
 ):
-    return await BranchController.get_branches(skip, limit, active_only, current_user)
+    return await BranchController.get_branches(skip, limit, active_only, current_user, include_stats)
 
 @router.get("/{branch_id}")
 async def get_branch(

@@ -943,6 +943,7 @@ class AuthController:
                 "is_active": enrollment.get("is_active", True),
                 "duration_id": duration_id,
                 "duration_months": duration_months,
+                "batch_ref": enrollment.get("batch_ref"),
                 "fee_amount": enrollment.get("fee_amount"),
                 "admission_fee": enrollment.get("admission_fee"),
             }

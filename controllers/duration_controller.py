@@ -332,14 +332,8 @@ class DurationController:
             pricing_type = "flat"
             used_branch_config = False
 
-            # Branch/course tenure fees (same source as checkout when no batch is selected)
-            if branch_pricing_for_course:
-                for key in key_candidates:
-                    if key in branch_pricing_for_course and branch_pricing_for_course[key] is not None:
-                        price_raw = branch_pricing_for_course.get(key)
-                        used_branch_config = True
-                        break
-
+            # Super-admin batch fees are the live price source. Course-level branch_pricing
+            # often still holds leftover amounts (₹1500) that are no longer edited in admin.
             if branch_batch:
                 batch_fee_per_duration = branch_batch.get("fee_per_duration", {}) or {}
                 batch_pricing_type_per_duration = (
@@ -354,14 +348,20 @@ class DurationController:
                         duration_enabled = bool(batch_enabled_per_duration.get(key))
                         break
 
-                if price_raw is None:
-                    for key in key_candidates:
-                        if key in batch_fee_per_duration:
-                            price_raw = batch_fee_per_duration.get(key)
-                            pt = batch_pricing_type_per_duration.get(key)
-                            pricing_type = pt if pt is not None and str(pt).strip() else "flat"
-                            used_branch_config = True
-                            break
+                for key in key_candidates:
+                    if key in batch_fee_per_duration:
+                        price_raw = batch_fee_per_duration.get(key)
+                        pt = batch_pricing_type_per_duration.get(key)
+                        pricing_type = pt if pt is not None and str(pt).strip() else "flat"
+                        used_branch_config = True
+                        break
+
+            if price_raw is None and branch_pricing_for_course:
+                for key in key_candidates:
+                    if key in branch_pricing_for_course and branch_pricing_for_course[key] is not None:
+                        price_raw = branch_pricing_for_course.get(key)
+                        used_branch_config = True
+                        break
 
             if price_raw is None:
                 for key in key_candidates:

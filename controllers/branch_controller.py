@@ -116,7 +116,8 @@ class BranchController:
         skip: int = 0,
         limit: int = 50,
         active_only: bool = True,
-        current_user: dict = None
+        current_user: dict = None,
+        include_stats: bool = True,
     ):
         """Get branches with nested structure and statistics, filtered by user role"""
         if not current_user:
@@ -149,6 +150,9 @@ class BranchController:
                 }
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
+
+        if not include_stats:
+            return {"branches": serialize_doc(branches)}
 
         # Enhance branches with coach and student counts
         enhanced_branches = []

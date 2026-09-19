@@ -151,11 +151,13 @@ def _public_branch_batches_for_course(
             trainer_name = None
             if coach_names and coach_id:
                 trainer_name = coach_names.get(coach_id)
+            fpd = b.get("fee_per_duration") if isinstance(b.get("fee_per_duration"), dict) else None
             row = {
                 "batch_ref": ref,
                 "name": bname or None,
                 "label": label,
                 "batch_fee": fee,
+                "fee_per_duration": fpd,
                 "days": days,
                 "start_time": st,
                 "end_time": et,
@@ -286,6 +288,10 @@ class CourseController:
 
         # Store the course with nested structure exactly as provided
         course_dict = course.dict()
+        settings = course_dict.setdefault("settings", {})
+        if settings.get("active") is None:
+            settings["active"] = True
+        course_dict["settings"] = settings
 
         await db.courses.insert_one(course_dict)
         return {"message": "Course created successfully", "course_id": course.id}
@@ -784,10 +790,10 @@ class CourseController:
 
     @staticmethod
     async def get_public_courses(
-        active_only: bool = True,
-        skip: int = 0,
-        limit: int = 100
-    ):
+    active_only: bool = True,
+    skip: int = 0,
+    limit: int = 500
+):
         """Get all courses with enhanced data - Public endpoint (no authentication required)"""
         db = get_db()
 
@@ -797,11 +803,10 @@ class CourseController:
             query["settings.active"] = True
 
         # Apply pagination
-        if limit > 100:
-            limit = 100  # Cap at 100 for public endpoint
+        if limit > 500:
+            limit = 500
 
-        # Get courses
-        courses_cursor = db.courses.find(query).skip(skip).limit(limit)
+        courses_cursor = db.courses.find(query).sort("created_at", 1).skip(skip).limit(limit)
         courses = await courses_cursor.to_list(limit)
 
         # Enhance courses with additional data
@@ -1168,6 +1173,37 @@ class CourseController:
                     "fee_1_year": pricing.get("fee_1_year"),
                     "fee_per_duration": pricing.get("fee_per_duration"),
                 }
+            # Live prices come from super-admin batch setup, not leftover course catalog amounts.
+            branch_batches = _public_branch_batches_for_course(
+                branch, serialized.get("id"), coach_names
+            )
+            live_fpd: dict = {}
+            live_amounts = []
+            for bat in branch_batches:
+                fpd = bat.get("fee_per_duration") or {}
+                if isinstance(fpd, dict):
+                    for k, v in fpd.items():
+                        if v is None:
+                            continue
+                        try:
+                            fv = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        live_amounts.append(fv)
+                        if k not in live_fpd or fv < float(live_fpd[k]):
+                            live_fpd[k] = fv
+                bf = bat.get("batch_fee")
+                if bf is not None:
+                    try:
+                        live_amounts.append(float(bf))
+                    except (TypeError, ValueError):
+                        pass
+            if live_fpd:
+                fees["fee_per_duration"] = live_fpd
+            if live_amounts:
+                lowest = min(live_amounts)
+                fees["amount"] = lowest
+                fees["fee_1_month"] = lowest
             available_durations = []
             for d in durations:
                 available_durations.append({
@@ -1187,9 +1223,7 @@ class CourseController:
                 "media_resources": serialized.get("media_resources") or {},
                 "pricing": fees,
                 "available_durations": available_durations,
-                "branch_batches": _public_branch_batches_for_course(
-                    branch, serialized.get("id"), coach_names
-                ),
+                "branch_batches": branch_batches,
             })
         return {"courses": result_courses, "branch_timings": branch_timings}
 
