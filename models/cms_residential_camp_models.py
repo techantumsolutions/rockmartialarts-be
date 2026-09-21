@@ -24,11 +24,13 @@ class CampIconCard(_CampModel):
     icon_image: Optional[str] = None
     title: str = ""
     text: str = ""
+    enabled: bool = True
 
 
 class CampTrainingCard(_CampModel):
     title: str = ""
     bullets: List[str] = Field(default_factory=list)
+    enabled: bool = True
 
 
 class CampTimelineItem(_CampModel):
