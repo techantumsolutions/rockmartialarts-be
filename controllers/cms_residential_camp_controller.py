@@ -133,18 +133,29 @@ class CMSResidentialCampController:
             collection = db[CMSResidentialCampController.COLLECTION]
             doc = await collection.find_one({}, sort=[("updated_at", -1), ("created_at", -1)])
             if not doc:
-                doc = await CMSResidentialCampController._create_default()
-            doc = await CMSResidentialCampController._ensure_event(doc)
-            event = await CMSResidentialCampController._ensure_current_event(doc)
-            merged = _merge_event_into_cms(doc, event)
+                try:
+                    doc = await CMSResidentialCampController._create_default()
+                except Exception:
+                    # DB insert failed — still serve defaults so the public page works
+                    return CMSResidentialCampController._to_response(default_residential_camp_dict())
+            try:
+                doc = await CMSResidentialCampController._ensure_event(doc)
+                event = await CMSResidentialCampController._ensure_current_event(doc)
+                merged = _merge_event_into_cms(doc, event)
+            except Exception:
+                merged = doc
             return CMSResidentialCampController._to_response(merged)
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to retrieve residential camp content: {str(e)}",
-            )
+            # Last resort: never 500 the public landing page if the CMS doc was deleted
+            try:
+                return CMSResidentialCampController._to_response(default_residential_camp_dict())
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to retrieve residential camp content: {str(e)}",
+                )
 
     @staticmethod
     async def update_content(data: ResidentialCampContent) -> ResidentialCampResponse:
@@ -364,7 +375,10 @@ class CMSResidentialCampController:
                 payload[key] = serialized[key]
         if serialized.get("event_id"):
             payload["event_id"] = serialized["event_id"]
-        content = ResidentialCampContent(**payload)
+        try:
+            content = ResidentialCampContent(**payload)
+        except Exception:
+            content = ResidentialCampContent(**defaults)
         data = _dump(content)
         data["id"] = serialized.get("id") or ""
         data["created_at"] = serialized.get("created_at")

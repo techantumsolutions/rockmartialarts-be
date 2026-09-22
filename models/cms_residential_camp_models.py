@@ -29,6 +29,8 @@ class CampIconCard(_CampModel):
 
 class CampTrainingCard(_CampModel):
     title: str = ""
+    description: str = ""
+    image: Optional[str] = None
     bullets: List[str] = Field(default_factory=list)
     enabled: bool = True
 
@@ -43,43 +45,71 @@ class ResidentialCampNav(_CampModel):
     logo: Optional[str] = None
     brand_prefix: str = "ROCK"
     brand_accent: str = "MARTIAL ARTS ACADEMY"
-    link_camp: str = "Camp"
+    link_home: str = "Home"
+    link_camp: str = "About"
     link_training: str = "Training"
-    link_schedule: str = "Schedule"
-    link_register: str = "Register"
-    mobile_register_label: str = "Register"
+    link_schedule: str = "Masters"
+    link_levels: str = "Levels"
+    link_journey: str = "Journey"
+    link_rules: str = "Rules"
+    link_register: str = "Register Now"
+    mobile_register_label: str = "Register Now"
 
 
 class ResidentialCampHero(_CampModel):
     hero_image: Optional[str] = None
-    eyebrow: str = "5-Day Residential Training"
+    eyebrow: str = "TRADITIONAL • AUTHENTIC • TRANSFORMATIVE"
+    eyebrow_part1: str = "TRADITIONAL"
+    eyebrow_part2: str = "AUTHENTIC"
+    eyebrow_part3: str = "TRANSFORMATIVE"
     h1_line1: str = "Shaolin"
-    h1_line2: str = "Kungfu"
-    h2: str = "Residential Camp"
+    h1_line2: str = "Kung Fu"
+    h2: str = "Train your body. Train your mind. Build your warrior spirit."
     paragraph: str = (
-        "Train. Discipline. Transform. Step away from your daily routine and immerse "
-        "yourself in intensive Shaolin Kungfu training designed to build strength, "
-        "confidence, focus and a warrior mindset."
+        "Authentic Shaolin Kung Fu training in Hyderabad at Rock Martial Arts Academy."
     )
-    cta_primary_label: str = "Register Now →"
-    cta_whatsapp_label: str = "WhatsApp Us"
+    cta_primary_label: str = "Join Now"
+    cta_whatsapp_label: str = "Book a Trial Class"
     whatsapp_url: str = "https://wa.me/918179941226"
+    side_lines: List[str] = Field(
+        default_factory=lambda: ["DISCIPLINE", "FOCUS", "STRENGTH", "A BETTER YOU"]
+    )
+    cta_primary_enabled: bool = True
+    cta_secondary_enabled: bool = True
+    calligraphy_text: str = "少林功夫"
+    quote_text: str = "Not a fighter, a warrior."
+    quote_author: str = "Deva"
 
 
 class ResidentialCampCampSection(_CampModel):
-    kicker: str = "More than training"
-    h2: str = "Experience the Shaolin lifestyle"
+    kicker: str = "ABOUT"
+    h2: str = "SHAOLIN KUNG FU"
     lead: str = (
         "The Shaolin Kungfu Residential Camp at Rock Martial Arts Academy is an "
         "immersive experience of training, discipline, teamwork, self-control and "
         "personal transformation."
     )
+    paragraph_1: str = (
+        "Shaolin Kung Fu is a traditional Chinese martial art that combines physical "
+        "training, martial techniques, flexibility, discipline and mental focus. "
+        "It is more than fighting – it is a way of life."
+    )
+    paragraph_2: str = (
+        "At Rock Martial Arts Academy, we offer structured and authentic Shaolin Kung Fu "
+        "training for children, teenagers and adults, helping them develop strength, "
+        "character and a positive mindset."
+    )
+    cta_label: str = "LEARN MORE"
+    cta_href: str = "#training"
+    cta_enabled: bool = True
+    about_image: Optional[str] = "/campaign/aboutsection.png"
     cards: List[CampIconCard] = Field(default_factory=list)
 
 
 class ResidentialCampTrainingSection(_CampModel):
     kicker: str = "What you will learn"
-    h2: str = "Build skills that stay with you"
+    h2: str = "OUR TRAINING PROGRAM"
+    enabled: bool = True
     cards: List[CampTrainingCard] = Field(default_factory=list)
 
 
@@ -94,9 +124,20 @@ class ResidentialCampPrice(_CampModel):
     cta_label: str = "Secure Your Seat"
 
 
+class CampMasterProfile(_CampModel):
+    title: str = ""
+    name: str = ""
+    designation: str = ""
+    description: str = ""
+    quote: str = ""
+    image: Optional[str] = None
+    enabled: bool = True
+
+
 class ResidentialCampScheduleSection(_CampModel):
     kicker: str = "Daily routine"
     h2: str = "Train with purpose"
+    masters: List[CampMasterProfile] = Field(default_factory=list)
     timeline: List[CampTimelineItem] = Field(default_factory=list)
     price: ResidentialCampPrice = Field(default_factory=ResidentialCampPrice)
 
@@ -124,6 +165,66 @@ class ResidentialCampFooter(_CampModel):
     academy_name: str = "ROCK MARTIAL ARTS ACADEMY"
     tagline: str = "Become the Strongest Version of Yourself"
     camp_line: str = "Shaolin Kungfu Residential Camp • Hyderabad • 22–26 September 2026"
+    logo: Optional[str] = None
+    description: str = "Become the Strongest Version of Yourself"
+    social_instagram_url: str = ""
+    social_instagram_icon: Optional[str] = None
+    social_youtube_url: str = ""
+    social_youtube_icon: Optional[str] = None
+    social_facebook_url: str = ""
+    social_facebook_icon: Optional[str] = None
+    cta_label: str = "ENQUIRE NOW"
+    cta_href: str = "#register"
+    cta_enabled: bool = True
+    cta_opens_register: bool = True
+
+
+class CampFeatureBarItem(_CampModel):
+    label: str = ""
+    icon_image: Optional[str] = None
+    icon_key: str = ""
+    enabled: bool = True
+
+
+class CampLevelCard(_CampModel):
+    title: str = ""
+    description: str = ""
+    color: str = "#8f9a3a"
+    enabled: bool = True
+
+
+class CampLevelPanel(_CampModel):
+    title: str = ""
+    description: str = ""
+    bullets: List[str] = Field(default_factory=list)
+    cta_label: str = ""
+    cta_href: str = "#"
+    cta_enabled: bool = True
+    cta_opens_register: bool = False
+    enabled: bool = True
+
+
+class ResidentialCampLevelsSection(_CampModel):
+    enabled: bool = True
+    background_image: Optional[str] = "/campaign/levelbg.png"
+    h2: str = "TRAINING FOR EVERY LEVEL"
+    cards: List[CampLevelCard] = Field(default_factory=list)
+    panels: List[CampLevelPanel] = Field(default_factory=list)
+
+
+class ResidentialCampJourneyCta(_CampModel):
+    enabled: bool = True
+    background_image: Optional[str] = "/campaign/ctabg.png"
+    title_line1: str = "START YOUR"
+    title_line2: str = "SHAOLIN JOURNEY TODAY"
+    description: str = "A STRONGER BODY. A CALMER MIND. A BRIGHTER FUTURE."
+    cta_primary_label: str = "REGISTER NOW"
+    cta_primary_enabled: bool = True
+    cta_primary_opens_register: bool = True
+    cta_primary_href: str = "#register"
+    cta_secondary_label: str = "BOOK A TRIAL CLASS"
+    cta_secondary_enabled: bool = True
+    cta_secondary_href: str = "https://wa.me/918179941226"
 
 
 class ResidentialCampContent(_CampModel):
@@ -144,10 +245,31 @@ class ResidentialCampContent(_CampModel):
     nav: ResidentialCampNav = Field(default_factory=ResidentialCampNav)
     hero: ResidentialCampHero = Field(default_factory=ResidentialCampHero)
     facts: List[CampLabelValue] = Field(default_factory=list)
+    feature_bar: List[CampFeatureBarItem] = Field(
+        default_factory=lambda: [
+            CampFeatureBarItem(
+                label="Physical Fitness", icon_key="fitness", icon_image="/campaign/f1.png"
+            ),
+            CampFeatureBarItem(
+                label="Mental Discipline", icon_key="discipline", icon_image="/campaign/f2.png"
+            ),
+            CampFeatureBarItem(
+                label="Self Confidence", icon_key="confidence", icon_image="/campaign/f3.png"
+            ),
+            CampFeatureBarItem(
+                label="Traditional Training", icon_key="training", icon_image="/campaign/f4.png"
+            ),
+            CampFeatureBarItem(
+                label="Better Lifestyle", icon_key="lifestyle", icon_image="/campaign/f5.png"
+            ),
+        ]
+    )
     camp: ResidentialCampCampSection = Field(default_factory=ResidentialCampCampSection)
     training: ResidentialCampTrainingSection = Field(default_factory=ResidentialCampTrainingSection)
     schedule: ResidentialCampScheduleSection = Field(default_factory=ResidentialCampScheduleSection)
     rules: ResidentialCampRulesSection = Field(default_factory=ResidentialCampRulesSection)
+    levels: ResidentialCampLevelsSection = Field(default_factory=ResidentialCampLevelsSection)
+    journey_cta: ResidentialCampJourneyCta = Field(default_factory=ResidentialCampJourneyCta)
     register: ResidentialCampRegisterSection = Field(default_factory=ResidentialCampRegisterSection)
     footer: ResidentialCampFooter = Field(default_factory=ResidentialCampFooter)
 
@@ -185,6 +307,33 @@ def default_residential_camp_dict() -> dict:
             CampLabelValue(label="Age Group", value="6–15 Years"),
             CampLabelValue(label="Camp Fee", value="₹15,000/-"),
         ],
+        feature_bar=[
+            CampFeatureBarItem(
+                label="Physical Fitness",
+                icon_key="fitness",
+                icon_image="/campaign/f1.png",
+            ),
+            CampFeatureBarItem(
+                label="Mental Discipline",
+                icon_key="discipline",
+                icon_image="/campaign/f2.png",
+            ),
+            CampFeatureBarItem(
+                label="Self Confidence",
+                icon_key="confidence",
+                icon_image="/campaign/f3.png",
+            ),
+            CampFeatureBarItem(
+                label="Traditional Training",
+                icon_key="training",
+                icon_image="/campaign/f4.png",
+            ),
+            CampFeatureBarItem(
+                label="Better Lifestyle",
+                icon_key="lifestyle",
+                icon_image="/campaign/f5.png",
+            ),
+        ],
         camp=ResidentialCampCampSection(
             cards=[
                 CampIconCard(
@@ -205,37 +354,68 @@ def default_residential_camp_dict() -> dict:
             ]
         ),
         training=ResidentialCampTrainingSection(
+            h2="OUR TRAINING PROGRAM",
             cards=[
                 CampTrainingCard(
-                    title="Foundation",
-                    bullets=[
-                        "Basic Shaolin stances",
-                        "Punches and strikes",
-                        "Kicks and blocks",
-                        "Footwork and movement",
-                    ],
+                    title="SHAOLIN FORMS",
+                    description="Traditional hand forms, stances and techniques.",
+                    image="/campaign/t1.png",
                 ),
                 CampTrainingCard(
-                    title="Traditional Training",
-                    bullets=[
-                        "Traditional forms (Taolu)",
-                        "Advanced forms for eligible students",
-                        "Balance and coordination",
-                        "Shaolin conditioning",
-                    ],
+                    title="WEAPONS TRAINING",
+                    description="Learn traditional Shaolin weapons like staff, spear, etc.",
+                    image="/campaign/t2.png",
                 ),
                 CampTrainingCard(
-                    title="Personal Development",
-                    bullets=[
-                        "Strength & flexibility",
-                        "Self-defense awareness",
-                        "Teamwork & leadership",
-                        "Focus & confidence",
-                    ],
+                    title="FLEXIBILITY & MOBILITY",
+                    description="Improve flexibility, balance and body control.",
+                    image="/campaign/t3.png",
+                ),
+                CampTrainingCard(
+                    title="STRENGTH & CONDITIONING",
+                    description="Build functional strength, stamina and endurance.",
+                    image="/campaign/t4.png",
+                ),
+                CampTrainingCard(
+                    title="COMBAT TRAINING",
+                    description="Practical application through drills and partner training.",
+                    image="/campaign/t5.png",
+                ),
+                CampTrainingCard(
+                    title="DISCIPLINE & MINDSET",
+                    description="Develop patience, focus and a warrior mindset.",
+                    image="/campaign/t6.png",
                 ),
             ]
         ),
         schedule=ResidentialCampScheduleSection(
+            masters=[
+                CampMasterProfile(
+                    title="OUR SHAOLIN LINEAGE",
+                    name="MASTER DEVARAJU",
+                    designation="Founder & Master Coach",
+                    description=(
+                        "Deva is a dedicated Shaolin Kung Fu practitioner and coach, known for his "
+                        "discipline, strength and traditional training approach. He focuses on building "
+                        "strong fundamentals, mental toughness and authentic Shaolin values in every student."
+                    ),
+                    quote="NOT A FIGHTER, A WARRIOR.",
+                    image="/campaign/master1.png",
+                ),
+                CampMasterProfile(
+                    title="MEET YOUR MASTER",
+                    name="MASTER JANARDHAN",
+                    designation="16th Generation Shaolin Disciple | Founder - Rock Martial Arts Academy",
+                    description=(
+                        "Master Janardhan is a 16th Generation Shaolin Disciple and the Founder of "
+                        "Rock Martial Arts Academy. With years of dedicated training and teaching experience, "
+                        "he specialises in traditional Shaolin Kung Fu, discipline-based coaching and "
+                        "holistic martial arts development for students of all ages."
+                    ),
+                    quote="NOT A FIGHTER, A WARRIOR.",
+                    image="/campaign/master2.png",
+                ),
+            ],
             timeline=[
                 CampTimelineItem(
                     time_label="Morning Session",
@@ -268,6 +448,66 @@ def default_residential_camp_dict() -> dict:
                 "Follow all safety and residential guidelines.",
                 "No unauthorized gadgets during designated periods.",
             ]
+        ),
+        levels=ResidentialCampLevelsSection(
+            background_image="/campaign/levelbg.png",
+            h2="TRAINING FOR EVERY LEVEL",
+            cards=[
+                CampLevelCard(
+                    title="BEGINNER",
+                    description="Learn the fundamentals. No experience needed.",
+                    color="#8f9a3a",
+                ),
+                CampLevelCard(
+                    title="INTERMEDIATE",
+                    description="Develop your techniques and skills.",
+                    color="#1f4d36",
+                ),
+                CampLevelCard(
+                    title="ADVANCED",
+                    description="For dedicated students seeking deeper training.",
+                    color="#b85a28",
+                ),
+                CampLevelCard(
+                    title="PROFESSIONAL PLAYER TRAINING",
+                    description="Intensive training for demonstrations, tournaments and advanced development.",
+                    color="#8b1a1a",
+                ),
+            ],
+            panels=[
+                CampLevelPanel(
+                    title="SHAOLIN FOR CHILDREN",
+                    description=(
+                        "Help your child grow with discipline, confidence and focus "
+                        "through Shaolin Kung Fu training."
+                    ),
+                    bullets=[
+                        "Fitness & flexibility",
+                        "Discipline & respect",
+                        "Confidence & self-control",
+                    ],
+                    cta_label="ENROLL YOUR CHILD",
+                    cta_href="#register",
+                    cta_enabled=True,
+                    cta_opens_register=True,
+                ),
+                CampLevelPanel(
+                    title="RESIDENTIAL CAMPS",
+                    description=(
+                        "Experience intensive Shaolin Kung Fu training in our special residential camps."
+                    ),
+                    bullets=[
+                        "Intensive training",
+                        "Weapons practice",
+                        "Discipline and routine",
+                        "Group activities & more",
+                    ],
+                    cta_label="VIEW UPCOMING CAMPS",
+                    cta_href="#camp",
+                    cta_enabled=True,
+                    cta_opens_register=False,
+                ),
+            ],
         ),
     )
     if hasattr(content, "model_dump"):
