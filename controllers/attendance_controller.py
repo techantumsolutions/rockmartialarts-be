@@ -67,9 +67,8 @@ class AttendanceController:
         branch_id: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        status: Optional[str] = None,
-        method: Optional[str] = None,
-        current_user: dict = None
+        current_user: dict = None,
+        limit: Optional[int] = None,
     ):
         """Get attendance reports with filtering and role-based access control"""
         try:
@@ -146,24 +145,19 @@ class AttendanceController:
                     filter_query["attendance_date"] = {"$gte": start_dt, "$lte": end_dt}
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid date format")
-            elif start_date:
+
+            fetch_limit = 1000
+            if limit is not None:
                 try:
-                    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                    filter_query["attendance_date"] = {"$gte": start_dt}
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Invalid date format")
-            elif end_date:
-                try:
-                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                    if len(end_date) <= 10:
-                        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-                    filter_query["attendance_date"] = {"$lte": end_dt}
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Invalid date format")
+                    fetch_limit = max(1, min(int(limit), 1000))
+                except (TypeError, ValueError):
+                    fetch_limit = 1000
 
             # Get attendance records with student and course information
             pipeline = [
                 {"$match": filter_query},
+                {"$sort": {"attendance_date": -1}},
+                {"$limit": fetch_limit},
                 {
                     "$lookup": {
                         "from": "users",
@@ -217,7 +211,7 @@ class AttendanceController:
                 {"$sort": {"attendance_date": -1}}
             ]
 
-            attendance_records = await db.attendance.aggregate(pipeline).to_list(length=1000)
+            attendance_records = await db.attendance.aggregate(pipeline).to_list(length=fetch_limit)
 
             # Convert to serializable format
             serialized_records = []

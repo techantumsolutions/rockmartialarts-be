@@ -93,7 +93,7 @@ async def get_course_payment_info(
 async def get_public_courses(
     active_only: bool = True,
     skip: int = 0,
-    limit: int = 100
+    limit: int = 500
 ):
     """Get all courses - Public endpoint (no authentication required)"""
     return await CourseController.get_public_courses(active_only, skip, limit)

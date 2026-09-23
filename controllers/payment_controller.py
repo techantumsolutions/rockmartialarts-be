@@ -139,6 +139,11 @@ def _batches_for_course_on_branch(branch: dict, course_id: str) -> list:
     return []
 
 
+def _batch_identity(batch: dict, index: int) -> str:
+    bid = str((batch.get("batch_id") or batch.get("id") or "")).strip()
+    return bid or f"__index:{index}__"
+
+
 def _resolve_branch_batch(batches: list, batch_ref: Optional[str]):
     """Match persisted batch_id/id or synthetic __index:n__ from public API."""
     if not batch_ref or not str(batch_ref).strip():
@@ -157,6 +162,106 @@ def _resolve_branch_batch(batches: list, batch_ref: Optional[str]):
         bid = str((b.get("batch_id") or b.get("id") or "")).strip()
         if bid == s:
             return b
+    return None
+
+
+def _fee_from_batch_for_keys(batch: Optional[dict], dur_keys: list) -> Optional[float]:
+    """Current admin batch fee for a tenure: fee_per_duration first, else legacy batch_fee."""
+    if not batch:
+        return None
+    fpd = batch.get("fee_per_duration") or {}
+    if isinstance(fpd, dict):
+        for dk in dur_keys or []:
+            if dk in fpd and fpd[dk] is not None:
+                try:
+                    return float(fpd[dk])
+                except (TypeError, ValueError):
+                    pass
+    return _batch_fee_from_doc(batch)
+
+
+async def _latest_student_batch_ref(
+    db,
+    student_id: Optional[str],
+    course_id: str,
+    branch_id: str,
+) -> Optional[str]:
+    """Most recent enrollment batch for this student/course/branch (paid first)."""
+    if not student_id:
+        return None
+    rows = await db.enrollments.find(
+        {
+            "student_id": student_id,
+            "course_id": course_id,
+            "branch_id": branch_id,
+            "batch_ref": {"$exists": True, "$nin": [None, ""]},
+        },
+        {"batch_ref": 1, "end_date": 1, "created_at": 1, "payment_status": 1},
+    ).sort([("end_date", -1), ("created_at", -1)]).to_list(length=40)
+    paid = []
+    other = []
+    for row in rows:
+        ref = str(row.get("batch_ref") or "").strip()
+        if not ref:
+            continue
+        status = str(row.get("payment_status") or "").lower()
+        if status in (EnrollmentPaymentStatus.PAID.value, "completed", "paid"):
+            paid.append(ref)
+        else:
+            other.append(ref)
+    return (paid or other or [None])[0]
+
+
+async def _latest_active_paid_enrollment(db, student_id: str, course_id: str):
+    """Latest still-active paid enrollment for this course (by end_date, not arbitrary find_one)."""
+    return await db.enrollments.find_one(
+        {
+            "student_id": student_id,
+            "course_id": course_id,
+            "is_active": True,
+            "payment_status": {"$in": [EnrollmentPaymentStatus.PAID.value, "completed", "paid"]},
+        },
+        sort=[("end_date", -1), ("created_at", -1)],
+    )
+
+
+async def resolve_checkout_batch_ref(
+    db,
+    *,
+    course_id: str,
+    branch_id: str,
+    batches: list,
+    requested_batch_ref: Optional[str] = None,
+    student_id: Optional[str] = None,
+    duration_keys: Optional[list] = None,
+) -> Optional[str]:
+    """
+    Source of truth for renewal/checkout is the branch course_schedule batch fee
+    set in super admin — never leftover course-level catalog amounts (e.g. ₹1500).
+    """
+    requested = (requested_batch_ref or "").strip()
+    if requested:
+        if not batches or _resolve_branch_batch(batches, requested) is not None:
+            return requested
+    if student_id:
+        prior = await _latest_student_batch_ref(db, student_id, course_id, branch_id)
+        if prior and (not batches or _resolve_branch_batch(batches, prior) is not None):
+            return prior
+    if len(batches) == 1:
+        return _batch_identity(batches[0], 0)
+    keys = duration_keys or []
+    priced_refs: list = []
+    priced_fees: list = []
+    for i, batch in enumerate(batches):
+        fee = _fee_from_batch_for_keys(batch, keys)
+        if fee is None:
+            continue
+        priced_refs.append(_batch_identity(batch, i))
+        priced_fees.append(fee)
+    if len(priced_fees) == 1:
+        return priced_refs[0]
+    if len(priced_fees) > 1 and len(set(priced_fees)) == 1:
+        return priced_refs[0]
     return None
 
 
@@ -744,7 +849,22 @@ class PaymentController:
 
         student_id = current_user["id"]
         await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
-        br = (body.batch_ref or "").strip() or None
+        branch = await db.branches.find_one({"id": body.branch_id})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        duration_info = await db.durations.find_one({"id": body.duration})
+        if not duration_info:
+            duration_info = await db.durations.find_one({"code": body.duration})
+        batches = _batches_for_course_on_branch(branch, body.course_id)
+        br = await resolve_checkout_batch_ref(
+            db,
+            course_id=body.course_id,
+            branch_id=body.branch_id,
+            batches=batches,
+            requested_batch_ref=body.batch_ref,
+            student_id=student_id,
+            duration_keys=_duration_price_keys(body.duration, duration_info),
+        )
         beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
         should_charge_admission = await should_charge_admission_fee_for_checkout(
             db,
@@ -1572,14 +1692,7 @@ class PaymentController:
         student_id = current_user["id"]
         await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
 
-        active_paid = await db.enrollments.find_one(
-            {
-                "student_id": student_id,
-                "course_id": body.course_id,
-                "is_active": True,
-                "payment_status": EnrollmentPaymentStatus.PAID.value,
-            }
-        )
+        active_paid = await _latest_active_paid_enrollment(db, student_id, body.course_id)
 
         # Drop abandoned pending checkouts so the student can retry after canceling Razorpay.
         # Also cancel pending payment attempts linked to those stale pending enrollments.
@@ -1622,7 +1735,19 @@ class PaymentController:
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
 
-        batch_ref = (body.batch_ref or "").strip() or None
+        duration_row = await db.durations.find_one({"id": body.duration})
+        if not duration_row:
+            duration_row = await db.durations.find_one({"code": body.duration})
+        batches = _batches_for_course_on_branch(branch, body.course_id)
+        batch_ref = await resolve_checkout_batch_ref(
+            db,
+            course_id=body.course_id,
+            branch_id=body.branch_id,
+            batches=batches,
+            requested_batch_ref=body.batch_ref,
+            student_id=student_id,
+            duration_keys=_duration_price_keys(body.duration, duration_row),
+        )
 
         beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
         info = await PaymentController.get_course_payment_info(
@@ -1640,9 +1765,6 @@ class PaymentController:
             active_end_eod = subscription_end_of_day_utc(active_paid.get("end_date"))
             if active_end_eod is not None:
                 start_date = (active_end_eod + timedelta(microseconds=1)).replace(tzinfo=None)
-        duration_row = await db.durations.find_one({"id": body.duration})
-        if not duration_row:
-            duration_row = await db.durations.find_one({"code": body.duration})
         months_hint = None
         if duration_row and duration_row.get("duration_months") is not None:
             try:
@@ -1667,10 +1789,14 @@ class PaymentController:
             admission_fee=effective_admission_fee,
             payment_status=EnrollmentPaymentStatus.PENDING,
             is_active=True,
+            duration_id=body.duration,
+            batch_ref=batch_ref,
         )
         enrollment_doc = enrollment.dict()
         enrollment_doc["duration_id"] = body.duration
         enrollment_doc["enrollment_date"] = start_date
+        if batch_ref:
+            enrollment_doc["batch_ref"] = batch_ref
         # Store beneficiary info if provided
         if body.beneficiary and body.beneficiary.beneficiary_type != "self":
             enrollment_doc["beneficiary"] = beneficiary_payload
@@ -1682,6 +1808,7 @@ class PaymentController:
             "course_name": info.course_name,
             "branch_name": info.branch_name,
             "duration_months": months_hint,
+            "batch_ref": batch_ref,
         }
 
     @staticmethod
@@ -1784,8 +1911,30 @@ class PaymentController:
 
             batches = _batches_for_course_on_branch(branch, course_id)
             branch_pricing = _course_branch_pricing_map(course)
-            # Batch pricing applies only when the client selects a batch (registration batch picker).
-            # Renewals and quotes without batch_ref use course/branch tenure fees (e.g. ₹1500 not first batch ₹3000).
+            # Always price from the current super-admin batch setup when one can be resolved.
+            # Course-level fee_per_duration / branch_pricing often still hold leftover amounts
+            # (₹1500 / ₹1600) that are no longer shown or edited in the admin UI.
+            batch_ref = await resolve_checkout_batch_ref(
+                db,
+                course_id=course_id,
+                branch_id=branch_id,
+                batches=batches,
+                requested_batch_ref=batch_ref,
+                student_id=optional_student_id,
+                duration_keys=dur_keys,
+            )
+            if not batch_ref:
+                for i, bdoc_candidate in enumerate(batches):
+                    if _fee_from_batch_for_keys(bdoc_candidate, dur_keys) is not None:
+                        # Multiple differently priced batches and no student/batch context:
+                        # still prefer an admin batch fee over stale course-catalog leftovers.
+                        if optional_student_id:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Please select your batch so we can apply the correct fee set by admin.",
+                            )
+                        batch_ref = _batch_identity(bdoc_candidate, i)
+                        break
             if batch_ref and str(batch_ref).strip():
                 bdoc = _resolve_branch_batch(batches, batch_ref)
                 if bdoc is None:
@@ -3066,43 +3215,46 @@ class PaymentController:
                     # Filter payments by branch_id in branch_details
                     filter_query["branch_details.branch_id"] = assigned_branch
 
-            # Get payments with student information
+            # Cap work before expensive lookups. Dedupe still runs on this recent window.
+            pre_dedupe_fetch_limit = max(400, (skip + limit) * 8)
+
             pipeline = [
                 {"$match": filter_query},
-                # Add deduplication by payment ID at database level
+            ]
+            if branch_filter_id:
+                pipeline.extend([
+                    {
+                        "$lookup": {
+                            "from": "enrollments",
+                            "localField": "enrollment_id",
+                            "foreignField": "id",
+                            "as": "enr",
+                        }
+                    },
+                    {"$unwind": {"path": "$enr", "preserveNullAndEmptyArrays": True}},
+                    {
+                        "$addFields": {
+                            "resolved_branch_id": {"$ifNull": ["$branch_details.branch_id", "$enr.branch_id"]}
+                        }
+                    },
+                    {"$match": {"resolved_branch_id": branch_filter_id}},
+                ])
+            pipeline.extend([
+                {"$sort": {"created_at": -1}},
+                {"$limit": pre_dedupe_fetch_limit},
                 {
                     "$group": {
-                        "_id": "$id",  # Group by payment ID to remove duplicates
-                        "doc": {"$first": "$$ROOT"}  # Keep the first occurrence
+                        "_id": "$id",
+                        "doc": {"$first": "$$ROOT"},
                     }
                 },
-                {"$replaceRoot": {"newRoot": "$doc"}},  # Replace root with the original document
-                # Resolve branch via enrollment when branch_filter_id is used
-                {
-                    "$lookup": {
-                        "from": "enrollments",
-                        "localField": "enrollment_id",
-                        "foreignField": "id",
-                        "as": "enr",
-                    }
-                },
-                {"$unwind": {"path": "$enr", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$addFields": {
-                        "resolved_branch_id": {"$ifNull": ["$branch_details.branch_id", "$enr.branch_id"]}
-                    }
-                },
-                *(
-                    [{"$match": {"resolved_branch_id": branch_filter_id}}]
-                    if branch_filter_id
-                    else []
-                ),
+                {"$replaceRoot": {"newRoot": "$doc"}},
                 {
                     "$lookup": {
                         "from": "users",
                         "localField": "student_id",
                         "foreignField": "id",
-                        "as": "student_info"
+                        "as": "student_info",
                     }
                 },
                 {"$unwind": {"path": "$student_info", "preserveNullAndEmptyArrays": True}},
@@ -3126,15 +3278,12 @@ class PaymentController:
                         "course_name": {"$ifNull": ["$course_details.course_name", None]},
                         "branch_name": {"$ifNull": ["$branch_details.branch_name", None]},
                         "branch_id": {"$ifNull": ["$branch_details.branch_id", "$resolved_branch_id"]},
-                        "created_at": 1
+                        "created_at": 1,
                     }
                 },
                 {"$sort": {"created_at": -1}},
-            ]
+            ])
 
-            # IMPORTANT: Fetch wider set first, then dedupe, then paginate.
-            # Paginating before dedupe can hide successful rows behind duplicate pending retries.
-            pre_dedupe_fetch_limit = max(1000, (skip + limit) * 10)
             payments = await db.payments.aggregate(pipeline).to_list(pre_dedupe_fetch_limit)
 
             # Convert MongoDB documents to JSON-serializable format
@@ -3230,24 +3379,33 @@ class PaymentController:
                     sp["gateway_payment_label"] = _METHOD_DISPLAY.get(pm) or pm.replace("_", " ").title()
 
             # Enrich missing course names from enrollment → course (older rows may lack course_details)
-            for sp in serialized_payments:
-                if sp.get("course_name"):
-                    continue
-                eid = sp.get("enrollment_id")
-                if not eid:
-                    continue
+            missing_course = [sp for sp in serialized_payments if not sp.get("course_name") and sp.get("enrollment_id")]
+            if missing_course:
                 try:
-                    en = await db.enrollments.find_one({"id": eid})
-                    if not en:
-                        continue
-                    cid = en.get("course_id")
-                    if not cid:
-                        continue
-                    cdoc = await db.courses.find_one({"id": cid})
-                    if cdoc:
-                        sp["course_name"] = cdoc.get("title") or cdoc.get("name")
+                    eids = list({sp["enrollment_id"] for sp in missing_course})
+                    ens = await db.enrollments.find(
+                        {"id": {"$in": eids}},
+                        {"_id": 0, "id": 1, "course_id": 1},
+                    ).to_list(length=len(eids))
+                    cid_by_eid = {e["id"]: e.get("course_id") for e in ens if e.get("id")}
+                    cids = list({cid for cid in cid_by_eid.values() if cid})
+                    course_map = {}
+                    if cids:
+                        courses = await db.courses.find(
+                            {"id": {"$in": cids}},
+                            {"_id": 0, "id": 1, "title": 1, "name": 1},
+                        ).to_list(length=len(cids))
+                        course_map = {
+                            c["id"]: (c.get("title") or c.get("name"))
+                            for c in courses
+                            if c.get("id")
+                        }
+                    for sp in missing_course:
+                        cid = cid_by_eid.get(sp.get("enrollment_id"))
+                        if cid and course_map.get(cid):
+                            sp["course_name"] = course_map[cid]
                 except Exception:
-                    logger.exception("enrich course_name for payment %s", sp.get("id"))
+                    logger.exception("enrich course_name for payment list")
 
             print(f"🔍 Payment query debug - Student ID: {filter_query.get('student_id', 'N/A')}")
             print(f"🔍 Total payments found: {len(payments)}, After deduplication: {len(serialized_payments)}")

@@ -28,6 +28,11 @@ class HomepageSection(BaseModel):
     hero_description: Optional[str] = None
     hero_image: Optional[str] = None
     hero_video: Optional[str] = None
+    # Hero CTA buttons — only rendered on the site when text is set in admin CMS
+    hero_primary_cta_text: Optional[str] = None
+    hero_primary_cta_link: Optional[str] = None
+    hero_secondary_cta_text: Optional[str] = None
+    hero_secondary_cta_link: Optional[str] = None
     about_title: Optional[str] = None
     about_subtitle: Optional[str] = None
     courses_title: Optional[str] = None

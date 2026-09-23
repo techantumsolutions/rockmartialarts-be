@@ -107,6 +107,212 @@ def _derive_enrollment_status(enrollment: dict) -> str:
     return "active"
 
 
+def _student_age(date_of_birth):
+    if not date_of_birth:
+        return None
+    if isinstance(date_of_birth, str):
+        try:
+            birth_date = datetime.strptime(date_of_birth, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    elif isinstance(date_of_birth, date):
+        birth_date = date_of_birth
+    else:
+        return None
+    today = date.today()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+
+
+async def _enrich_students_for_list(db, students: list) -> list:
+    """Attach course/branch data with a few batched queries instead of per-student lookups."""
+    if not students:
+        return []
+
+    student_ids = [s["id"] for s in students if s.get("id")]
+    enrollments = await db.enrollments.find(
+        {"student_id": {"$in": student_ids}}
+    ).to_list(length=20000)
+
+    enrollments_by_student = defaultdict(list)
+    course_ids = set()
+    branch_ids = set()
+    duration_ids = set()
+    for enrollment in enrollments:
+        enrollments_by_student[enrollment.get("student_id")].append(enrollment)
+        if enrollment.get("course_id"):
+            course_ids.add(enrollment["course_id"])
+        if enrollment.get("branch_id"):
+            branch_ids.add(enrollment["branch_id"])
+        if enrollment.get("duration_id"):
+            duration_ids.add(enrollment["duration_id"])
+
+    for student in students:
+        legacy_course = student.get("course") or {}
+        if legacy_course.get("course_id"):
+            course_ids.add(legacy_course["course_id"])
+        legacy_duration = legacy_course.get("duration")
+        if legacy_duration:
+            duration_ids.add(legacy_duration)
+        legacy_branch = (student.get("branch") or {}).get("branch_id") or student.get("branch_id")
+        if legacy_branch:
+            branch_ids.add(legacy_branch)
+
+    courses = {}
+    if course_ids:
+        course_rows = await db.courses.find({"id": {"$in": list(course_ids)}}).to_list(length=len(course_ids))
+        courses = {course["id"]: course for course in course_rows if course.get("id")}
+
+    branches = {}
+    if branch_ids:
+        branch_rows = await db.branches.find({"id": {"$in": list(branch_ids)}}).to_list(length=len(branch_ids))
+        branches = {branch["id"]: branch for branch in branch_rows if branch.get("id")}
+
+    durations = {}
+    if duration_ids:
+        duration_keys = list(duration_ids)
+        duration_rows = await db.durations.find(
+            {"$or": [{"id": {"$in": duration_keys}}, {"code": {"$in": duration_keys}}]}
+        ).to_list(length=max(len(duration_keys) * 2, 1))
+        for duration in duration_rows:
+            if duration.get("id"):
+                durations[duration["id"]] = duration
+            if duration.get("code"):
+                durations[duration["code"]] = duration
+
+    enriched_students = []
+    for student in students:
+        student_id = student["id"]
+        all_enrollments = enrollments_by_student.get(student_id, [])
+        courses_info = []
+
+        groups = defaultdict(list)
+        for enrollment in all_enrollments:
+            groups[(enrollment.get("course_id"), enrollment.get("branch_id"))].append(enrollment)
+
+        for (_cid, _bid), group in groups.items():
+            enrollment = _select_primary_enrollment(group)
+            if not enrollment or not enrollment.get("is_active", True):
+                continue
+            course = courses.get(enrollment.get("course_id"))
+            if not course:
+                continue
+            duration_days = None
+            if enrollment.get("start_date") and enrollment.get("end_date"):
+                start_date = enrollment["start_date"]
+                end_date = enrollment["end_date"]
+                if isinstance(start_date, str):
+                    start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                if isinstance(end_date, str):
+                    end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                duration_days = (end_date - start_date).days
+
+            duration_label = None
+            did = enrollment.get("duration_id")
+            if did:
+                ddoc = durations.get(did)
+                if ddoc:
+                    duration_label = ddoc.get("name") or ddoc.get("code")
+
+            courses_info.append({
+                "enrollment_id": enrollment.get("id"),
+                "course_id": enrollment["course_id"],
+                "course_name": course.get("title", "Unknown Course"),
+                "level": course.get("difficulty_level", "Beginner"),
+                "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
+                "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
+                "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
+                "enrollment_date": enrollment.get("enrollment_date"),
+                "payment_status": enrollment.get("payment_status", "pending"),
+                "is_active": enrollment.get("is_active", True),
+                "branch_id": enrollment.get("branch_id"),
+            })
+
+        if not courses_info and student.get("course"):
+            course_info = student["course"]
+            branch_info = student.get("branch", {}) or {}
+            course = courses.get(course_info.get("course_id"))
+            if course:
+                branch_name = "Not specified"
+                if branch_info.get("branch_id"):
+                    branch = branches.get(branch_info["branch_id"])
+                    if branch:
+                        branch_name = branch.get("name") or branch.get("branch", {}).get("name") or "Unknown Branch"
+
+                duration_name = course_info.get("duration", "Not specified")
+                if course_info.get("duration"):
+                    if isinstance(course_info["duration"], str) and not str(course_info["duration"]).startswith(("uuid-", "duration-")):
+                        duration_name = course_info["duration"]
+                    else:
+                        duration = durations.get(course_info["duration"])
+                        if duration:
+                            duration_name = duration.get("name", duration_name)
+
+                courses_info.append({
+                    "course_name": course.get("title", "Unknown Course"),
+                    "level": course.get("difficulty_level", "Beginner"),
+                    "duration": duration_name,
+                    "enrollment_date": student.get("created_at"),
+                    "payment_status": "paid",
+                    "source": "legacy_user_document",
+                    "branch_name": branch_name,
+                })
+
+        branch_info_response = None
+        branch_id_for_name = None
+        active_enrollments_only = [e for e in all_enrollments if e.get("is_active", True)]
+        row_primary = (
+            _select_primary_enrollment(active_enrollments_only)
+            if active_enrollments_only
+            else None
+        )
+        if row_primary:
+            branch_id_for_name = row_primary.get("branch_id")
+        if not branch_id_for_name and student.get("branch", {}).get("branch_id"):
+            branch_id_for_name = student["branch"]["branch_id"]
+        if not branch_id_for_name and student.get("branch_id"):
+            branch_id_for_name = student["branch_id"]
+        if branch_id_for_name:
+            branch_doc = branches.get(branch_id_for_name)
+            if branch_doc:
+                branch_info_response = {
+                    "branch_id": branch_id_for_name,
+                    "location_id": branch_doc.get("location_id", ""),
+                    "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch"),
+                }
+
+        full_name = student.get("full_name") or f"{student.get('first_name', '')} {student.get('last_name', '')}".strip()
+        enriched_students.append({
+            "id": student_id,
+            "student_id": student_id,
+            "full_name": full_name,
+            "student_name": full_name,
+            "first_name": student.get("first_name", ""),
+            "last_name": student.get("last_name", ""),
+            "email": student.get("email"),
+            "phone": student.get("phone"),
+            "role": student.get("role", "student"),
+            "gender": student.get("gender", "Not specified"),
+            "age": _student_age(student.get("date_of_birth")),
+            "date_of_birth": student.get("date_of_birth"),
+            "is_active": student.get("is_active", True),
+            "created_at": student.get("created_at"),
+            "has_credentials": bool(student.get("has_credentials", True)),
+            "start_date": _enrollment_date_to_iso(row_primary.get("start_date")) if row_primary else None,
+            "end_date": _enrollment_date_to_iso(row_primary.get("end_date")) if row_primary else None,
+            "primary_enrollment_id": row_primary.get("id") if row_primary else None,
+            "subscription_payment_status": row_primary.get("payment_status") if row_primary else None,
+            "branch_id": branch_id_for_name or student.get("branch_id"),
+            "branch_info": branch_info_response,
+            "address": student.get("address"),
+            "courses": courses_info,
+            "enrollments": courses_info,
+            "action": "view_profile",
+            "student_level": student.get("student_level"),
+        })
+
+    return enriched_students
+
+
 class UserController:
     @staticmethod
     async def create_user(
@@ -1486,8 +1692,42 @@ class UserController:
                     return {"message": "No students found", "students": [], "total": 0}
                 query["id"] = {"$in": coach_student_ids}
 
+        if branch_id and branch_id != "all" and current_role == UserRole.SUPER_ADMIN:
+            enrolled_ids = await db.enrollments.distinct(
+                "student_id",
+                {"branch_id": branch_id, "is_active": True},
+            )
+            or_clauses = [
+                {"branch_id": branch_id},
+                {"branch.branch_id": branch_id},
+            ]
+            if enrolled_ids:
+                or_clauses.append({"id": {"$in": enrolled_ids}})
+            query["$or"] = or_clauses
+
+        student_proj = {
+            "_id": 0,
+            "id": 1,
+            "full_name": 1,
+            "first_name": 1,
+            "last_name": 1,
+            "email": 1,
+            "phone": 1,
+            "role": 1,
+            "gender": 1,
+            "date_of_birth": 1,
+            "is_active": 1,
+            "created_at": 1,
+            "has_credentials": 1,
+            "branch_id": 1,
+            "branch": 1,
+            "course": 1,
+            "address": 1,
+            "student_level": 1,
+        }
+
         # Get students (newest first)
-        students_cursor = db.users.find(query).sort("created_at", -1)
+        students_cursor = db.users.find(query, student_proj).sort("created_at", -1)
         students = await students_cursor.to_list(1000)
 
         if not students:
@@ -1497,209 +1737,16 @@ class UserController:
                 "total": 0
             }
 
-        # Enrich student data with course and enrollment information
-        enriched_students = []
-
         # For branch managers, we need to filter students based on their enrollments
         if current_role == UserRole.BRANCH_MANAGER and 'managed_branch_ids_for_students' in locals():
-            print(f"🔍 DEBUG: Filtering students for branch manager with managed_branch_ids: {managed_branch_ids_for_students}")
-
-            # Get all enrollments for all managed branches
-            branch_enrollments = await db.enrollments.find({"branch_id": {"$in": managed_branch_ids_for_students}, "is_active": True}).to_list(1000)
-            branch_student_ids = list(set([enrollment["student_id"] for enrollment in branch_enrollments]))
-
-            print(f"Found {len(branch_enrollments)} enrollments across {len(managed_branch_ids_for_students)} managed branches")
-            print(f"Unique student IDs with enrollments: {len(branch_student_ids)}")
-
-            # Debug: Show some enrollment details
-            if branch_enrollments:
-                print(f"🔍 DEBUG: Sample enrollment: {branch_enrollments[0]}")
-
-            # Debug: Check total enrollments in database
-            total_enrollments = await db.enrollments.find({"is_active": True}).to_list(1000)
-            print(f"🔍 DEBUG: Total active enrollments in database: {len(total_enrollments)}")
-
-            print(f"🔍 DEBUG: Students before filtering: {len(students)}")
-            # Filter students to only include those with enrollments in the managed branches
+            branch_enrollments = await db.enrollments.find(
+                {"branch_id": {"$in": managed_branch_ids_for_students}, "is_active": True},
+                {"_id": 0, "student_id": 1},
+            ).to_list(5000)
+            branch_student_ids = {enrollment["student_id"] for enrollment in branch_enrollments if enrollment.get("student_id")}
             students = [student for student in students if student["id"] in branch_student_ids]
-            print(f"🔍 DEBUG: Students after filtering: {len(students)}")
 
-        for student in students:
-            student_id = student["id"]
-
-            # Calculate age from date_of_birth
-            age = None
-            if student.get("date_of_birth"):
-                if isinstance(student["date_of_birth"], str):
-                    try:
-                        birth_date = datetime.strptime(student["date_of_birth"], "%Y-%m-%d").date()
-                    except ValueError:
-                        birth_date = None
-                elif isinstance(student["date_of_birth"], date):
-                    birth_date = student["date_of_birth"]
-                else:
-                    birth_date = None
-
-                if birth_date:
-                    today = date.today()
-                    age = today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
-
-            # Get course information from multiple sources
-            courses_info = []
-
-            # All enrollment rows (inactive/cancelled included); one display row per course+branch using same
-            # primary rules as student dashboard merge (paid beats cancelled — avoids mismatched dates/status).
-            all_enrollments = await (
-                db.enrollments.find({"student_id": student_id})
-                .sort([("updated_at", -1), ("enrollment_date", -1)])
-                .to_list(100)
-            )
-
-            groups = defaultdict(list)
-            for e in all_enrollments:
-                groups[(e.get("course_id"), e.get("branch_id"))].append(e)
-
-            for (_cid, _bid), group in groups.items():
-                enrollment = _select_primary_enrollment(group)
-                if not enrollment or not enrollment.get("is_active", True):
-                    continue
-                course = await db.courses.find_one({"id": enrollment["course_id"]})
-                if not course:
-                    continue
-                duration_days = None
-                if enrollment.get("start_date") and enrollment.get("end_date"):
-                    start_date = enrollment["start_date"]
-                    end_date = enrollment["end_date"]
-                    if isinstance(start_date, str):
-                        start_date = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-                    if isinstance(end_date, str):
-                        end_date = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    duration_days = (end_date - start_date).days
-
-                duration_label = None
-                did = enrollment.get("duration_id")
-                if did:
-                    ddoc = await db.durations.find_one({"id": did})
-                    if not ddoc:
-                        ddoc = await db.durations.find_one({"code": did})
-                    if ddoc:
-                        duration_label = ddoc.get("name") or ddoc.get("code")
-
-                level = course.get("difficulty_level", "Beginner")
-
-                courses_info.append({
-                    "enrollment_id": enrollment.get("id"),
-                    "course_id": enrollment["course_id"],
-                    "course_name": course.get("title", "Unknown Course"),
-                    "level": level,
-                    "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
-                    "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
-                    "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
-                    "enrollment_date": enrollment.get("enrollment_date"),
-                    "payment_status": enrollment.get("payment_status", "pending"),
-                    "is_active": enrollment.get("is_active", True),
-                    "branch_id": enrollment.get("branch_id"),
-                })
-
-            # DEPRECATED: Legacy fallback for students with course data in user documents
-            # This will be removed after data migration is complete
-            if not courses_info and student.get("course"):
-                course_info = student["course"]
-                branch_info = student.get("branch", {})
-
-                # Get course details from courses collection
-                course_id = course_info.get("course_id")
-                course = await db.courses.find_one({"id": course_id})
-                if course:
-                    # Get branch details
-                    branch_name = "Not specified"
-                    if branch_info.get("branch_id"):
-                        branch = await db.branches.find_one({"id": branch_info["branch_id"]})
-                        if branch:
-                            branch_name = branch.get("name", "Unknown Branch")
-
-                    # Get duration details - handle both UUID and string formats
-                    duration_name = course_info.get("duration", "Not specified")
-                    if course_info.get("duration"):
-                        # If it's already a readable string, use it directly
-                        if isinstance(course_info["duration"], str) and not course_info["duration"].startswith(("uuid-", "duration-")):
-                            duration_name = course_info["duration"]
-                        else:
-                            # Try to look up in durations collection
-                            duration = await db.durations.find_one({"id": course_info["duration"]})
-                            if duration:
-                                duration_name = duration.get("name", duration_name)
-
-                    courses_info.append({
-                        "course_name": course.get("title", "Unknown Course"),
-                        "level": course.get("difficulty_level", "Beginner"),
-                        "duration": duration_name,
-                        "enrollment_date": student.get("created_at"),
-                        "payment_status": "paid",  # Assume paid for registration-based students
-                        "source": "legacy_user_document"  # Mark as legacy data for migration tracking
-                    })
-
-            # Resolve branch_info — primary active enrollment only (matches Branch column)
-            branch_info_response = None
-            branch_id_for_name = None
-            active_enrollments_only = [
-                e for e in all_enrollments if e.get("is_active", True)
-            ]
-            row_primary = (
-                _select_primary_enrollment(active_enrollments_only)
-                if active_enrollments_only
-                else None
-            )
-            if row_primary:
-                branch_id_for_name = row_primary.get("branch_id")
-            if not branch_id_for_name and student.get("branch", {}).get("branch_id"):
-                branch_id_for_name = student["branch"]["branch_id"]
-            if not branch_id_for_name and student.get("branch_id"):
-                branch_id_for_name = student["branch_id"]
-            if branch_id_for_name:
-                branch_doc = await db.branches.find_one({"id": branch_id_for_name})
-                if branch_doc:
-                    branch_info_response = {
-                        "branch_id": branch_id_for_name,
-                        "location_id": branch_doc.get("location_id", ""),
-                        "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch")
-                    }
-
-            primary_enrollment = row_primary
-            start_date_out = _enrollment_date_to_iso(primary_enrollment.get("start_date")) if primary_enrollment else None
-            end_date_out = _enrollment_date_to_iso(primary_enrollment.get("end_date")) if primary_enrollment else None
-
-            # Prepare student details response
-            student_details = {
-                "id": student_id,
-                "student_id": student_id,
-                "full_name": student.get("full_name", f"{student.get('first_name', '')} {student.get('last_name', '')}").strip(),
-                "student_name": student.get("full_name", f"{student.get('first_name', '')} {student.get('last_name', '')}").strip(),
-                "first_name": student.get("first_name", ""),
-                "last_name": student.get("last_name", ""),
-                "email": student.get("email"),
-                "phone": student.get("phone"),
-                "role": student.get("role", "student"),
-                "gender": student.get("gender", "Not specified"),
-                "age": age,
-                "date_of_birth": student.get("date_of_birth"),
-                "is_active": student.get("is_active", True),
-                "created_at": student.get("created_at"),
-                "has_credentials": bool(student.get("has_credentials", True)),
-                "start_date": start_date_out,
-                "end_date": end_date_out,
-                "primary_enrollment_id": primary_enrollment.get("id") if primary_enrollment else None,
-                "subscription_payment_status": primary_enrollment.get("payment_status") if primary_enrollment else None,
-                "branch_id": branch_id_for_name or student.get("branch_id"),
-                "branch_info": branch_info_response,
-                "address": student.get("address"),
-                "courses": courses_info,
-                "enrollments": courses_info,  # For compatibility with frontend
-                "action": "view_profile",  # Default action - can be customized based on requirements
-                "student_level": student.get("student_level"),
-            }
-
-            enriched_students.append(student_details)
+        enriched_students = await _enrich_students_for_list(db, students)
 
         if (
             branch_id
@@ -1840,69 +1887,82 @@ class UserController:
                 raise HTTPException(status_code=403, detail="You can only view payments for students in branches you manage")
 
         try:
-            # Get payments for this student with course and enrollment information
-            pipeline = [
-                {"$match": {"student_id": user_id}},
+            rows = await db.payments.find(
+                {"student_id": user_id},
                 {
-                    "$lookup": {
-                        "from": "enrollments",
-                        "localField": "enrollment_id",
-                        "foreignField": "id",
-                        "as": "enrollment_info"
-                    }
+                    "_id": 0,
+                    "id": 1,
+                    "student_id": 1,
+                    "enrollment_id": 1,
+                    "amount": 1,
+                    "payment_type": 1,
+                    "payment_method": 1,
+                    "payment_status": 1,
+                    "transaction_id": 1,
+                    "payment_date": 1,
+                    "due_date": 1,
+                    "notes": 1,
+                    "gateway_payment_label": 1,
+                    "gateway_method": 1,
+                    "course_id": 1,
+                    "course_details": 1,
+                    "created_at": 1,
+                    "updated_at": 1,
                 },
-                {"$unwind": {"path": "$enrollment_info", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$lookup": {
-                        "from": "courses",
-                        "localField": "enrollment_info.course_id",
-                        "foreignField": "id",
-                        "as": "course_info"
-                    }
-                },
-                {"$unwind": {"path": "$course_info", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$project": {
-                        "id": 1,
-                        "student_id": 1,
-                        "enrollment_id": 1,
-                        "amount": 1,
-                        "payment_type": 1,
-                        "payment_method": 1,
-                        "payment_status": 1,
-                        "transaction_id": 1,
-                        "payment_date": 1,
-                        "due_date": 1,
-                        "notes": 1,
-                        "course_name": {"$ifNull": ["$course_info.title", "$course_info.name"]},
-                        "course_difficulty": "$course_info.difficulty_level",
-                        "enrollment_date": "$enrollment_info.enrollment_date",
-                        "created_at": 1,
-                        "updated_at": 1
-                    }
-                },
-                {"$sort": {"created_at": -1}}
+            ).sort("created_at", -1).to_list(length=500)
+
+            missing_course_ids = []
+            for payment in rows:
+                details = payment.get("course_details") or {}
+                if not details.get("course_name") and (payment.get("course_id") or payment.get("enrollment_id")):
+                    missing_course_ids.append(payment)
+
+            course_map = {}
+            enrollment_course_ids = {}
+            need_enrollment_lookup = [
+                p.get("enrollment_id")
+                for p in missing_course_ids
+                if p.get("enrollment_id") and not p.get("course_id")
             ]
+            if need_enrollment_lookup:
+                enrollments = await db.enrollments.find(
+                    {"id": {"$in": list(set(need_enrollment_lookup))}},
+                    {"_id": 0, "id": 1, "course_id": 1},
+                ).to_list(length=len(set(need_enrollment_lookup)))
+                enrollment_course_ids = {e["id"]: e.get("course_id") for e in enrollments if e.get("id")}
 
-            payments = await db.payments.aggregate(pipeline).to_list(length=100)
+            course_ids = set()
+            for payment in missing_course_ids:
+                cid = payment.get("course_id") or enrollment_course_ids.get(payment.get("enrollment_id"))
+                if cid:
+                    course_ids.add(cid)
+            if course_ids:
+                courses = await db.courses.find(
+                    {"id": {"$in": list(course_ids)}},
+                    {"_id": 0, "id": 1, "title": 1, "name": 1},
+                ).to_list(length=len(course_ids))
+                course_map = {
+                    c["id"]: (c.get("title") or c.get("name") or "Course")
+                    for c in courses
+                    if c.get("id")
+                }
 
-            # Convert to serializable format
             enhanced_payments = []
-            for payment in payments:
+            for payment in rows:
+                details = payment.get("course_details") or {}
+                course_id = payment.get("course_id") or enrollment_course_ids.get(payment.get("enrollment_id"))
+                course_name = details.get("course_name") or course_map.get(course_id) or "Course"
                 enhanced_payment = {}
                 for key, value in payment.items():
-                    if key == "_id":
+                    if key in ("_id", "course_details", "course_id"):
                         continue
-                    elif hasattr(value, 'isoformat'):  # datetime objects
+                    elif hasattr(value, "isoformat"):
                         enhanced_payment[key] = value.isoformat()
                     else:
                         enhanced_payment[key] = value
-
-                # Add formatted payment description
-                course_name = enhanced_payment.get("course_name", "Course")
-                payment_type = enhanced_payment.get("payment_type", "payment")
-                enhanced_payment["description"] = f"{course_name} - {payment_type.replace('_', ' ').title()}"
-
+                enhanced_payment["course_name"] = course_name
+                payment_type = enhanced_payment.get("payment_type", "payment") or "payment"
+                enhanced_payment["description"] = f"{course_name} - {str(payment_type).replace('_', ' ').title()}"
                 enhanced_payments.append(enhanced_payment)
 
             return {
