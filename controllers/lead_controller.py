@@ -13,6 +13,7 @@ from passlib.context import CryptContext
 from models.lead_models import (
     LEAD_STATUSES,
     LeadCreate,
+    LeadFollowUpCreate,
     LeadOtpVerifyBody,
     LeadResponse,
     LeadStatus,
@@ -21,6 +22,18 @@ from models.lead_models import (
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.indian_phone import canonical_indian_phone, otp_phone_variants
+from utils.lead_service import (
+    create_lead_follow_up,
+    create_lead_from_payload,
+    get_lead,
+    lead_pipeline_summary,
+    lead_to_response_dict,
+    list_lead_follow_ups,
+    list_lead_source_options,
+    list_leads_service,
+    update_lead_status_with_history,
+)
+from utils.student_status_service import get_managed_branch_ids_for_user
 from utils.reg_checkout_sms import (
     public_sms_failure_hint,
     send_registration_sms,
@@ -70,54 +83,19 @@ def _issue_lead_popup_token(phone: str) -> str:
 _LEAD_EMAIL_PLACEHOLDER = (os.getenv("LEAD_EMAIL_PLACEHOLDER") or "website-popup@example.com").strip().lower()
 
 
-def _normalize_lead_status(raw: Any) -> LeadStatus:
-    s = (str(raw).strip().lower() if raw is not None else "")
-    if s in LEAD_STATUSES:
-        return s  # type: ignore[return-value]
-    return "new"
-
-
 def _lead_response_from_ser(ser: Dict[str, Any], fallback_now: Optional[datetime] = None) -> LeadResponse:
-    now = fallback_now or datetime.utcnow()
-    return LeadResponse(
-        id=ser["id"],
-        name=ser.get("name", "") or "",
-        email=ser.get("email") or "",
-        phone=ser.get("phone", "") or "",
-        course=ser.get("course", "") or "",
-        source=ser.get("source"),
-        branch_id=ser.get("branch_id"),
-        branch_name=ser.get("branch_name"),
-        status=_normalize_lead_status(ser.get("status")),
-        created_at=ser.get("created_at", now),
-    )
+    data = lead_to_response_dict(ser, fallback_now)
+    return LeadResponse(**data)
 
 
 class LeadController:
     @staticmethod
     async def create_lead(data: LeadCreate) -> LeadResponse:
         try:
-            db = get_db()
-            now = datetime.utcnow()
-            email_raw = (data.email or "").strip().lower() if data.email else ""
-            if email_raw == _LEAD_EMAIL_PLACEHOLDER:
-                email_raw = ""
-            doc: Dict[str, Any] = {
-                "id": str(uuid.uuid4()),
-                "name": data.name.strip(),
-                "email": email_raw,
-                "phone": data.phone.strip(),
-                "course": (data.course or "").strip(),
-                "source": (data.source or "").strip() or None,
-                "branch_id": (data.branch_id or "").strip() or None,
-                "branch_name": (data.branch_name or "").strip() or None,
-                "status": "new",
-                "created_at": now,
-                "updated_at": now,
-            }
-            await db.leads.insert_one(doc)
-            ser = serialize_doc(doc)
-            return _lead_response_from_ser(ser, now)
+            payload = await create_lead_from_payload(data)
+            return LeadResponse(**payload)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -130,54 +108,34 @@ class LeadController:
         limit: int = 50,
         search: Optional[str] = None,
         status: Optional[str] = None,
+        source: Optional[str] = None,
+        source_type: Optional[str] = None,
+        branch_id: Optional[str] = None,
+        follow_up_due: Optional[str] = None,
+        sort: Optional[str] = None,
+        coach_assignment_status: Optional[str] = None,
+        unassigned_coach: bool = False,
+        current_user: Optional[dict] = None,
     ) -> Dict[str, Any]:
         try:
-            db = get_db()
-            clauses: List[Dict[str, Any]] = []
-            if search and search.strip():
-                s = search.strip()
-                clauses.append(
-                    {
-                        "$or": [
-                            {"name": {"$regex": s, "$options": "i"}},
-                            {"email": {"$regex": s, "$options": "i"}},
-                            {"phone": {"$regex": s, "$options": "i"}},
-                            {"course": {"$regex": s, "$options": "i"}},
-                            {"branch_name": {"$regex": s, "$options": "i"}},
-                            {"branch_id": {"$regex": s, "$options": "i"}},
-                        ]
-                    }
-                )
-            st = (status or "").strip().lower()
-            if st in LEAD_STATUSES:
-                if st == "new":
-                    clauses.append(
-                        {
-                            "$or": [
-                                {"status": "new"},
-                                {"status": {"$exists": False}},
-                                {"status": None},
-                                {"status": ""},
-                            ]
-                        }
-                    )
-                else:
-                    clauses.append({"status": st})
-            if not clauses:
-                q: Dict[str, Any] = {}
-            elif len(clauses) == 1:
-                q = clauses[0]
-            else:
-                q = {"$and": clauses}
-            limit = min(max(limit, 1), 200)
-            skip = max(skip, 0)
-            cursor = db.leads.find(q).sort("created_at", -1).skip(skip).limit(limit)
-            items: List[LeadResponse] = []
-            for raw in await cursor.to_list(length=limit):
-                ser = serialize_doc(raw)
-                items.append(_lead_response_from_ser(ser))
-            total = await db.leads.count_documents(q)
-            return {"leads": items, "total": total, "skip": skip, "limit": limit}
+            data = await list_leads_service(
+                skip=skip,
+                limit=limit,
+                search=search,
+                status=status,
+                source=source,
+                source_type=source_type,
+                branch_id=branch_id,
+                follow_up_due=follow_up_due,
+                sort=sort,
+                coach_assignment_status=coach_assignment_status,
+                unassigned_coach=unassigned_coach,
+                current_user=current_user,
+            )
+            # Keep response shape: leads as LeadResponse-compatible dicts
+            return data
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -185,22 +143,63 @@ class LeadController:
             )
 
     @staticmethod
-    async def update_status(lead_id: str, body: LeadStatusUpdate) -> LeadResponse:
-        db = get_db()
-        if db is None:
-            raise HTTPException(status_code=503, detail="Database not initialized")
-        lid = (lead_id or "").strip()
-        if not lid:
-            raise HTTPException(status_code=404, detail="Lead not found")
-        now = datetime.utcnow()
-        result = await db.leads.find_one_and_update(
-            {"id": lid},
-            {"$set": {"status": body.status, "updated_at": now}},
-            return_document=True,
+    async def list_sources(current_user: Optional[dict] = None) -> Dict[str, Any]:
+        return await list_lead_source_options(current_user=current_user)
+
+    @staticmethod
+    async def pipeline_summary(current_user: Optional[dict] = None) -> Dict[str, Any]:
+        return await lead_pipeline_summary(current_user=current_user)
+
+    @staticmethod
+    async def get_lead_detail(
+        lead_id: str, current_user: Optional[dict] = None
+    ) -> Dict[str, Any]:
+        return await get_lead(lead_id, current_user=current_user)
+
+    @staticmethod
+    async def list_follow_ups(
+        lead_id: str,
+        skip: int = 0,
+        limit: int = 50,
+        current_user: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        return await list_lead_follow_ups(
+            lead_id, current_user=current_user, skip=skip, limit=limit
         )
-        if not result:
-            raise HTTPException(status_code=404, detail="Lead not found")
-        return _lead_response_from_ser(serialize_doc(result), now)
+
+    @staticmethod
+    async def create_follow_up(
+        lead_id: str,
+        body: LeadFollowUpCreate,
+        current_user: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        return await create_lead_follow_up(
+            lead_id,
+            note=body.note,
+            action=body.action,
+            status=body.status,
+            next_follow_up_at=body.next_follow_up_at,
+            clear_next_follow_up=body.clear_next_follow_up,
+            current_user=current_user,
+        )
+
+    @staticmethod
+    async def update_status(lead_id: str, body: LeadStatusUpdate, current_user: Optional[dict] = None) -> LeadResponse:
+        try:
+            data = await update_lead_status_with_history(
+                lead_id,
+                status=body.status,
+                note=body.note,
+                current_user=current_user,
+            )
+            return LeadResponse(**data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to update lead: {str(e)}",
+            )
 
     @staticmethod
     async def send_otp(phone: str) -> Dict[str, Any]:

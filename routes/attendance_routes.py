@@ -1,15 +1,58 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Optional
 from datetime import datetime
+import os
 from controllers.attendance_controller import AttendanceController
 from models.attendance_models import (
     AttendanceCreate, BiometricAttendance, CoachAttendanceCreate, BranchManagerAttendanceCreate,
     AttendanceMarkRequest
 )
 from models.user_models import UserRole
-from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
+from utils.unified_auth import (
+    require_role_unified,
+    get_current_user_or_superadmin,
+    get_optional_current_user_or_superadmin,
+)
+from utils.biometric_attendance_ingest import (
+    BiometricIngestRequest,
+    ingest_events,
+    list_unmatched,
+    ingest_stats,
+)
+from utils.attendance_correction_service import (
+    AttendanceCorrectionRequest,
+    correct_attendance,
+    list_correction_history,
+)
 
 router = APIRouter()
+
+
+async def require_biometric_ingest_auth(
+    request: Request,
+    x_biometric_ingest_key: Optional[str] = Header(None, alias="X-Biometric-Ingest-Key"),
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin),
+):
+    """
+    Allow device middleware via shared API key, or Admin JWT for manual/testing ingest.
+    """
+    expected = (os.getenv("BIOMETRIC_INGEST_API_KEY") or "").strip()
+    provided = (x_biometric_ingest_key or "").strip()
+    if expected and provided and provided == expected:
+        return {"auth": "api_key", "role": "ingest"}
+    if current_user:
+        role = str(current_user.get("role") or "").lower()
+        if role in {"super_admin", "superadmin", "coach_admin", "branch_manager"}:
+            return current_user
+    if not expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Set BIOMETRIC_INGEST_API_KEY or authenticate as Admin to ingest punches.",
+        )
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid ingest credentials. Provide X-Biometric-Ingest-Key or Admin Bearer token.",
+    )
 
 @router.get("/reports")
 async def get_attendance_reports(
@@ -73,10 +116,50 @@ async def mark_manual_attendance(
 
 @router.post("/biometric")
 async def biometric_attendance(
-    attendance_data: BiometricAttendance
+    attendance_data: BiometricAttendance,
+    _auth: dict = Depends(require_biometric_ingest_auth),
 ):
-    """Record attendance from biometric device"""
+    """
+    Legacy single-punch biometric endpoint (now authenticated).
+    Prefer POST /api/attendance/ingest/biometric for batch ingest.
+    """
     return await AttendanceController.biometric_attendance(attendance_data)
+
+
+@router.post("/ingest/biometric")
+async def ingest_biometric_events(
+    body: BiometricIngestRequest,
+    _auth: dict = Depends(require_biometric_ingest_auth),
+):
+    """M09-S03: ingest normalized biometric punch events (deduped, device→branch)."""
+    return await ingest_events(body)
+
+
+@router.get("/ingest/unmatched")
+async def get_unmatched_biometric_punches(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S03: list unmatched biometric punches for Admin review."""
+    return await list_unmatched(skip=skip, limit=limit)
+
+
+@router.get("/ingest/stats")
+async def get_biometric_ingest_stats(
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S03: ingest summary stats."""
+    return await ingest_stats()
+
 
 @router.get("/export")
 async def export_attendance_reports(
@@ -86,12 +169,23 @@ async def export_attendance_reports(
     branch_id: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="present | absent | late"),
+    method: Optional[str] = Query(None, description="manual | biometric | ..."),
     format: str = Query("csv", regex="^(csv|excel)$"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]))
 ):
     """Export attendance reports"""
     return await AttendanceController.export_attendance_reports(
-        student_id, coach_id, course_id, branch_id, start_date, end_date, format, current_user
+        student_id,
+        coach_id,
+        course_id,
+        branch_id,
+        start_date,
+        end_date,
+        format,
+        status,
+        method,
+        current_user,
     )
 
 @router.get("/coach/{coach_id}/students")
@@ -143,6 +237,46 @@ async def mark_comprehensive_attendance(
 ):
     """Mark attendance for any user type (student, coach, branch_manager)"""
     return await AttendanceController.mark_comprehensive_attendance(attendance_request, current_user)
+
+
+@router.post("/corrections")
+async def create_attendance_correction(
+    body: AttendanceCorrectionRequest,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """
+    M09-S05: correct an existing attendance record.
+    Requires a non-empty reason; writes full before/after audit.
+    First-time marking should continue to use POST /mark.
+    """
+    return await correct_attendance(body, current_user)
+
+
+@router.get("/corrections")
+async def get_attendance_corrections(
+    attendance_id: Optional[str] = Query(None),
+    student_id: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S05: list correction / adjustment audit history."""
+    return await list_correction_history(
+        attendance_id=attendance_id,
+        student_id=student_id,
+        skip=skip,
+        limit=limit,
+        current_user=current_user,
+    )
+
 
 @router.get("/student/my-attendance")
 async def get_my_attendance(

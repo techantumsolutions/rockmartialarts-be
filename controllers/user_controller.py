@@ -1210,11 +1210,35 @@ class UserController:
         request: Request,
         current_user: dict = None
     ):
-        """Deactivate user (Super Admin only)"""
+        """Deactivate user (Super Admin only) — uses shared status history when target is a student."""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
 
-        result = await get_db().users.update_one(
+        db = get_db()
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if str(user.get("role") or "").lower() == "student":
+            from utils.student_status_service import update_student_account_status
+
+            out = await update_student_account_status(
+                student_id=user_id,
+                is_active=False,
+                reason="Deactivated via admin deactivate endpoint",
+                current_user=current_user,
+                source="deactivate_endpoint",
+            )
+            await log_activity(
+                request=request,
+                action="admin_deactivate_user",
+                user_id=current_user["id"],
+                user_name=current_user.get("full_name"),
+                details={"deactivated_user_id": user_id, "via": "student_status"},
+            )
+            return {"message": out.get("message") or "User deactivated successfully", **{k: v for k, v in out.items() if k != "message"}}
+
+        result = await db.users.update_one(
             {"id": user_id},
             {"$set": {"is_active": False, "updated_at": datetime.utcnow()}}
         )
@@ -1231,6 +1255,209 @@ class UserController:
         )
 
         return {"message": "User deactivated successfully"}
+
+    @staticmethod
+    async def update_student_status(
+        user_id: str,
+        body,
+        request: Request,
+        current_user: dict = None,
+    ):
+        """M08-S01: activate/deactivate student account with reason + history."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_status_service import update_student_account_status
+
+        out = await update_student_account_status(
+            student_id=user_id,
+            is_active=bool(body.is_active),
+            reason=getattr(body, "reason", None),
+            current_user=current_user,
+            source="status_api",
+        )
+        try:
+            await log_activity(
+                request=request,
+                action="admin_student_status_update",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={
+                    "student_id": user_id,
+                    "is_active": out.get("is_active"),
+                    "previous_status": out.get("previous_status"),
+                    "reason": getattr(body, "reason", None),
+                    "changed": out.get("changed"),
+                },
+            )
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    async def get_student_status_history(user_id: str, current_user: dict, limit: int = 50):
+        """M08-S01: list status history for a student (scoped)."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        db = get_db()
+        student = await db.users.find_one({"id": user_id})
+        if not student or str(student.get("role") or "").lower() != "student":
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        from utils.student_status_service import (
+            assert_can_manage_student_status,
+            list_student_status_history,
+        )
+
+        role = str(current_user.get("role") or "").lower()
+        if role == "branch_manager":
+            await assert_can_manage_student_status(db, student, current_user)
+        elif role not in {"super_admin", "coach_admin"}:
+            raise HTTPException(status_code=403, detail="Not allowed")
+
+        rows = await list_student_status_history(user_id, limit=limit)
+        return {"student_id": user_id, "history": rows, "total": len(rows)}
+
+    @staticmethod
+    async def get_student_biometric_mapping(user_id: str, current_user: dict):
+        """M09-S02: get student biometric mapping."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_biometric_mapping_service import get_mapping
+
+        return await get_mapping(user_id, current_user)
+
+    @staticmethod
+    async def set_student_biometric_mapping(user_id: str, body, request: Request, current_user: dict = None):
+        """M09-S02: create/update biometric mapping with duplicate checks."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_biometric_mapping_service import set_mapping
+
+        out = await set_mapping(user_id, body, current_user)
+        try:
+            mapping = out.get("mapping") or {}
+            await log_activity(
+                request=request,
+                action="admin_student_biometric_mapping_set",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={
+                    "student_id": user_id,
+                    "biometric_id": mapping.get("biometric_id"),
+                    "essl_user_id": mapping.get("essl_user_id"),
+                },
+            )
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    async def clear_student_biometric_mapping(user_id: str, request: Request, current_user: dict = None):
+        """M09-S02: remove biometric mapping."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_biometric_mapping_service import clear_mapping
+
+        out = await clear_mapping(user_id, current_user)
+        try:
+            await log_activity(
+                request=request,
+                action="admin_student_biometric_mapping_clear",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={"student_id": user_id},
+            )
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    async def list_student_biometric_mappings(
+        current_user: dict,
+        q: Optional[str] = None,
+        branch_id: Optional[str] = None,
+        mapped: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ):
+        """M09-S02: list students with mapping status."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_biometric_mapping_service import list_mappings
+
+        return await list_mappings(
+            current_user,
+            q=q,
+            branch_id=branch_id,
+            mapped=mapped,
+            skip=skip,
+            limit=limit,
+        )
+
+    @staticmethod
+    async def get_student_id_card(user_id: str, current_user: dict):
+        """M08-S03: view current student ID card (or empty if not generated)."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_id_card_service import get_id_card_for_student
+
+        return await get_id_card_for_student(user_id, current_user)
+
+    @staticmethod
+    async def generate_student_id_card(
+        user_id: str,
+        request: Request,
+        current_user: dict = None,
+        regenerate: bool = False,
+    ):
+        """M08-S03: generate or regenerate student ID card + QR token."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_id_card_service import get_or_create_id_card
+
+        out = await get_or_create_id_card(
+            user_id, current_user, regenerate=bool(regenerate)
+        )
+        try:
+            card = out.get("card") or {}
+            await log_activity(
+                request=request,
+                action="admin_student_id_card_generate",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={
+                    "student_id": user_id,
+                    "card_number": card.get("card_number"),
+                    "regenerate": bool(regenerate),
+                },
+            )
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    async def revoke_student_id_card(
+        user_id: str,
+        request: Request,
+        current_user: dict = None,
+    ):
+        """M08-S03: revoke active student ID card / QR."""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        from utils.student_id_card_service import revoke_id_card
+
+        out = await revoke_id_card(user_id, current_user)
+        try:
+            await log_activity(
+                request=request,
+                action="admin_student_id_card_revoke",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={"student_id": user_id, **out},
+            )
+        except Exception:
+            pass
+        return out
 
     @staticmethod
     async def delete_user(
@@ -1318,9 +1545,11 @@ class UserController:
         current_user: dict,
         unassigned_only: bool = False,
         branch_id: Optional[str] = None,
+        is_active: Optional[bool] = None,
     ):
         """Get detailed student information with course enrollment data (Authenticated endpoint).
-        When unassigned_only=True, returns only students with no active branch enrollment (for Assign to Branch modal)."""
+        When unassigned_only=True, returns only students with no active branch enrollment (for Assign to Branch modal).
+        Optional is_active filters account status (users.is_active) — does not touch enrollments."""
 
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
@@ -1343,6 +1572,8 @@ class UserController:
             # Include all student users (active/inactive); admins may need to assign/enroll newly
             # registered students before account activation is toggled.
             query = {"role": "student", "id": {"$nin": assigned_student_ids}}
+            if is_active is not None:
+                query["is_active"] = bool(is_active)
             students_cursor = db.users.find(query).sort("created_at", -1)
             students = await students_cursor.to_list(1000)
             if not students:
@@ -1400,6 +1631,8 @@ class UserController:
         # Same users collection as public registration; include active + inactive students
         # so super admin can edit/assign/enroll newly registered accounts.
         query = {"role": "student"}
+        if is_active is not None:
+            query["is_active"] = bool(is_active)
 
         # Apply branch filtering for non-super-admin users
         if current_role != UserRole.SUPER_ADMIN:

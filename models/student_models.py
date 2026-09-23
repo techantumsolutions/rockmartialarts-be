@@ -46,6 +46,30 @@ class PrepareStudentCheckoutBody(BaseModel):
     beneficiary: Optional[BeneficiaryInput] = None
 
 
+class RenewalQuoteBody(BaseModel):
+    """M07-S03 renewal quote for an existing enrollment (grace / overdue / arrear breakdown)."""
+
+    enrollment_id: str
+    duration: Optional[str] = Field(
+        None,
+        description="Tenure id/code; defaults to enrollment.duration_id when omitted.",
+    )
+    batch_ref: Optional[str] = None
+    beneficiary: Optional[BeneficiaryInput] = None
+
+
+class PrepareRenewalCheckoutBody(BaseModel):
+    """M07-S04: prepare pending renewal checkout from an existing enrollment + tenure."""
+
+    enrollment_id: str
+    duration: Optional[str] = Field(
+        None,
+        description="Tenure id/code; defaults to enrollment.duration_id when omitted.",
+    )
+    batch_ref: Optional[str] = None
+    beneficiary: Optional[BeneficiaryInput] = None
+
+
 class CreateStudentRazorpayOrderBody(BaseModel):
     """Create a Razorpay order for an existing pending enrollment (amount is taken from enrollment server-side)."""
     enrollment_id: str

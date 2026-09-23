@@ -2,6 +2,10 @@
 
 This integration is intentionally **modular and isolated** from the main backend (`server.py`) and the Next.js app.
 
+> **M09-S03-T01:** The provisional application contract (normalized punch event, poll/webhook/file modes, mapping & dedup rules) lives in  
+> [`M09_S03_T01_VENDOR_INTEGRATION_CONTRACT.md`](./M09_S03_T01_VENDOR_INTEGRATION_CONTRACT.md).  
+> Vendor sign-off ratifies production; it does **not** block implementing ingest against the provisional contract.
+
 ### 1) Environment variables
 
 Set these on the machine running the service:

@@ -10,3 +10,4 @@ venv/
 !.env.example
 .env.local
 *.log
+storage/private/

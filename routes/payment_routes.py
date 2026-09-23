@@ -6,6 +6,8 @@ from models.student_models import (
     ConfirmRazorpayPayment,
     PrepareStudentCheckoutBody,
     CreateStudentRazorpayOrderBody,
+    RenewalQuoteBody,
+    PrepareRenewalCheckoutBody,
 )
 from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody
 from models.user_models import UserRole
@@ -48,6 +50,33 @@ async def student_checkout_quote(
 ):
     """Quote checkout amount for student dashboard without creating pending enrollment."""
     return await PaymentController.quote_student_course_checkout(body, current_user)
+
+
+@router.post("/renewal-quote", status_code=status.HTTP_200_OK)
+async def student_renewal_quote(
+    body: RenewalQuoteBody,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """M07-S03: renewal quote with grace/overdue days and arrear placeholder."""
+    return await PaymentController.quote_student_renewal(body, current_user)
+
+
+@router.post("/prepare-student-renewal-checkout", status_code=status.HTTP_200_OK)
+async def prepare_student_renewal_checkout(
+    body: PrepareRenewalCheckoutBody,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """M07-S04: prepare pending renewal checkout from eligible enrollment + quote."""
+    return await PaymentController.prepare_student_renewal_checkout(body, current_user)
+
+
+@router.get("/renewal-history", status_code=status.HTTP_200_OK)
+async def student_renewal_history(
+    enrollment_id: Optional[str] = Query(None),
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """M07-S04: renewal history (old expiry, renewal date, arrears, resulting expiry)."""
+    return await PaymentController.get_student_renewal_history(current_user, enrollment_id)
 
 
 @router.post("/confirm-razorpay", status_code=status.HTTP_200_OK)

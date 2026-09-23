@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request, Path
 from typing import Optional
 from controllers.user_controller import UserController
-from models.user_models import UserCreate, UserUpdate, UserRole, StudentNotifyBody
+from models.user_models import UserCreate, UserUpdate, UserRole, StudentNotifyBody, StudentStatusUpdateBody
 from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
 
@@ -30,11 +30,39 @@ async def get_users(
 async def get_student_details(
     unassigned_only: Optional[bool] = False,
     branch_id: Optional[str] = None,
+    is_active: Optional[bool] = None,
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
-    """Get detailed student information. If unassigned_only=true, returns only students with no active branch enrollment (for Assign to Branch)."""
+    """Get detailed student information. Optional is_active filters account status (active/inactive)."""
     return await UserController.get_student_details(
-        current_user, unassigned_only=unassigned_only, branch_id=branch_id
+        current_user,
+        unassigned_only=unassigned_only,
+        branch_id=branch_id,
+        is_active=is_active,
+    )
+
+
+@router.get("/students/biometric-mappings")
+async def list_student_biometric_mappings(
+    q: Optional[str] = None,
+    branch_id: Optional[str] = None,
+    mapped: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S02: list students with biometric mapping status (Admin/BM scoped)."""
+    return await UserController.list_student_biometric_mappings(
+        current_user,
+        q=q,
+        branch_id=branch_id,
+        mapped=mapped,
+        skip=skip,
+        limit=limit,
     )
 
 @router.get("/{user_id}/enrollments")
@@ -194,6 +222,133 @@ async def delete_user(
 ):
     """Permanently delete user - accessible by Super Admin, Coach Admin, and Branch Manager"""
     return await UserController.delete_user(user_id, request, current_user)
+
+@router.patch("/{user_id}/status")
+async def update_student_status(
+    user_id: str,
+    body: StudentStatusUpdateBody,
+    request: Request,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M08-S01: update student account active/inactive status with reason + history."""
+    return await UserController.update_student_status(user_id, body, request, current_user)
+
+
+@router.get("/{user_id}/status-history")
+async def get_student_status_history(
+    user_id: str,
+    limit: int = 50,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M08-S01: student account status history."""
+    return await UserController.get_student_status_history(user_id, current_user, limit=limit)
+
+
+@router.get("/{user_id}/biometric-mapping")
+async def get_student_biometric_mapping(
+    user_id: str,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S02: get biometric mapping for a student."""
+    return await UserController.get_student_biometric_mapping(user_id, current_user)
+
+
+@router.put("/{user_id}/biometric-mapping")
+async def set_student_biometric_mapping(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S02: create/update biometric mapping (duplicate → 409)."""
+    from utils.student_biometric_mapping_service import StudentBiometricMappingBody
+
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    body = StudentBiometricMappingBody(**raw)
+    return await UserController.set_student_biometric_mapping(
+        user_id, body, request, current_user
+    )
+
+
+@router.delete("/{user_id}/biometric-mapping")
+async def clear_student_biometric_mapping(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M09-S02: clear biometric mapping."""
+    return await UserController.clear_student_biometric_mapping(
+        user_id, request, current_user
+    )
+
+
+@router.get("/{user_id}/id-card")
+async def get_student_id_card(
+    user_id: str,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M08-S03: view current student ID card."""
+    return await UserController.get_student_id_card(user_id, current_user)
+
+
+@router.post("/{user_id}/id-card")
+async def generate_student_id_card(
+    user_id: str,
+    request: Request,
+    regenerate: bool = False,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M08-S03: generate (or regenerate) student ID card + secure QR token."""
+    return await UserController.generate_student_id_card(
+        user_id, request, current_user, regenerate=regenerate
+    )
+
+
+@router.post("/{user_id}/id-card/revoke")
+async def revoke_student_id_card(
+    user_id: str,
+    request: Request,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """M08-S03: revoke active student ID card."""
+    return await UserController.revoke_student_id_card(user_id, request, current_user)
+
 
 @router.patch("/{user_id}/deactivate")
 async def deactivate_user(

@@ -72,6 +72,14 @@ class AttendanceController:
     ):
         """Get attendance reports with filtering and role-based access control"""
         try:
+            from utils.attendance_report_query import (
+                apply_method_filter,
+                apply_status_filter,
+                normalize_status_value,
+                summarize_records,
+            )
+            from utils.student_status_service import get_managed_branch_ids_for_user
+
             db = get_db()
             if db is None:
                 raise HTTPException(status_code=500, detail="Database connection not available")
@@ -80,18 +88,38 @@ class AttendanceController:
             filter_query = {}
             
             # Apply role-based filtering for branch managers
-            if current_user and current_user.get("role") == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            role = str((current_user or {}).get("role") or "").lower()
+            if role == "branch_manager":
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if not managed_branch_ids:
+                    # Fallback to manager_id lookup used historically
+                    branch_manager_id = current_user.get("id")
+                    managed_branches = await db.branches.find(
+                        {"manager_id": branch_manager_id, "is_active": True}
+                    ).to_list(length=None)
+                    managed_branch_ids = [branch["id"] for branch in (managed_branches or [])]
+                if not managed_branch_ids:
+                    return {
+                        "attendance_records": [],
+                        "total": 0,
+                        "summary": {
+                            "total": 0,
+                            "present": 0,
+                            "absent": 0,
+                            "late": 0,
+                            "biometric": 0,
+                        },
+                    }
 
-                # Find all branches managed by this branch manager
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                if not managed_branches:
-                    return {"attendance_records": [], "total": 0}
-
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
-                filter_query["branch_id"] = {"$in": managed_branch_ids}
+                if branch_id:
+                    if str(branch_id) not in {str(b) for b in managed_branch_ids}:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Branch Manager cannot view attendance for other branches",
+                        )
+                    filter_query["branch_id"] = branch_id
+                else:
+                    filter_query["branch_id"] = {"$in": managed_branch_ids}
 
             # Apply additional filters
             if student_id:
@@ -100,14 +128,20 @@ class AttendanceController:
                 filter_query["coach_id"] = coach_id
             if course_id:
                 filter_query["course_id"] = course_id
-            if branch_id and current_user.get("role") != "branch_manager":
+            if branch_id and role != "branch_manager":
                 filter_query["branch_id"] = branch_id
+
+            apply_status_filter(filter_query, status)
+            apply_method_filter(filter_query, method)
 
             # Date range filtering
             if start_date and end_date:
                 try:
                     start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
                     end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    # Inclusive end-of-day when date-only strings are used
+                    if len(end_date) <= 10:
+                        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
                     filter_query["attendance_date"] = {"$gte": start_dt, "$lte": end_dt}
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid date format")
@@ -164,6 +198,7 @@ class AttendanceController:
                         "check_in_time": 1,
                         "check_out_time": 1,
                         "is_present": 1,
+                        "status": 1,
                         "method": 1,
                         "notes": 1,
                         "created_at": 1,
@@ -189,13 +224,28 @@ class AttendanceController:
                         serialized_record[key] = value.isoformat()
                     else:
                         serialized_record[key] = value
+                serialized_record["status"] = normalize_status_value(serialized_record)
                 serialized_records.append(serialized_record)
 
+            summary = summarize_records(serialized_records)
             return {
                 "attendance_records": serialized_records,
-                "total": len(serialized_records)
+                "total": len(serialized_records),
+                "summary": summary,
+                "filters": {
+                    "student_id": student_id,
+                    "coach_id": coach_id,
+                    "course_id": course_id,
+                    "branch_id": branch_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "status": status,
+                    "method": method,
+                },
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to get attendance reports: {str(e)}")
 
@@ -306,6 +356,8 @@ class AttendanceController:
                             status = "present" if record.get("is_present") else "absent"
 
                         attendance_map[student_id] = {
+                            "id": record.get("id"),
+                            "attendance_id": record.get("id"),
                             "status": status,
                             "check_in_time": record.get("check_in_time"),
                             "check_out_time": record.get("check_out_time"),
@@ -314,6 +366,7 @@ class AttendanceController:
                             "admin_adjusted": record.get("admin_adjusted", False),
                             "attendance_modified_at": record.get("attendance_modified_at"),
                             "attendance_modified_by": record.get("attendance_modified_by"),
+                            "correction_reason": record.get("correction_reason"),
                         }
 
                 # Combine student data with attendance and course information
@@ -334,7 +387,9 @@ class AttendanceController:
                 for student in students:
                     student_id = student.get("id")
                     attendance_info = attendance_map.get(student_id, {
-                        "status": "absent",  # Default to absent if no record
+                        "id": None,
+                        "attendance_id": None,
+                        "status": "not_marked",
                         "check_in_time": None,
                         "check_out_time": None,
                         "notes": "",
@@ -342,6 +397,7 @@ class AttendanceController:
                         "admin_adjusted": False,
                         "attendance_modified_at": None,
                         "attendance_modified_by": None,
+                        "correction_reason": None,
                     })
 
                     # Get student's enrollments for course information
@@ -829,31 +885,41 @@ class AttendanceController:
 
     @staticmethod
     async def biometric_attendance(attendance_data: BiometricAttendance):
-        """Record attendance from biometric device"""
+        """
+        Record attendance from biometric device (M09-S03).
+        Delegates to secure ingest pipeline (device registry + mapping + dedupe).
+        """
         try:
-            db = get_db()
-            if db is None:
-                raise HTTPException(status_code=500, detail="Database connection not available")
-
-            # Find user by biometric ID
-            user = await db.users.find_one({"biometric_id": attendance_data.biometric_id, "is_active": True})
-            if not user:
-                raise HTTPException(status_code=404, detail="User with this biometric ID not found")
-
-            # Create attendance record
-            attendance = Attendance(
-                student_id=user["id"],
-                course_id="",  # Will be filled based on enrollment
-                branch_id=user.get("branch_id", ""),
-                attendance_date=attendance_data.timestamp,
-                check_in_time=attendance_data.timestamp,
-                method=AttendanceMethod.BIOMETRIC,
-                notes=f"Biometric check-in from device {attendance_data.device_id}"
+            from utils.biometric_attendance_ingest import (
+                BiometricIngestRequest,
+                ingest_events,
+                legacy_biometric_to_event,
             )
 
-            await db.attendance.insert_one(attendance.dict())
-            return {"message": "Attendance marked successfully", "attendance_id": attendance.id}
-
+            event = legacy_biometric_to_event(
+                attendance_data.device_id,
+                attendance_data.biometric_id,
+                attendance_data.timestamp,
+            )
+            out = await ingest_events(BiometricIngestRequest(events=[event], event=None))
+            result = (out.get("results") or [{}])[0]
+            if result.get("status") == "processed":
+                return {
+                    "message": result.get("message") or "Attendance marked successfully",
+                    "attendance_id": result.get("attendance_id"),
+                    "ingest": result,
+                }
+            if result.get("status") == "duplicate":
+                return {
+                    "message": result.get("message") or "Duplicate punch ignored",
+                    "attendance_id": result.get("attendance_id"),
+                    "ingest": result,
+                }
+            # unmatched / rejected
+            detail = result.get("message") or "Biometric punch could not be applied"
+            raise HTTPException(status_code=404, detail=detail)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to record biometric attendance: {str(e)}")
 
@@ -866,33 +932,35 @@ class AttendanceController:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         format: str = "csv",
+        status: Optional[str] = None,
+        method: Optional[str] = None,
         current_user: dict = None
     ):
-        """Export attendance reports"""
+        """Export attendance reports (csv or excel)"""
         try:
-            # Get attendance data
+            from utils.attendance_report_query import build_attendance_export
+
             attendance_data = await AttendanceController.get_attendance_reports(
-                student_id, coach_id, course_id, branch_id, start_date, end_date, current_user
+                student_id,
+                coach_id,
+                course_id,
+                branch_id,
+                start_date,
+                end_date,
+                status,
+                method,
+                current_user,
             )
+            export = build_attendance_export(
+                attendance_data.get("attendance_records") or [],
+                format=format,
+            )
+            export["summary"] = attendance_data.get("summary")
+            export["filters"] = attendance_data.get("filters")
+            return export
 
-            if format == "csv":
-                # Create CSV content
-                output = io.StringIO()
-                writer = csv.DictWriter(output, fieldnames=[
-                    'student_name', 'course_name', 'branch_name', 'attendance_date',
-                    'check_in_time', 'check_out_time', 'is_present', 'method', 'notes'
-                ])
-                writer.writeheader()
-                writer.writerows(attendance_data["attendance_records"])
-
-                return {
-                    "content": output.getvalue(),
-                    "filename": f"attendance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    "content_type": "text/csv"
-                }
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported export format")
-
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to export attendance reports: {str(e)}")
 

@@ -163,12 +163,42 @@ async def _compute_fee_status(
         if enrollment_ps == "paid":
             end_date = primary.get("end_date")
             next_due = primary.get("next_due_date") or end_date
+            billing = None
+            billing_state_snap = None
+            try:
+                from utils.billing_cycle_service import get_active_cycle_for_enrollment
+                from utils.billing_state import compute_enrollment_billing_state
+
+                billing = await get_active_cycle_for_enrollment(primary.get("id"))
+                if billing and billing.get("next_due_date"):
+                    next_due = billing.get("next_due_date")
+                billing_state_snap = compute_enrollment_billing_state(end_date)
+            except Exception:
+                billing = None
+                billing_state_snap = None
             status = "Paid"
-            if end_date and is_subscription_period_over(end_date):
+            if billing_state_snap and billing_state_snap.get("billing_state") == "grace":
+                status = "Grace period"
+            elif billing_state_snap and billing_state_snap.get("billing_state") == "overdue":
+                status = "Due for renewal"
+            elif end_date and is_subscription_period_over(end_date):
+                status = "Due for renewal"
+            elif billing and billing.get("status") == "due_soon":
+                status = "Due soon"
+            elif billing and billing.get("status") == "overdue":
                 status = "Due for renewal"
             return {
                 "status": status,
                 "next_due_date": next_due,
+                "period_start": (billing or {}).get("period_start") or primary.get("billing_period_start"),
+                "period_end": (billing or {}).get("period_end") or primary.get("billing_period_end") or end_date,
+                "billing_status": (billing_state_snap or {}).get("billing_state")
+                or (billing or {}).get("status"),
+                "overdue_days": (billing_state_snap or {}).get("overdue_days"),
+                "grace_days_remaining": (billing_state_snap or {}).get("grace_days_remaining"),
+                "grace_days_total": (billing_state_snap or {}).get("grace_days_total"),
+                "is_within_grace": (billing_state_snap or {}).get("is_within_grace"),
+                "duration_months": (billing or {}).get("duration_months"),
                 "source": "enrollment",
             }
 

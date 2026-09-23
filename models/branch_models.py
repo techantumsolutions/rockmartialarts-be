@@ -112,7 +112,8 @@ class Branch(BaseModel):
     bank_details: BankDetails
     admission_fee: float = 500.0
     slug: Optional[str] = None
-    allows_collaboration: bool = False  # Reserved for M21; unused in S02
+    allows_collaboration: bool = False  # M21 — collaboration partner branch
+    is_collaboration_partner: bool = False  # Alias of allows_collaboration (API/UI)
     is_active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -127,6 +128,7 @@ class BranchCreate(BaseModel):
     admission_fee: float = 500.0
     slug: Optional[str] = None
     allows_collaboration: bool = False
+    is_collaboration_partner: Optional[bool] = None
 
 class BranchUpdate(BaseModel):
     branch: Optional[BranchInfo] = None
@@ -138,4 +140,5 @@ class BranchUpdate(BaseModel):
     admission_fee: Optional[float] = None
     slug: Optional[str] = None
     allows_collaboration: Optional[bool] = None
+    is_collaboration_partner: Optional[bool] = None
     is_active: Optional[bool] = None

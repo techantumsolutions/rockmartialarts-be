@@ -116,6 +116,16 @@ class StudentNotifyBody(BaseModel):
     kind: Literal["welcome", "payment_reminder"]
 
 
+class StudentStatusUpdateBody(BaseModel):
+    """M08-S01: update student account lifecycle status (users.is_active)."""
+    is_active: bool
+    reason: Optional[str] = Field(
+        None,
+        description="Required when deactivating; optional when reactivating.",
+        max_length=500,
+    )
+
+
 # Student Profile Models
 class StudentAddress(BaseModel):
     street: Optional[str] = None
