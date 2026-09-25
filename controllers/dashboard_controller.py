@@ -62,13 +62,23 @@ class DashboardController:
                 # Return empty stats if no branches are managed
                 return {"dashboard_stats": {
                     "active_students": 0,
+                    "inactive_students": 0,
+                    "total_students": 0,
                     "total_users": 0,
                     "active_courses": 0,
                     "monthly_active_users": 0,
                     "active_enrollments": 0,
+                    "enrollments_count": 0,
                     "total_revenue": 0,
                     "monthly_revenue": 0,
                     "pending_payments": 0,
+                    "renewals_count": 0,
+                    "leads_count": 0,
+                    "demo_bookings_count": 0,
+                    "training_requests_count": 0,
+                    "events_count": 0,
+                    "events_registrations_count": 0,
+                    "partners_count": 0,
                     "today_attendance": 0,
                     "total_coaches": 0,
                     "active_coaches": 0,
@@ -380,7 +390,125 @@ class DashboardController:
             else:
                 stats["students_registered_in_period"] = stats.get("active_students", 0)
                 stats["courses_with_enrollments_in_period"] = stats.get("active_courses", 0)
-            
+
+            # ---- M23-S02 additive metrics (safe defaults) ----
+            branch_scope = filter_query.get("branch_id")
+            period_start, period_end = _parse_dashboard_period(start_date, end_date)
+            date_match = {}
+            if period_start and period_end:
+                date_match = {"$gte": period_start, "$lte": period_end}
+
+            # Inactive / total students
+            try:
+                if current_user["role"] == "branch_manager":
+                    managed_branch_ids = filter_query.get("branch_id", {}).get("$in", []) or []
+                    if managed_branch_ids:
+                        active_ids = set(
+                            await db.enrollments.distinct(
+                                "student_id",
+                                {"is_active": True, "branch_id": {"$in": managed_branch_ids}},
+                            )
+                        )
+                        all_ids = set(
+                            await db.enrollments.distinct(
+                                "student_id",
+                                {"branch_id": {"$in": managed_branch_ids}},
+                            )
+                        )
+                        stats["total_students"] = len(all_ids)
+                        stats["inactive_students"] = max(0, len(all_ids) - len(active_ids))
+                    else:
+                        stats["total_students"] = 0
+                        stats["inactive_students"] = 0
+                else:
+                    aq = {"role": "student", "is_active": True}
+                    iq = {"role": "student", "is_active": False}
+                    tq = {"role": "student"}
+                    if branch_scope:
+                        aq["branch_id"] = branch_scope
+                        iq["branch_id"] = branch_scope
+                        tq["branch_id"] = branch_scope
+                    stats["total_students"] = await db.users.count_documents(tq)
+                    stats["inactive_students"] = await db.users.count_documents(iq)
+                    if not stats.get("active_students"):
+                        stats["active_students"] = await db.users.count_documents(aq)
+            except Exception:
+                stats.setdefault("total_students", stats.get("active_students", 0))
+                stats.setdefault("inactive_students", 0)
+
+            stats["enrollments_count"] = stats.get("active_enrollments", 0)
+
+            # Renewals (payments marked renewal or type renewal in period)
+            try:
+                renew_q: dict = {
+                    "$or": [
+                        {"is_renewal": True},
+                        {"payment_type": {"$regex": "renew", "$options": "i"}},
+                        {"type": {"$regex": "renew", "$options": "i"}},
+                    ],
+                    "payment_status": {"$in": ["completed", "paid"]},
+                }
+                if date_match:
+                    renew_q["payment_date"] = date_match
+                if current_user["role"] == "branch_manager":
+                    managed_branch_ids = filter_query.get("branch_id", {}).get("$in", []) or []
+                    if managed_branch_ids:
+                        sid = await db.enrollments.distinct(
+                            "student_id", {"branch_id": {"$in": managed_branch_ids}}
+                        )
+                        renew_q["student_id"] = {"$in": sid}
+                        stats["renewals_count"] = await db.payments.count_documents(renew_q) if sid else 0
+                    else:
+                        stats["renewals_count"] = 0
+                else:
+                    if branch_scope:
+                        renew_q["branch_id"] = branch_scope
+                    stats["renewals_count"] = await db.payments.count_documents(renew_q)
+            except Exception:
+                stats["renewals_count"] = 0
+
+            async def _count_collection(name: str, base: dict) -> int:
+                try:
+                    coll = db[name]
+                    q = dict(base)
+                    if date_match:
+                        q["created_at"] = date_match
+                    if current_user["role"] == "branch_manager":
+                        managed_branch_ids = filter_query.get("branch_id", {}).get("$in", []) or []
+                        if managed_branch_ids:
+                            q["branch_id"] = {"$in": managed_branch_ids}
+                        else:
+                            return 0
+                    elif branch_scope:
+                        q["branch_id"] = branch_scope
+                    return await coll.count_documents(q)
+                except Exception:
+                    return 0
+
+            stats["leads_count"] = await _count_collection("leads", {})
+            stats["demo_bookings_count"] = await _count_collection("demo_bookings", {})
+            if stats["demo_bookings_count"] == 0:
+                stats["demo_bookings_count"] = await _count_collection("demo_booking", {})
+            stats["training_requests_count"] = await _count_collection("training_requests", {})
+            stats["events_count"] = await _count_collection("academy_events", {})
+            if stats["events_count"] == 0:
+                stats["events_count"] = await _count_collection("events", {})
+            stats["events_registrations_count"] = await _count_collection(
+                "academy_event_registrations", {}
+            )
+            try:
+                pq: dict = {}
+                if date_match:
+                    pq["created_at"] = date_match
+                stats["partners_count"] = await db.collaboration_partners.count_documents(pq)
+            except Exception:
+                try:
+                    stats["partners_count"] = await db.branches.count_documents(
+                        {"$or": [{"is_collaboration_partner": True}, {"allows_collaboration": True}]}
+                    )
+                except Exception:
+                    stats["partners_count"] = 0
+
             return {"dashboard_stats": stats}
             
         except Exception as e:
@@ -392,24 +520,54 @@ class DashboardController:
     @staticmethod
     async def get_recent_activities(
         current_user: dict,
-        limit: int = 10
+        limit: int = 10,
+        branch_id: Optional[str] = None,
     ):
-        """Get recent activities for dashboard"""
+        """Get recent activities for dashboard (branch-scoped for BM / optional branch_id)."""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
         
         try:
-            # Get recent enrollments
-            recent_enrollments = await db.enrollments.find({
-                "is_active": True
-            }).sort("created_at", -1).limit(limit).to_list(length=limit)
-            
-            # Get recent payments
-            recent_payments = await db.payments.find(
-                {"payment_status": {"$in": ["completed", "paid"]}}
-            ).sort("payment_date", -1).limit(limit).to_list(length=limit)
+            enr_filter: dict = {"is_active": True}
+            pay_student_ids = None
+
+            if current_user["role"] == "branch_manager":
+                branch_manager_id = current_user.get("id")
+                managed_branches = await db.branches.find(
+                    {"manager_id": branch_manager_id, "is_active": True}
+                ).to_list(length=None)
+                managed_branch_ids = [b["id"] for b in managed_branches]
+                if not managed_branch_ids:
+                    return {"recent_enrollments": [], "recent_payments": []}
+                enr_filter["branch_id"] = {"$in": managed_branch_ids}
+                pay_student_ids = await db.enrollments.distinct(
+                    "student_id", {"branch_id": {"$in": managed_branch_ids}}
+                )
+            elif branch_id:
+                enr_filter["branch_id"] = branch_id
+                pay_student_ids = await db.enrollments.distinct(
+                    "student_id", {"branch_id": branch_id}
+                )
+
+            recent_enrollments = await db.enrollments.find(enr_filter).sort(
+                "created_at", -1
+            ).limit(limit).to_list(length=limit)
+
+            pay_filter: dict = {"payment_status": {"$in": ["completed", "paid"]}}
+            if pay_student_ids is not None:
+                if not pay_student_ids:
+                    recent_payments = []
+                else:
+                    pay_filter["student_id"] = {"$in": pay_student_ids}
+                    recent_payments = await db.payments.find(pay_filter).sort(
+                        "payment_date", -1
+                    ).limit(limit).to_list(length=limit)
+            else:
+                recent_payments = await db.payments.find(pay_filter).sort(
+                    "payment_date", -1
+                ).limit(limit).to_list(length=limit)
             
             return {
                 "recent_enrollments": serialize_doc(recent_enrollments),

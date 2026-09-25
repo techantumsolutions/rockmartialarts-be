@@ -407,3 +407,214 @@ async def get_course_report_filters(
 ):
     """Get available filter options for course reports"""
     return await ReportsController.get_course_report_filters(current_user)
+
+
+# ---- M23-S04 operational reports + M23-S05 export jobs ----
+from fastapi import BackgroundTasks
+from utils import operational_reports as op_reports
+from models.user_models import UserRole as _UR
+from utils.unified_auth import require_role_unified as _require_role
+
+
+_ADMIN_ROLES = [_UR.SUPER_ADMIN, _UR.BRANCH_MANAGER, _UR.COACH_ADMIN]
+
+
+@router.get("/enrollments")
+async def list_enrollment_reports(
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.list_operational(
+        "enrollments",
+        current_user,
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/enrollments/export")
+async def export_enrollment_reports(
+    background_tasks: BackgroundTasks,
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.export_operational(
+        "enrollments",
+        current_user,
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        format=format,
+        fieldnames=["id", "student_id", "course_id", "branch_id", "is_active", "created_at"],
+        report_type="enrollments",
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/renewals")
+async def list_renewal_reports(
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.list_operational(
+        "payments",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        skip=skip,
+        limit=limit,
+        extra_query={
+            "$or": [
+                {"is_renewal": True},
+                {"payment_type": {"$regex": "renew", "$options": "i"}},
+            ]
+        },
+    )
+
+
+@router.get("/renewals/export")
+async def export_renewal_reports(
+    background_tasks: BackgroundTasks,
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.export_operational(
+        "payments",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        format=format,
+        fieldnames=["id", "student_id", "amount", "payment_status", "payment_date", "is_renewal"],
+        report_type="renewals",
+        background_tasks=background_tasks,
+        extra_query={
+            "$or": [
+                {"is_renewal": True},
+                {"payment_type": {"$regex": "renew", "$options": "i"}},
+            ]
+        },
+    )
+
+
+@router.get("/leads")
+async def list_lead_reports(
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.list_operational(
+        "leads",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/leads/export")
+async def export_lead_reports(
+    background_tasks: BackgroundTasks,
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.export_operational(
+        "leads",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        format=format,
+        fieldnames=["id", "name", "phone", "email", "status", "branch_id", "created_at"],
+        report_type="leads",
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/events")
+async def list_event_reports(
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    # Prefer academy_event_registrations; fall back handled by empty result if missing
+    return await op_reports.list_operational(
+        "academy_event_registrations",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/events/export")
+async def export_event_reports(
+    background_tasks: BackgroundTasks,
+    branch_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.export_operational(
+        "academy_event_registrations",
+        current_user,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        format=format,
+        fieldnames=["id", "event_id", "student_id", "status", "created_at"],
+        report_type="events",
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/exports/{job_id}")
+async def get_export_job_status(
+    job_id: str,
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.get_export_job(job_id, current_user)
+
+
+@router.get("/exports/{job_id}/download")
+async def download_export_job_file(
+    job_id: str,
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.download_export_job(job_id, current_user)

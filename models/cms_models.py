@@ -22,6 +22,17 @@ class TestimonialItem(BaseModel):
         extra = "allow"
 
 
+class HomepageMediaItem(BaseModel):
+    """M22-S02: homepage video section item (below Courses)."""
+    id: Optional[str] = None
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    video_url: Optional[str] = None
+    poster_url: Optional[str] = None
+    enabled: bool = True
+    display_order: int = 0
+
+
 class HomepageSection(BaseModel):
     hero_title: Optional[str] = None
     hero_subtitle: Optional[str] = None
@@ -37,6 +48,10 @@ class HomepageSection(BaseModel):
     about_subtitle: Optional[str] = None
     courses_title: Optional[str] = None
     courses_subtitle: Optional[str] = None
+    # M22-S02: video section below Courses, above About
+    media_section_title: Optional[str] = None
+    media_section_subtitle: Optional[str] = None
+    media_section: Optional[List[HomepageMediaItem]] = None
     testimonials_title: Optional[str] = None
     testimonials_subtitle: Optional[str] = None
     testimonials: Optional[List[TestimonialItem]] = None
