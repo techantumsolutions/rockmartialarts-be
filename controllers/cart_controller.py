@@ -26,6 +26,7 @@ from utils.cart_helpers import build_cart_public_payload, recompute_cart_totals
 from utils.discount_engine import compute_cart_promotions_for_cart
 from utils.cart_validation import validate_cart_document
 from utils.database import get_db
+from utils.family_accounts import student_on_same_account
 
 
 class CartController:
@@ -231,6 +232,11 @@ class CartController:
     ) -> Dict[str, Any]:
         cart = await CartController.ensure_cart(current_user=current_user, guest_token=guest_token)
         cart, changed = CartController._sanitize_cart_items(cart)
+        items, id_changed = CartController._ensure_item_ids(cart.get("items") or [])
+        if id_changed:
+            cart = dict(cart)
+            cart["items"] = items
+            changed = True
         cart = await CartController._persist_cart_if_sanitized(cart, changed)
         return await build_cart_public_payload(cart)
 
@@ -245,11 +251,20 @@ class CartController:
         if not label:
             raise HTTPException(status_code=400, detail="Student name is required")
 
-        if body.student_id and current_user:
-            if current_user.get("role") == UserRole.STUDENT.value and current_user.get("id") != body.student_id:
-                raise HTTPException(status_code=403, detail="You can only add your own student profile")
-
         db = get_db()
+        if current_user and current_user.get("role") == UserRole.STUDENT.value:
+            sid = (body.student_id or "").strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select a student from your account (name-only cart students are not allowed)",
+                )
+            if not await student_on_same_account(db, current_user, sid):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only add student profiles on your account",
+                )
+
         cart = await CartController.ensure_cart(current_user=current_user, guest_token=guest_token)
         students = list(cart.get("students") or [])
         if body.student_id:
@@ -291,11 +306,21 @@ class CartController:
                 skipped.append({"label": entry.label, "reason": "Student name is required"})
                 continue
             sid = (entry.student_id or "").strip() or None
+            if current_user and current_user.get("role") == UserRole.STUDENT.value:
+                if not sid:
+                    skipped.append(
+                        {
+                            "label": label,
+                            "reason": "Select a student from your account (name-only cart students are not allowed)",
+                        }
+                    )
+                    continue
+                if not await student_on_same_account(db, current_user, sid):
+                    skipped.append(
+                        {"label": label, "reason": "You can only add student profiles on your account"}
+                    )
+                    continue
             if sid:
-                if current_user and current_user.get("role") == UserRole.STUDENT.value:
-                    if current_user.get("id") != sid:
-                        skipped.append({"label": label, "reason": "You can only add your own student profile"})
-                        continue
                 if sid in existing_student_ids:
                     skipped.append({"label": label, "reason": "This student is already in the cart"})
                     continue
@@ -375,6 +400,73 @@ class CartController:
         return await build_cart_public_payload(cart)
 
     @staticmethod
+    async def _resolve_cart_batch_ref(
+        *,
+        course_id: str,
+        branch_id: str,
+        duration_id: str,
+        batch_ref: Optional[str],
+        student_id: Optional[str],
+    ) -> Optional[str]:
+        """Resolve batch for cart lines so linked students can multi-add without a picker.
+
+        Prefer an explicit batch_ref, then payment-info resolution (prior enrollment /
+        single batch / single priced fee). If still ambiguous, pick the first batch
+        that has a fee for this duration so multi-course add does not hard-fail.
+        """
+        from controllers.payment_controller import (
+            _batch_identity,
+            _batches_for_course_on_branch,
+            _duration_price_keys,
+            _fee_from_batch_for_keys,
+            resolve_checkout_batch_ref,
+        )
+
+        requested = (batch_ref or "").strip() or None
+        db = get_db()
+        branch = await db.branches.find_one({"id": branch_id})
+        if not branch:
+            return requested
+        batches = _batches_for_course_on_branch(branch, course_id)
+        if not batches:
+            return requested
+
+        duration_info = await db.durations.find_one({"id": duration_id})
+        if not duration_info:
+            duration_info = await db.durations.find_one({"code": duration_id})
+        dur_keys = _duration_price_keys(duration_id, duration_info)
+
+        resolved = await resolve_checkout_batch_ref(
+            db,
+            course_id=course_id,
+            branch_id=branch_id,
+            batches=batches,
+            requested_batch_ref=requested,
+            student_id=student_id,
+            duration_keys=dur_keys,
+        )
+        if resolved:
+            return resolved
+
+        for i, batch in enumerate(batches):
+            if _fee_from_batch_for_keys(batch, dur_keys) is not None:
+                return _batch_identity(batch, i)
+        return _batch_identity(batches[0], 0)
+
+    @staticmethod
+    def _ensure_item_ids(items: List[dict]) -> Tuple[List[dict], bool]:
+        """Backfill missing cart item ids so remove/update always have a stable key."""
+        changed = False
+        out: List[dict] = []
+        for row in items or []:
+            item = dict(row)
+            if not (item.get("id") or "").strip():
+                item["id"] = str(uuid.uuid4())
+                changed = True
+            out.append(item)
+        return out, changed
+
+    @staticmethod
     async def _build_item_row(
         *,
         student_line_id: str,
@@ -385,11 +477,18 @@ class CartController:
         student_id: Optional[str],
     ) -> dict:
         beneficiary = {"beneficiary_type": "self"}
-        pricing = await CartController._pricing_for_line(
+        resolved_batch = await CartController._resolve_cart_batch_ref(
             course_id=course_id,
             branch_id=branch_id,
             duration_id=duration_id,
             batch_ref=batch_ref,
+            student_id=student_id,
+        )
+        pricing = await CartController._pricing_for_line(
+            course_id=course_id,
+            branch_id=branch_id,
+            duration_id=duration_id,
+            batch_ref=resolved_batch,
             optional_student_id=student_id,
             beneficiary=beneficiary,
         )
@@ -397,7 +496,7 @@ class CartController:
             course_id,
             branch_id,
             duration_id,
-            batch_ref=batch_ref,
+            batch_ref=resolved_batch,
             optional_student_id=student_id,
             admission_fee_beneficiary=beneficiary,
         )
@@ -406,7 +505,7 @@ class CartController:
             course_id=course_id,
             branch_id=branch_id,
             duration_id=duration_id,
-            batch_ref=(batch_ref or "").strip() or None,
+            batch_ref=(resolved_batch or "").strip() or None,
             course_name=info.course_name,
             branch_name=info.branch_name,
             category_name=info.category_name,
@@ -475,6 +574,21 @@ class CartController:
             duration_id=body.duration_id,
             batch_ref=body.batch_ref,
         )
+        if student_id:
+            active = await db.enrollments.find_one(
+                {
+                    "student_id": student_id,
+                    "course_id": body.course_id,
+                    "is_active": True,
+                    "payment_status": {"$in": ["paid", "pending"]},
+                },
+                {"id": 1},
+            )
+            if active:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This student is already enrolled in this course.",
+                )
         items.append(
             await CartController._build_item_row(
                 student_line_id=body.student_line_id,
@@ -549,6 +663,25 @@ class CartController:
             except HTTPException as exc:
                 skipped.append({"course_id": cid, "reason": str(exc.detail)})
                 continue
+
+            if student_id:
+                active = await db.enrollments.find_one(
+                    {
+                        "student_id": student_id,
+                        "course_id": cid,
+                        "is_active": True,
+                        "payment_status": {"$in": ["paid", "pending"]},
+                    },
+                    {"id": 1},
+                )
+                if active:
+                    skipped.append(
+                        {
+                            "course_id": cid,
+                            "reason": "This student is already enrolled in this course.",
+                        }
+                    )
+                    continue
 
             try:
                 row = await CartController._build_item_row(
@@ -666,14 +799,23 @@ class CartController:
     ) -> Dict[str, Any]:
         db = get_db()
         cart = await CartController.ensure_cart(current_user=current_user, guest_token=guest_token)
-        items = [i for i in (cart.get("items") or []) if i.get("id") != item_id]
-        if len(items) == len(cart.get("items") or []):
+        items, id_changed = CartController._ensure_item_ids(cart.get("items") or [])
+        target = (item_id or "").strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="Cart item id is required")
+        kept = [i for i in items if i.get("id") != target]
+        if len(kept) == len(items):
+            if id_changed:
+                await db.carts.update_one(
+                    {"id": cart["id"]},
+                    {"$set": {"items": items, "updated_at": CartController._now()}},
+                )
             raise HTTPException(status_code=404, detail="Cart item not found")
         await db.carts.update_one(
             {"id": cart["id"]},
-            {"$set": {"items": items, "updated_at": CartController._now()}},
+            {"$set": {"items": kept, "updated_at": CartController._now()}},
         )
-        cart["items"] = items
+        cart["items"] = kept
         return await build_cart_public_payload(cart)
 
     @staticmethod

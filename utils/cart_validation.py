@@ -8,6 +8,7 @@ from utils.branch_courses import assert_course_available_at_branch
 from utils.branch_geography import assert_branch_accepts_enrollment
 from utils.cart_duplicates import course_branch_tuple
 from utils.database import get_db
+from utils.family_accounts import student_on_same_account
 
 
 def _item_key(item: dict) -> tuple:
@@ -52,11 +53,11 @@ async def validate_cart_document(
         student_id = (student_row.get("student_id") or "").strip()
         if student_id and current_user:
             role = current_user.get("role")
-            if role == "student" and current_user.get("id") != student_id:
+            if role == "student" and not await student_on_same_account(db, current_user, student_id):
                 issues.append(
                     CartValidationIssue(
                         code="student_ownership",
-                        message="You can only add enrollments for your own student account.",
+                        message="You can only add enrollments for student profiles on your account.",
                         item_id=iid,
                         student_line_id=sid,
                     )
@@ -132,7 +133,7 @@ async def validate_cart_document(
                 issues.append(
                     CartValidationIssue(
                         code="already_enrolled",
-                        message="This student already has an active enrollment for this course.",
+                        message="This student is already enrolled in this course.",
                         item_id=iid,
                         student_line_id=sid,
                     )
