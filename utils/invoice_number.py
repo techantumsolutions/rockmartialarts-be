@@ -11,7 +11,7 @@ DEFAULT_PREFIX = "INV"
 
 
 async def ensure_invoice_counter_indexes(db=None) -> None:
-    db = db or get_db()
+    db = db if db is not None else get_db()
     if db is None:
         return
     try:

@@ -1,11 +1,12 @@
 """M05-S04 discount rule admin CRUD."""
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from fastapi import HTTPException
 
 from models.discount_rule_models import DiscountRuleCreate, DiscountRuleDocument, DiscountRuleUpdate
 from utils.database import get_db
+from utils.helpers import serialize_doc
 
 
 class DiscountRuleController:
@@ -50,7 +51,7 @@ class DiscountRuleController:
         )
         payload = doc.dict()
         await db.discount_rules.insert_one(payload)
-        return {"rule": payload}
+        return {"rule": serialize_doc(payload)}
 
     @staticmethod
     async def list_rules(
@@ -65,10 +66,13 @@ class DiscountRuleController:
             query["is_active"] = True
         total = await db.discount_rules.count_documents(query)
         cursor = (
-            db.discount_rules.find(query).sort("priority", 1).skip(max(0, skip)).limit(min(limit, 200))
+            db.discount_rules.find(query)
+            .sort("priority", 1)
+            .skip(max(0, skip))
+            .limit(min(max(1, limit), 200))
         )
         rules = await cursor.to_list(length=200)
-        return {"rules": rules, "total": total}
+        return {"rules": serialize_doc(rules) or [], "total": total}
 
     @staticmethod
     async def get(rule_id: str) -> Dict[str, Any]:
@@ -76,7 +80,7 @@ class DiscountRuleController:
         rule = await db.discount_rules.find_one({"id": rule_id})
         if not rule:
             raise HTTPException(status_code=404, detail="Discount rule not found")
-        return {"rule": rule}
+        return {"rule": serialize_doc(rule)}
 
     @staticmethod
     async def update(rule_id: str, body: DiscountRuleUpdate, *, current_user: dict) -> Dict[str, Any]:
@@ -104,7 +108,7 @@ class DiscountRuleController:
         patch["updated_at"] = DiscountRuleController._now()
         await db.discount_rules.update_one({"id": rule_id}, {"$set": patch})
         updated = await db.discount_rules.find_one({"id": rule_id})
-        return {"rule": updated}
+        return {"rule": serialize_doc(updated)}
 
     @staticmethod
     async def delete(rule_id: str) -> Dict[str, Any]:

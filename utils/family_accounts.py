@@ -35,6 +35,55 @@ async def list_profiles(db, account_id: str) -> List[Dict[str, Any]]:
     return [profile_summary(u) for u in users]
 
 
+async def resolve_account_id_for_user(db, user: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return account_id from the user dict or by looking up the user document."""
+    if not user:
+        return None
+    account_id = user.get("account_id")
+    if account_id:
+        return account_id
+    uid = user.get("id")
+    if not uid:
+        return None
+    doc = await db.users.find_one({"id": uid}, {"account_id": 1})
+    return (doc or {}).get("account_id")
+
+
+async def student_on_same_account(
+    db,
+    current_user: Optional[Dict[str, Any]],
+    student_id: str,
+) -> bool:
+    """True if student_id is the caller, or another student on the same family account.
+
+    Also allows legacy cart dependents linked via primary_account_id.
+    """
+    if not current_user or not student_id:
+        return False
+    if current_user.get("id") == student_id:
+        return True
+
+    account_id = await resolve_account_id_for_user(db, current_user)
+    if account_id:
+        sibling = await db.users.find_one(
+            {"id": student_id, "account_id": account_id, "role": "student"},
+            {"id": 1},
+        )
+        if sibling:
+            return True
+
+    # Legacy dependents created at cart checkout under this owner
+    owner_id = current_user.get("id")
+    if owner_id:
+        legacy = await db.users.find_one(
+            {"id": student_id, "primary_account_id": owner_id, "role": "student"},
+            {"id": 1},
+        )
+        if legacy:
+            return True
+    return False
+
+
 async def ensure_account_indexes(db) -> None:
     try:
         await db[COL_ACCOUNTS].create_index("id", unique=True, name="accounts_id_unique")

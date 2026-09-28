@@ -89,6 +89,13 @@ async def resolve_student_id_for_line(
         user = await db.users.find_one({"id": existing, "role": "student"})
         if not user:
             raise HTTPException(status_code=400, detail=f"Student profile not found for {line.get('label')}")
+        # Family account siblings (shared account_id)
+        owner_account = owner.get("account_id")
+        if not owner_account:
+            owner_doc = await db.users.find_one({"id": owner_id}, {"account_id": 1})
+            owner_account = (owner_doc or {}).get("account_id")
+        if owner_account and user.get("account_id") == owner_account:
+            return existing
         # Allow owner-linked dependents created earlier via cart
         if user.get("primary_account_id") and user.get("primary_account_id") != owner_id:
             raise HTTPException(status_code=403, detail="Cannot enroll a student linked to another account")

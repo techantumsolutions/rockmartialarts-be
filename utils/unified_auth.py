@@ -32,13 +32,16 @@ async def _resolve_user_from_token(db, token: str) -> dict:
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
 
-    # Check if it's a superadmin token
-    if user_role == "superadmin":
+    # Check if it's a superadmin token (JWT may use either role string)
+    if user_role in ("superadmin", "super_admin"):
         user = await db.superadmins.find_one({"id": user_id})
         if user is None:
             raise HTTPException(status_code=401, detail="Super admin not found")
         user_data = serialize_doc(user)
         user_data["role"] = "super_admin"
+        # Normalize so role checks never treat missing is_active as inactive
+        if user_data.get("is_active") is None:
+            user_data["is_active"] = True
         return user_data
 
     # Check if it's a branch manager token
@@ -127,13 +130,15 @@ def require_role_unified(allowed_roles: List[UserRole]):
     Role checker that works with regular users, superadmins, coaches, and branch managers
     """
     async def role_checker(current_user: dict = Depends(get_current_user_or_superadmin)):
-        if not current_user.get("is_active", True):
+        # Only block when explicitly inactive. Missing/None must not become 400
+        # (superadmin docs often omit is_active; .get("is_active", True) still returns None if key exists).
+        if current_user.get("is_active") is False:
             raise HTTPException(status_code=400, detail="Inactive user")
 
         user_role = current_user["role"]
 
         # Convert role strings to enum values for comparison
-        if user_role == "super_admin":
+        if user_role in ("super_admin", "superadmin"):
             if UserRole.SUPER_ADMIN not in allowed_roles:
                 raise HTTPException(status_code=403, detail="Insufficient permissions")
         elif user_role == "branch_manager":

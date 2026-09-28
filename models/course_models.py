@@ -16,6 +16,8 @@ class CourseContent(BaseModel):
 class MediaResources(BaseModel):
     course_image_url: Optional[str] = None
     promo_video_url: Optional[str] = None
+    # Poster / fallback image for promo or learning native video players
+    video_poster_url: Optional[str] = None
 
 
 class CourseSEO(BaseModel):

@@ -1077,7 +1077,37 @@ class ReportsController:
                     "name": "Financial Reports",
                     "description": "Payment, revenue, and financial analytics reports",
                     "reports_count": 8
-                }
+                },
+                {
+                    "id": "enrollments",
+                    "name": "Enrollment Reports",
+                    "description": "Operational enrollment listings and exports",
+                    "reports_count": 1
+                },
+                {
+                    "id": "renewals",
+                    "name": "Renewal Reports",
+                    "description": "Payment renewals operational report",
+                    "reports_count": 1
+                },
+                {
+                    "id": "leads",
+                    "name": "Lead Reports",
+                    "description": "CRM leads operational report",
+                    "reports_count": 1
+                },
+                {
+                    "id": "events",
+                    "name": "Event Reports",
+                    "description": "Event registrations operational report",
+                    "reports_count": 1
+                },
+                {
+                    "id": "attendance",
+                    "name": "Attendance Reports",
+                    "description": "Attendance reports (see Attendance module for full UI)",
+                    "reports_count": 1
+                },
             ]
         }
 

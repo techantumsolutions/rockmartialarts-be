@@ -107,6 +107,7 @@ from routes.notification_send_routes import (
 from routes.student_promotion_routes import (
     router as student_promotion_router,
 )
+from routes.campaign_popup_routes import router as campaign_popup_router
 from routes.champion_routes import (
     router as champion_router,
 )
@@ -684,6 +685,9 @@ app.include_router(branches_with_courses_router, prefix="/api", tags=["Branches 
 app.include_router(branch_course_router, prefix="/api/branch-courses", tags=["Branch Courses"])
 app.include_router(upload_router, prefix="/api/uploads", tags=["Uploads"])
 app.include_router(cms_router, prefix="/api/cms", tags=["CMS"])
+app.include_router(
+    campaign_popup_router, prefix="/api/campaign-popups", tags=["Campaign Popups"]
+)
 app.include_router(camp_registration_router, prefix="/api/camp-registrations", tags=["Camp Registrations"])
 app.include_router(homepage_content_router, prefix="/api/homepage", tags=["Homepage Content"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
