@@ -18,6 +18,8 @@ async def list_registration_forms_for_student(
     """Active registration forms applicable to the logged-in student."""
     if current_user.get("role") != UserRole.STUDENT.value:
         raise HTTPException(status_code=403, detail="Students only")
+    if current_user.get("is_active") is False:
+        raise HTTPException(status_code=400, detail="Inactive user")
     items = await ctrl.list_for_student(current_user["id"])
     return {"registration_forms": items}
 
