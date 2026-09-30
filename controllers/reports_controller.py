@@ -78,6 +78,8 @@ class ReportsController:
             search_filter = {
                 "$or": [
                     {"transaction_id": {"$regex": search, "$options": "i"}},
+                    {"razorpay_payment_id": {"$regex": search, "$options": "i"}},
+                    {"id": {"$regex": search, "$options": "i"}},
                     {"course_details.course_name": {"$regex": search, "$options": "i"}},
                     {"branch_details.branch_name": {"$regex": search, "$options": "i"}},
                     {"notes": {"$regex": search, "$options": "i"}}
@@ -1376,6 +1378,16 @@ class ReportsController:
                 }
                 processed_coaches.append(processed_coach)
 
+            # areas_of_expertise stores course IDs; expose display names alongside them.
+            expertise_ids = {
+                str(v) for c in processed_coaches for v in (c.get("areas_of_expertise") or []) if v
+            }
+            expertise_names = await ReportsController._course_names_by_id(db, expertise_ids)
+            for c in processed_coaches:
+                c["areas_of_expertise_names"] = [
+                    expertise_names.get(str(v), str(v)) for v in (c.get("areas_of_expertise") or []) if v
+                ]
+
             return {
                 "masters": serialize_doc(processed_coaches),
                 "pagination": {
@@ -1398,6 +1410,21 @@ class ReportsController:
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error getting master reports: {str(e)}")
+
+    @staticmethod
+    async def _course_names_by_id(db, course_ids) -> dict:
+        """Map course id -> title/name. Unknown ids are omitted (callers fall back to the raw value)."""
+        ids = [cid for cid in (course_ids or []) if cid]
+        if not ids:
+            return {}
+        rows = await db.courses.find(
+            {"id": {"$in": ids}}, {"id": 1, "title": 1, "name": 1}
+        ).to_list(length=len(ids))
+        return {
+            str(r["id"]): (r.get("title") or r.get("name"))
+            for r in rows
+            if r.get("id") and (r.get("title") or r.get("name"))
+        }
 
     @staticmethod
     async def get_master_report_filters(current_user: dict):
@@ -1444,7 +1471,15 @@ class ReportsController:
                 {"$sort": {"_id": 1}}
             ]
             areas_result = await db.coaches.aggregate(areas_pipeline).to_list(100)
-            area_options = [{"id": area["_id"], "name": area["_id"]} for area in areas_result]
+            area_names = await ReportsController._course_names_by_id(
+                db, {str(area["_id"]) for area in areas_result if area.get("_id")}
+            )
+            area_options = [
+                {"id": area["_id"], "name": area_names.get(str(area["_id"]), area["_id"])}
+                for area in areas_result
+                if area.get("_id")
+            ]
+            area_options.sort(key=lambda opt: str(opt["name"]).lower())
 
             # Get unique professional experience levels from coaches collection
             experience_pipeline = [

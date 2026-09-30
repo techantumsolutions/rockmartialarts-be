@@ -12,7 +12,7 @@ from models.user_models import (
     LinkedStudentCreate,
 )
 from pydantic import BaseModel, EmailStr
-from utils.auth import require_role, get_current_active_user
+from utils.auth import require_role, get_current_active_user, get_current_student_any_status
 from models.user_models import UserRole
 
 router = APIRouter()
@@ -92,8 +92,14 @@ async def upload_student_profile_photo(
     return await AuthController.upload_student_profile_photo(file, current_user)
 
 
+@router.get("/session-status")
+async def student_session_status(current_user: dict = Depends(get_current_student_any_status)):
+    """Selected student's active/deactivated state plus account profiles (works for inactive profiles)."""
+    return await AuthController.student_session_status(current_user)
+
+
 @router.get("/profiles")
-async def list_linked_profiles(current_user: dict = Depends(require_role([UserRole.STUDENT]))):
+async def list_linked_profiles(current_user: dict = Depends(get_current_student_any_status)):
     """Linked student profiles on the current family account."""
     return await AuthController.list_linked_profiles(current_user)
 
@@ -108,7 +114,7 @@ async def list_linked_students(current_user: dict = Depends(require_role([UserRo
 async def switch_student(
     body: SwitchStudentBody,
     request: Request,
-    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+    current_user: dict = Depends(get_current_student_any_status),
 ):
     """Mint a JWT whose `sub` is another student on the same account."""
     return await AuthController.switch_student(body, current_user, request)

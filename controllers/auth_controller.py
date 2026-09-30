@@ -472,7 +472,11 @@ class AuthController:
                     )
                 user = await pick_login_student(db, acc)
                 if not user:
-                    await AuthController._reject_login(request, user_credentials.email, "No active student on account")
+                    await AuthController._reject_login(
+                        request, user_credentials.email, "No active student on account",
+                        status_code=400,
+                        detail="All student profiles on this account have been deactivated by the admin. Please contact your branch for assistance.",
+                    )
                 account_id = acc["id"]
                 if not user.get("account_id"):
                     await db.users.update_one(
@@ -1228,6 +1232,21 @@ class AuthController:
         }
 
     @staticmethod
+    async def student_session_status(current_user: dict):
+        db = get_db()
+        acc = await ensure_account_for_student(db, current_user)
+        is_active = current_user.get("is_active") is not False
+        return {
+            "student_id": current_user.get("id"),
+            "full_name": current_user.get("full_name")
+            or f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip(),
+            "is_active": is_active,
+            "status": "active" if is_active else "deactivated",
+            "account_id": acc["id"],
+            "profiles": await list_profiles(db, acc["id"]),
+        }
+
+    @staticmethod
     async def switch_student(body: SwitchStudentBody, current_user: dict, request: Request):
         db = get_db()
         if current_user.get("role") != "student":
@@ -1238,8 +1257,11 @@ class AuthController:
             "account_id": acc["id"],
             "role": "student",
         })
-        if not target or target.get("is_active") is False:
+        if not target:
             raise HTTPException(status_code=403, detail="Student is not linked to this account")
+        # Deactivated profiles may be selected; data APIs still reject their token and the
+        # dashboard renders the deactivated screen from /auth/session-status.
+        target_inactive = target.get("is_active") is False
 
         access_token = create_access_token(data={
             "sub": target["id"],
@@ -1253,7 +1275,11 @@ class AuthController:
                 action="switch_student",
                 user_id=target["id"],
                 user_name=target.get("full_name", ""),
-                details={"from_student_id": current_user.get("id"), "account_id": acc["id"]},
+                details={
+                    "from_student_id": current_user.get("id"),
+                    "account_id": acc["id"],
+                    "target_inactive": target_inactive,
+                },
             )
         except Exception:
             pass

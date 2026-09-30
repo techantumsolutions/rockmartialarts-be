@@ -119,6 +119,13 @@ async def get_current_active_user(current_user: dict = Depends(get_current_user)
 
     return current_user
 
+async def get_current_student_any_status(current_user: dict = Depends(get_current_user)):
+    """Student token regardless of is_active. Only for account-level endpoints
+    (session status, profile list, switch) so a deactivated profile can still switch away."""
+    if str(current_user.get("role") or "").lower() != UserRole.STUDENT.value:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return current_user
+
 def require_role(allowed_roles: List[UserRole]):
     async def role_checker(current_user: dict = Depends(get_current_active_user)):
         if current_user["role"] not in [role.value for role in allowed_roles]:
