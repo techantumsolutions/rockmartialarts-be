@@ -73,11 +73,31 @@ async def _find_duplicate(
 ) -> Optional[dict]:
     if not value:
         return None
+    # Match exact / trimmed / case-insensitive, and numeric twin (e.g. "1001" vs 1001).
+    candidates: List[Any] = [value, str(value).strip()]
+    stripped = str(value).strip()
+    if stripped.isdigit():
+        try:
+            candidates.append(int(stripped))
+        except (TypeError, ValueError):
+            pass
+    unique_candidates = []
+    seen_c = set()
+    for c in candidates:
+        key = (type(c).__name__, c)
+        if key in seen_c:
+            continue
+        seen_c.add(key)
+        unique_candidates.append(c)
+
     return await db.users.find_one(
         {
             "role": "student",
-            field: value,
             "id": {"$ne": exclude_student_id},
+            "$or": [
+                {field: {"$in": unique_candidates}},
+                {field: {"$regex": f"^{re.escape(stripped)}$", "$options": "i"}},
+            ],
         },
         {"id": 1, "full_name": 1, "first_name": 1, "last_name": 1, "email": 1, "biometric_id": 1, "essl_user_id": 1},
     )

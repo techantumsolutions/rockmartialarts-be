@@ -62,12 +62,23 @@ async def get_attendance_reports(
     branch_id: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="present | absent | late"),
+    method: Optional[str] = Query(None, description="manual | biometric | ..."),
     limit: Optional[int] = Query(None, ge=1, le=1000),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get attendance reports with filtering"""
     return await AttendanceController.get_attendance_reports(
-        student_id, coach_id, course_id, branch_id, start_date, end_date, current_user, limit
+        student_id=student_id,
+        coach_id=coach_id,
+        course_id=course_id,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        current_user=current_user,
+        limit=limit,
+        status=status,
+        method=method,
     )
 
 @router.get("/students")

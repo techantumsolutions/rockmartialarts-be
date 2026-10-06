@@ -488,6 +488,70 @@ class CoachController:
         return {"message": "Coach deactivated successfully"}
 
     @staticmethod
+    async def get_coaches_by_course(course_id: str, current_user: dict = None):
+        """Get coaches assigned to a specific course"""
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        db = get_db()
+
+        try:
+            course = await db.courses.find_one({"id": course_id})
+            if not course:
+                raise HTTPException(status_code=404, detail="Course not found")
+
+            coaches = []
+
+            if course.get("instructor_id"):
+                instructor = await db.coaches.find_one({
+                    "id": course["instructor_id"],
+                    "is_active": True
+                })
+                if instructor:
+                    coaches.append(instructor)
+
+            assigned_coaches = await db.coaches.find({
+                "assignment_details.courses": course_id,
+                "is_active": True
+            }).to_list(length=100)
+
+            coach_ids_seen = {coach["id"] for coach in coaches}
+            for assigned_coach in assigned_coaches:
+                if assigned_coach["id"] not in coach_ids_seen:
+                    coaches.append(assigned_coach)
+
+            formatted_coaches = []
+            for coach in coaches:
+                formatted_coaches.append({
+                    "id": coach["id"],
+                    "first_name": coach.get("first_name", ""),
+                    "last_name": coach.get("last_name", ""),
+                    "full_name": coach.get(
+                        "full_name",
+                        f"{coach.get('first_name', '')} {coach.get('last_name', '')}".strip(),
+                    ),
+                    "email": coach.get("email", ""),
+                    "phone": coach.get("phone", ""),
+                    "areas_of_expertise": coach.get("areas_of_expertise", []),
+                    "is_active": coach.get("is_active", True),
+                    "branch_id": coach.get("branch_id"),
+                    "is_instructor": coach["id"] == course.get("instructor_id"),
+                    "is_assigned": course_id in coach.get("assignment_details", {}).get("courses", []),
+                })
+
+            return {
+                "coaches": formatted_coaches,
+                "total": len(formatted_coaches),
+                "course_id": course_id,
+                "course_title": course.get("title", "Unknown Course"),
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching coaches for course: {str(e)}")
+
+    @staticmethod
     async def get_coach_courses(coach_id: str, current_user: dict = None):
         """Get courses assigned to a specific coach"""
         if not current_user:

@@ -213,6 +213,16 @@ async def _enrich_students_for_list(db, students: list) -> list:
                 if ddoc:
                     duration_label = ddoc.get("name") or ddoc.get("code")
 
+            enroll_branch_id = enrollment.get("branch_id")
+            enroll_branch_doc = branches.get(enroll_branch_id) if enroll_branch_id else None
+            enroll_branch_name = None
+            if enroll_branch_doc:
+                enroll_branch_name = (
+                    enroll_branch_doc.get("branch", {}).get("name")
+                    or enroll_branch_doc.get("name")
+                    or "Unknown Branch"
+                )
+
             courses_info.append({
                 "enrollment_id": enrollment.get("id"),
                 "course_id": enrollment["course_id"],
@@ -224,7 +234,8 @@ async def _enrich_students_for_list(db, students: list) -> list:
                 "enrollment_date": enrollment.get("enrollment_date"),
                 "payment_status": enrollment.get("payment_status", "pending"),
                 "is_active": enrollment.get("is_active", True),
-                "branch_id": enrollment.get("branch_id"),
+                "branch_id": enroll_branch_id,
+                "branch_name": enroll_branch_name,
             })
 
         if not courses_info and student.get("course"):
@@ -271,13 +282,32 @@ async def _enrich_students_for_list(db, students: list) -> list:
             branch_id_for_name = student["branch"]["branch_id"]
         if not branch_id_for_name and student.get("branch_id"):
             branch_id_for_name = student["branch_id"]
+        # All distinct branches from active enrollments (for multi-branch students in list UI).
+        all_branch_names: list = []
+        seen_branch_ids = set()
+        for enrollment in active_enrollments_only:
+            bid = enrollment.get("branch_id")
+            if not bid or bid in seen_branch_ids:
+                continue
+            seen_branch_ids.add(bid)
+            bdoc = branches.get(bid)
+            if not bdoc:
+                continue
+            bname = bdoc.get("branch", {}).get("name") or bdoc.get("name") or "Unknown Branch"
+            all_branch_names.append(bname)
+
         if branch_id_for_name:
             branch_doc = branches.get(branch_id_for_name)
             if branch_doc:
+                primary_name = branch_doc.get("branch", {}).get("name", "Unknown Branch")
+                # Keep primary branch_id/name for filters; expose full list for display.
+                if primary_name and primary_name not in all_branch_names:
+                    all_branch_names.insert(0, primary_name)
                 branch_info_response = {
                     "branch_id": branch_id_for_name,
                     "location_id": branch_doc.get("location_id", ""),
-                    "branch_name": branch_doc.get("branch", {}).get("name", "Unknown Branch"),
+                    "branch_name": primary_name,
+                    "branch_names": all_branch_names,
                 }
 
         full_name = student.get("full_name") or f"{student.get('first_name', '')} {student.get('last_name', '')}".strip()

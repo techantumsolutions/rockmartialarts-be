@@ -69,6 +69,8 @@ class AttendanceController:
         end_date: Optional[str] = None,
         current_user: dict = None,
         limit: Optional[int] = None,
+        status: Optional[str] = None,
+        method: Optional[str] = None,
     ):
         """Get attendance reports with filtering and role-based access control"""
         try:
@@ -279,7 +281,11 @@ class AttendanceController:
                     return {"students": [], "total": 0}
 
                 managed_branch_ids = [branch["id"] for branch in managed_branches]
-                filter_query["branch_id"] = {"$in": managed_branch_ids}
+                # Prefer an explicit branch_id when it belongs to this manager; otherwise all managed.
+                if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
+                    filter_query["branch_id"] = branch_id
+                else:
+                    filter_query["branch_id"] = {"$in": managed_branch_ids}
 
             # Apply additional filters
             if branch_id and current_user.get("role") != "branch_manager":
@@ -317,7 +323,10 @@ class AttendanceController:
                 # Build enrollment filter based on role
                 enrollment_filter = {"student_id": {"$in": student_ids}}
                 if managed_branch_ids:
-                    enrollment_filter["branch_id"] = {"$in": managed_branch_ids}
+                    if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
+                        enrollment_filter["branch_id"] = branch_id
+                    else:
+                        enrollment_filter["branch_id"] = {"$in": managed_branch_ids}
                 elif branch_id:
                     enrollment_filter["branch_id"] = branch_id
                 # Only apply course filtering when explicitly requested
@@ -941,15 +950,15 @@ class AttendanceController:
             from utils.attendance_report_query import build_attendance_export
 
             attendance_data = await AttendanceController.get_attendance_reports(
-                student_id,
-                coach_id,
-                course_id,
-                branch_id,
-                start_date,
-                end_date,
-                status,
-                method,
-                current_user,
+                student_id=student_id,
+                coach_id=coach_id,
+                course_id=course_id,
+                branch_id=branch_id,
+                start_date=start_date,
+                end_date=end_date,
+                current_user=current_user,
+                status=status,
+                method=method,
             )
             export = build_attendance_export(
                 attendance_data.get("attendance_records") or [],

@@ -22,8 +22,8 @@ class InvoiceWhatsAppResendBody(BaseModel):
 async def list_invoices(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
-    search: Optional[str] = None,
-    payment_id: Optional[str] = None,
+    search: Optional[str] = Query(None, description="Invoice number, customer, payment reference"),
+    payment_id: Optional[str] = Query(None),
     current_user: dict = Depends(
         require_role_unified(
             [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]

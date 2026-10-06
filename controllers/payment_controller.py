@@ -174,10 +174,14 @@ def _fee_from_batch_for_keys(batch: Optional[dict], dur_keys: list) -> Optional[
         for dk in dur_keys or []:
             if dk in fpd and fpd[dk] is not None:
                 try:
-                    return float(fpd[dk])
+                    v = float(fpd[dk])
                 except (TypeError, ValueError):
-                    pass
-    return _batch_fee_from_doc(batch)
+                    continue
+                # Explicit 0 / negative is not usable pricing — keep looking / fall through.
+                if v > 0:
+                    return v
+    legacy = _batch_fee_from_doc(batch)
+    return legacy if legacy is not None and legacy > 0 else None
 
 
 async def _latest_student_batch_ref(
@@ -281,7 +285,7 @@ def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
         v = float(raw)
     except (TypeError, ValueError):
         return None
-    if v < 0:
+    if v <= 0:
         return None
     return v
 
@@ -1583,6 +1587,67 @@ class PaymentController:
 
         total_inr = _enrollment_checkout_total_inr(enrollment)
         if total_inr <= 0:
+            # Recover pending enrollments that were stored without fee fields by
+            # reloading current course/branch/duration pricing, then retry.
+            try:
+                course_id = str(enrollment.get("course_id") or "")
+                branch_id = str(enrollment.get("branch_id") or "")
+                duration = str(
+                    enrollment.get("duration_id")
+                    or enrollment.get("duration")
+                    or ""
+                )
+                batch_ref = enrollment.get("batch_ref")
+                if course_id and branch_id and duration:
+                    # Prefer stored batch, then retry without batch so catalog fees can apply
+                    # when the batch cell is an empty/zero placeholder.
+                    batch_attempts = []
+                    if batch_ref:
+                        batch_attempts.append(str(batch_ref))
+                    batch_attempts.append(None)
+                    last_pricing_error = None
+                    for attempt_batch in batch_attempts:
+                        try:
+                            info = await PaymentController.get_course_payment_info(
+                                course_id,
+                                branch_id,
+                                duration,
+                                batch_ref=attempt_batch,
+                                optional_student_id=student_id,
+                            )
+                        except HTTPException as exc:
+                            last_pricing_error = exc
+                            continue
+                        course_fee = float(getattr(info.pricing, "course_fee", 0) or 0)
+                        admission_fee = float(getattr(info.pricing, "admission_fee", 0) or 0)
+                        if course_fee + admission_fee <= 0:
+                            continue
+                        set_fields = {
+                            "fee_amount": course_fee,
+                            "admission_fee": admission_fee,
+                            "updated_at": datetime.utcnow(),
+                        }
+                        if attempt_batch and not batch_ref:
+                            set_fields["batch_ref"] = attempt_batch
+                        await db.enrollments.update_one(
+                            {"id": body.enrollment_id, "student_id": student_id},
+                            {"$set": set_fields},
+                        )
+                        enrollment["fee_amount"] = course_fee
+                        enrollment["admission_fee"] = admission_fee
+                        total_inr = _enrollment_checkout_total_inr(enrollment)
+                        break
+                    if total_inr <= 0 and last_pricing_error is not None:
+                        raise last_pricing_error
+            except HTTPException:
+                raise
+            except Exception:
+                logger.exception(
+                    "Failed to backfill enrollment checkout amount enrollment_id=%s",
+                    body.enrollment_id,
+                )
+
+        if total_inr <= 0:
             raise HTTPException(status_code=400, detail="Invalid checkout amount.")
 
         amount_paise = int(round(total_inr * 100))
@@ -1694,6 +1759,62 @@ class PaymentController:
 
         active_paid = await _latest_active_paid_enrollment(db, student_id, body.course_id)
 
+        # Resolve pricing first. Only after a payable amount is confirmed do we drop
+        # abandoned pending checkouts — otherwise a ₹0/bad tenure wipe would leave a 404.
+        branch = await db.branches.find_one({"id": body.branch_id})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+
+        duration_row = await db.durations.find_one({"id": body.duration})
+        if not duration_row:
+            duration_row = await db.durations.find_one({"code": body.duration})
+        batches = _batches_for_course_on_branch(branch, body.course_id)
+        batch_ref = await resolve_checkout_batch_ref(
+            db,
+            course_id=body.course_id,
+            branch_id=body.branch_id,
+            batches=batches,
+            requested_batch_ref=body.batch_ref,
+            student_id=student_id,
+            duration_keys=_duration_price_keys(body.duration, duration_row),
+        )
+
+        beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
+        info = await PaymentController.get_course_payment_info(
+            body.course_id,
+            body.branch_id,
+            body.duration,
+            batch_ref=batch_ref,
+            optional_student_id=student_id,
+            admission_fee_beneficiary=beneficiary_payload,
+        )
+
+        effective_admission_fee = float(info.pricing.admission_fee)
+        effective_course_fee = float(info.pricing.course_fee)
+        effective_total = float(info.pricing.total_amount)
+        if effective_total <= 0 or (effective_course_fee + effective_admission_fee) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No payable amount for this course/tenure. Please select another tenure or contact the admin.",
+            )
+
+        start_date = datetime.utcnow()
+        if active_paid and not is_subscription_period_over(active_paid.get("end_date")):
+            # Allow in-advance renewal while preserving current plan validity window.
+            active_end_eod = subscription_end_of_day_utc(active_paid.get("end_date"))
+            if active_end_eod is not None:
+                start_date = (active_end_eod + timedelta(microseconds=1)).replace(tzinfo=None)
+        months_hint = None
+        if duration_row and duration_row.get("duration_months") is not None:
+            try:
+                months_hint = int(duration_row["duration_months"])
+            except (TypeError, ValueError):
+                months_hint = None
+
+        end_date = await resolve_enrollment_end_date(
+            db, body.duration, start_date, months_hint=months_hint
+        )
+
         # Drop abandoned pending checkouts so the student can retry after canceling Razorpay.
         # Also cancel pending payment attempts linked to those stale pending enrollments.
         stale_pending_enrollments = await db.enrollments.find(
@@ -1731,61 +1852,13 @@ class PaymentController:
             }
         )
 
-        branch = await db.branches.find_one({"id": body.branch_id})
-        if not branch:
-            raise HTTPException(status_code=404, detail="Branch not found")
-
-        duration_row = await db.durations.find_one({"id": body.duration})
-        if not duration_row:
-            duration_row = await db.durations.find_one({"code": body.duration})
-        batches = _batches_for_course_on_branch(branch, body.course_id)
-        batch_ref = await resolve_checkout_batch_ref(
-            db,
-            course_id=body.course_id,
-            branch_id=body.branch_id,
-            batches=batches,
-            requested_batch_ref=body.batch_ref,
-            student_id=student_id,
-            duration_keys=_duration_price_keys(body.duration, duration_row),
-        )
-
-        beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
-        info = await PaymentController.get_course_payment_info(
-            body.course_id,
-            body.branch_id,
-            body.duration,
-            batch_ref=batch_ref,
-            optional_student_id=student_id,
-            admission_fee_beneficiary=beneficiary_payload,
-        )
-
-        start_date = datetime.utcnow()
-        if active_paid and not is_subscription_period_over(active_paid.get("end_date")):
-            # Allow in-advance renewal while preserving current plan validity window.
-            active_end_eod = subscription_end_of_day_utc(active_paid.get("end_date"))
-            if active_end_eod is not None:
-                start_date = (active_end_eod + timedelta(microseconds=1)).replace(tzinfo=None)
-        months_hint = None
-        if duration_row and duration_row.get("duration_months") is not None:
-            try:
-                months_hint = int(duration_row["duration_months"])
-            except (TypeError, ValueError):
-                months_hint = None
-
-        end_date = await resolve_enrollment_end_date(
-            db, body.duration, start_date, months_hint=months_hint
-        )
-
-        effective_admission_fee = float(info.pricing.admission_fee)
-        effective_total = float(info.pricing.total_amount)
-
         enrollment = EnrollmentModel(
             student_id=student_id,
             course_id=body.course_id,
             branch_id=body.branch_id,
             start_date=start_date,
             end_date=end_date,
-            fee_amount=float(info.pricing.course_fee),
+            fee_amount=effective_course_fee,
             admission_fee=effective_admission_fee,
             payment_status=EnrollmentPaymentStatus.PENDING,
             is_active=True,
@@ -1955,17 +2028,20 @@ class PaymentController:
                     for dk in dur_keys:
                         if dk in batch_fpd and batch_fpd[dk] is not None:
                             try:
-                                batch_dur_fee = float(batch_fpd[dk])
-                                matched_dur_key = dk
+                                candidate = float(batch_fpd[dk])
                             except (TypeError, ValueError):
-                                pass
-                            if batch_dur_fee is not None:
-                                break
+                                continue
+                            # Skip placeholder zeros so course/branch pricing can still apply.
+                            if candidate <= 0:
+                                continue
+                            batch_dur_fee = candidate
+                            matched_dur_key = dk
+                            break
                 if matched_dur_key and isinstance(batch_ptd, dict):
                     pt_raw = batch_ptd.get(matched_dur_key)
                     if pt_raw is not None and str(pt_raw).strip():
                         batch_dur_pricing_type = str(pt_raw).strip().lower()
-                if batch_dur_fee is not None:
+                if batch_dur_fee is not None and batch_dur_fee > 0:
                     explicit_duration_fee_found = True
                     if batch_dur_pricing_type == "monthly":
                         course_fee = batch_dur_fee * pricing_multiplier
@@ -1977,7 +2053,7 @@ class PaymentController:
                     total_amount = course_fee + admission_fee
                 else:
                     bf = _batch_fee_from_doc(bdoc)
-                    if bf is not None:
+                    if bf is not None and bf > 0:
                         # Legacy batch_fee is per-month; multiply by tenure months
                         course_fee = bf * pricing_multiplier
                         total_amount = course_fee + admission_fee
@@ -1990,8 +2066,13 @@ class PaymentController:
             original_calculated_total = None
             for dk in dur_keys:
                 if dk in flat_price_per_duration and flat_price_per_duration[dk] is not None:
-                    flat_price_value = float(flat_price_per_duration[dk])
-                    break
+                    try:
+                        candidate = float(flat_price_per_duration[dk])
+                    except (TypeError, ValueError):
+                        continue
+                    if candidate > 0:
+                        flat_price_value = candidate
+                        break
             # Also check branch-specific flat prices
             branch_flat_prices = {}
             raw_bp = course.get("branch_pricing") or {}
@@ -1999,8 +2080,13 @@ class PaymentController:
                 branch_flat_prices = raw_bp[branch_id].get("flat_price_per_duration") or {}
             for dk in dur_keys:
                 if dk in branch_flat_prices and branch_flat_prices[dk] is not None:
-                    flat_price_value = float(branch_flat_prices[dk])
-                    break
+                    try:
+                        candidate = float(branch_flat_prices[dk])
+                    except (TypeError, ValueError):
+                        continue
+                    if candidate > 0:
+                        flat_price_value = candidate
+                        break
 
             # 1) Branch-specific duration fees (dict may use duration id, code, or slug)
             bp_val = None
@@ -2010,15 +2096,20 @@ class PaymentController:
                     picked = None
                     for dk in dur_keys:
                         if dk in bp_val and bp_val[dk] is not None:
-                            picked = float(bp_val[dk])
-                            break
+                            try:
+                                candidate = float(bp_val[dk])
+                            except (TypeError, ValueError):
+                                continue
+                            if candidate > 0:
+                                picked = candidate
+                                break
                     if picked is not None:
                         course_fee = picked
                         total_amount = course_fee + admission_fee
                         pricing_multiplier = 1.0
                         explicit_duration_fee_found = True
                     # dict but no matching key: fall through to fee_per_duration / legacy (no 404)
-                elif isinstance(bp_val, (int, float)):
+                elif isinstance(bp_val, (int, float)) and float(bp_val) > 0:
                     base_price = float(bp_val)
                     course_fee = base_price * pricing_multiplier
                     total_amount = course_fee + admission_fee
@@ -2031,8 +2122,13 @@ class PaymentController:
                 picked_fd = None
                 for dk in dur_keys:
                     if dk in fee_per_duration and fee_per_duration[dk] is not None:
-                        picked_fd = float(fee_per_duration[dk])
-                        break
+                        try:
+                            candidate = float(fee_per_duration[dk])
+                        except (TypeError, ValueError):
+                            continue
+                        if candidate > 0:
+                            picked_fd = candidate
+                            break
                 if picked_fd is not None:
                     course_fee = picked_fd
                     total_amount = course_fee + admission_fee
@@ -2056,8 +2152,15 @@ class PaymentController:
                             detail="No pricing configured for this course. Please contact the admin to set up pricing.",
                         )
                     base_price = float(base_price)
+                    if base_price <= 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="No pricing configured for this course. Please contact the admin to set up pricing.",
+                        )
                     if branch_id in branch_pricing and isinstance(branch_pricing[branch_id], (int, float)):
-                        base_price = float(branch_pricing[branch_id])
+                        branch_base = float(branch_pricing[branch_id])
+                        if branch_base > 0:
+                            base_price = branch_base
                     course_fee = base_price * pricing_multiplier
                     total_amount = course_fee + admission_fee
 
