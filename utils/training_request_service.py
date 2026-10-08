@@ -544,17 +544,22 @@ async def _scoped_list_query(
     """Shared filter builder for list + summary (BM branch scoping included)."""
     await _assert_admin_access(db, current_user)
     q: Dict[str, Any] = {}
+    ands: List[Dict[str, Any]] = []
     role = _role(current_user)
     managed: List[str] = []
     if role == "branch_manager":
         managed = await get_managed_branch_ids_for_user(db, current_user)
         if not managed:
             return {"__empty__": True}
-        q["$or"] = [
-            {"branch_id": {"$in": managed}},
-            {"branch_id": None},
-            {"branch_id": ""},
-        ]
+        ands.append(
+            {
+                "$or": [
+                    {"branch_id": {"$in": managed}},
+                    {"branch_id": None},
+                    {"branch_id": ""},
+                ]
+            }
+        )
 
     if branch_id:
         bid = str(branch_id).strip()
@@ -571,8 +576,7 @@ async def _scoped_list_query(
     if payment_status:
         q["payment_status"] = str(payment_status).strip().lower()
     if unassigned_only:
-        q["$and"] = q.get("$and") or []
-        q["$and"].append(
+        ands.append(
             {
                 "$or": [
                     {"assigned_coach_id": None},
@@ -588,24 +592,34 @@ async def _scoped_list_query(
         term = search.strip()
         if term:
             rx = {"$regex": re.escape(term), "$options": "i"}
-            q["$and"] = q.get("$and") or []
-            q["$and"].append(
-                {
-                    "$or": [
-                        {"contact_name": rx},
-                        {"contact_phone": rx},
-                        {"contact_email": rx},
-                        {"details.participant_name": rx},
-                        {"details.school_name": rx},
-                        {"details.college_name": rx},
-                        {"details.organization_name": rx},
-                        {"details.package_name": rx},
-                        {"details.city": rx},
-                        {"assigned_coach_name": rx},
-                        {"branch_name": rx},
+            search_or: List[Dict[str, Any]] = [
+                {"contact_name": rx},
+                {"contact_phone": rx},
+                {"contact_email": rx},
+                {"details.participant_name": rx},
+                {"details.participant_phone": rx},
+                {"details.school_name": rx},
+                {"details.college_name": rx},
+                {"details.organization_name": rx},
+                {"details.package_name": rx},
+                {"details.city": rx},
+                {"details.state": rx},
+                {"assigned_coach_name": rx},
+                {"branch_name": rx},
+            ]
+            digits = re.sub(r"\D+", "", term)
+            if digits:
+                digit_rx = {"$regex": re.escape(digits), "$options": "i"}
+                search_or.extend(
+                    [
+                        {"contact_phone": digit_rx},
+                        {"details.participant_phone": digit_rx},
                     ]
-                }
-            )
+                )
+            ands.append({"$or": search_or})
+
+    if ands:
+        q["$and"] = ands
     return q
 
 

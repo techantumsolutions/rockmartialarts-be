@@ -1,5 +1,6 @@
 """M07-S01 invoice list / detail / printable document APIs."""
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -64,14 +65,16 @@ class InvoiceController:
             query["payment_id"] = payment_id
 
         if search and search.strip():
-            s = search.strip()
+            s = re.escape(search.strip())
             search_clause = {
                 "$or": [
                     {"invoice_number": {"$regex": s, "$options": "i"}},
                     {"payment_reference": {"$regex": s, "$options": "i"}},
+                    {"payment_id": {"$regex": s, "$options": "i"}},
                     {"customer.name": {"$regex": s, "$options": "i"}},
                     {"customer.email": {"$regex": s, "$options": "i"}},
                     {"customer.phone": {"$regex": s, "$options": "i"}},
+                    {"customer_name": {"$regex": s, "$options": "i"}},
                 ]
             }
             if "$or" in query:

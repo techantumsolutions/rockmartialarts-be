@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
+from pymongo.errors import DuplicateKeyError
 
 from models.kpi_models import (
     KpiDefinitionCreate,
@@ -27,10 +28,31 @@ COL = "kpi_definitions"
 # Soft tolerance for floating sum of percent weights
 PERCENT_SUM_TARGET = 100.0
 PERCENT_SUM_TOLERANCE = 0.01
+DUPLICATE_CODE_DETAIL = "A KPI with this code already exists"
 
 
 def normalize_kpi_code(code: str) -> str:
     return (code or "").strip().upper().replace(" ", "_")
+
+
+async def _find_kpi_by_normalized_code(
+    db,
+    code: str,
+    *,
+    exclude_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Match by normalized code so casing / spaces cannot bypass uniqueness."""
+    query: Dict[str, Any] = {}
+    if exclude_id:
+        query["id"] = {"$ne": exclude_id}
+    exact = await db[COL].find_one({**query, "code": code})
+    if exact:
+        return exact
+    rows = await db[COL].find(query, {"id": 1, "code": 1, "name": 1}).to_list(length=500)
+    for row in rows:
+        if normalize_kpi_code(str(row.get("code") or "")) == code:
+            return row
+    return None
 
 
 async def ensure_kpi_indexes(db=None) -> None:
@@ -53,6 +75,11 @@ def _validate_scores(min_score: float, max_score: float) -> None:
         raise HTTPException(status_code=400, detail="max_score must be greater than 0")
     if min_score < 0:
         raise HTTPException(status_code=400, detail="min_score cannot be negative")
+    if min_score == max_score:
+        raise HTTPException(
+            status_code=400,
+            detail="Min score and max score cannot be the same",
+        )
     if min_score > max_score:
         raise HTTPException(status_code=400, detail="min_score cannot exceed max_score")
 
@@ -180,8 +207,8 @@ async def create_kpi_definition(
     code = normalize_kpi_code(body.code)
     if not code:
         raise HTTPException(status_code=400, detail="KPI code is required")
-    if await db[COL].find_one({"code": code}):
-        raise HTTPException(status_code=409, detail="A KPI with this code already exists")
+    if await _find_kpi_by_normalized_code(db, code):
+        raise HTTPException(status_code=409, detail=DUPLICATE_CODE_DETAIL)
 
     _validate_weight(body.weight, body.weight_unit.value)
     _validate_scores(body.min_score, body.max_score)
@@ -215,7 +242,10 @@ async def create_kpi_definition(
         },
     )
 
-    await db[COL].insert_one(payload)
+    try:
+        await db[COL].insert_one(payload)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail=DUPLICATE_CODE_DETAIL)
     return {
         "kpi": serialize_doc(payload),
         "weight_summary": summary,
@@ -241,9 +271,9 @@ async def update_kpi_definition(
         code = normalize_kpi_code(patch["code"])
         if not code:
             raise HTTPException(status_code=400, detail="KPI code is required")
-        other = await db[COL].find_one({"code": code, "id": {"$ne": kpi_id}})
+        other = await _find_kpi_by_normalized_code(db, code, exclude_id=kpi_id)
         if other:
-            raise HTTPException(status_code=409, detail="A KPI with this code already exists")
+            raise HTTPException(status_code=409, detail=DUPLICATE_CODE_DETAIL)
         patch["code"] = code
     if "name" in patch and patch["name"] is not None:
         patch["name"] = str(patch["name"]).strip()
