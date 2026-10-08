@@ -198,14 +198,8 @@ async def _bm_branch_filter(db, current_user: Optional[dict]) -> Optional[Dict[s
     managed = await get_managed_branch_ids_for_user(db, current_user)
     if not managed:
         return {"branch_id": {"$in": []}}
-    return {
-        "$or": [
-            {"branch_id": {"$in": managed}},
-            {"branch_id": {"$exists": False}},
-            {"branch_id": None},
-            {"branch_id": ""},
-        ]
-    }
+    # Branch managers see only leads assigned to their managed branch(es).
+    return {"branch_id": {"$in": [str(x) for x in managed if x]}}
 
 
 def _build_lead_doc(

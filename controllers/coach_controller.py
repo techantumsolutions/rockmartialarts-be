@@ -184,16 +184,30 @@ class CoachController:
             elif status in ("pending", "rejected"):
                 filter_query["approval_status"] = status
 
-        if current_user and current_user.get("role") == "branch_manager":
-            branch_manager_id = current_user.get("id")
-            if branch_manager_id:
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                managed_branch_ids = [b["id"] for b in managed_branches]
-                if managed_branch_ids:
-                    filter_query["branch_id"] = {"$in": managed_branch_ids}
-                else:
-                    filter_query["branch_id"] = {"$in": []}
-        
+        role = str((current_user or {}).get("role") or "").lower()
+        if current_user and role in {"branch_manager", "branch_admin", "branchmanager"}:
+            from utils.student_status_service import get_managed_branch_ids_for_user
+
+            managed_branch_ids = [
+                str(x) for x in await get_managed_branch_ids_for_user(db, current_user) if x
+            ]
+            # Coaches may be linked via branch_id and/or service_location_ids (registration).
+            branch_scope = (
+                {
+                    "$or": [
+                        {"branch_id": {"$in": managed_branch_ids}},
+                        {"service_location_ids": {"$in": managed_branch_ids}},
+                    ]
+                }
+                if managed_branch_ids
+                else {"id": {"$in": []}}
+            )
+            and_parts = list(filter_query.pop("$and", []) or [])
+            if "$or" in filter_query:
+                and_parts.append({"$or": filter_query.pop("$or")})
+            and_parts.append(branch_scope)
+            filter_query["$and"] = and_parts
+
         coaches = await db.coaches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         
         # Convert to response format (remove sensitive data)
