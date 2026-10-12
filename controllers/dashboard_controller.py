@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.student_status_service import get_managed_branch_ids_for_user
 from models.user_models import UserRole
 
 
@@ -50,13 +51,13 @@ class DashboardController:
         if current_user["role"] == "coach_admin" and current_user.get("branch_id"):
             filter_query["branch_id"] = current_user["branch_id"]
         elif current_user["role"] == "branch_manager":
-            # Branch managers can only see data from their managed branches
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
-
-            # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
+            # Selected branch only (header). Empty when this login manages none.
+            managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+            managed_branches = (
+                await db.branches.find({"id": {"$in": managed_branch_ids}}).to_list(length=None)
+                if managed_branch_ids
+                else []
+            )
 
             if not managed_branches:
                 # Return empty stats if no branches are managed
@@ -86,11 +87,9 @@ class DashboardController:
                     "courses_with_enrollments_in_period": 0,
                 }}
 
-            # Get all branch IDs managed by this branch manager
             managed_branch_ids = [branch["id"] for branch in managed_branches]
-            print(f"Branch manager {branch_manager_id} manages branches for dashboard stats: {managed_branch_ids}")
 
-            # Filter by multiple branches
+            # Filter by the selected branch
             filter_query["branch_id"] = {"$in": managed_branch_ids}
         elif branch_id:
             filter_query["branch_id"] = branch_id
@@ -534,11 +533,7 @@ class DashboardController:
             pay_student_ids = None
 
             if current_user["role"] == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                managed_branches = await db.branches.find(
-                    {"manager_id": branch_manager_id, "is_active": True}
-                ).to_list(length=None)
-                managed_branch_ids = [b["id"] for b in managed_branches]
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
                 if not managed_branch_ids:
                     return {"recent_enrollments": [], "recent_payments": []}
                 enr_filter["branch_id"] = {"$in": managed_branch_ids}

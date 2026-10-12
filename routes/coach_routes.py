@@ -191,11 +191,14 @@ async def get_coaches(
     approval_status: Optional[str] = Query(
         None, description="M14 additive: pending | approved | rejected"
     ),
+    branch_id: Optional[str] = Query(
+        None, description="Only coaches assigned to this branch"
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get coaches with filtering options"""
     return await CoachController.get_coaches(
-        skip, limit, active_only, area_of_expertise, current_user, approval_status
+        skip, limit, active_only, area_of_expertise, current_user, approval_status, branch_id
     )
 
 @router.get("/me")

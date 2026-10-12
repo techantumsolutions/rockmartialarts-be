@@ -20,11 +20,11 @@ def _role(user: dict) -> str:
     return str((user or {}).get("role") or "").lower()
 
 
-def _managed_branch_ids(user: dict) -> List[str]:
-    raw = (user or {}).get("managed_branches") or (user or {}).get("branch_ids") or []
-    if isinstance(raw, str):
-        return [raw]
-    return [str(x) for x in raw if x]
+async def _managed_branch_ids(user: dict) -> List[str]:
+    from utils.database import get_db
+    from utils.student_status_service import get_managed_branch_ids_for_user
+
+    return await get_managed_branch_ids_for_user(get_db(), user)
 
 
 class InvoiceController:
@@ -54,7 +54,7 @@ class InvoiceController:
                 {"account_user_id": uid},
             ]
         elif role == UserRole.BRANCH_MANAGER.value:
-            branches = _managed_branch_ids(current_user)
+            branches = await _managed_branch_ids(current_user)
             if not branches:
                 return {"invoices": [], "total": 0, "skip": skip, "limit": limit}
             query["branch_id"] = {"$in": branches}
@@ -115,7 +115,7 @@ class InvoiceController:
         doc = await db.invoices.find_one({"id": invoice_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Invoice not found")
-        InvoiceController._assert_can_access(doc, current_user)
+        await InvoiceController._assert_can_access(doc, current_user)
         payload = public_invoice_payload(doc, include_html=include_html)
         try:
             from utils.invoice_whatsapp_service import (
@@ -142,7 +142,7 @@ class InvoiceController:
         doc = await db.invoices.find_one({"id": invoice_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Invoice not found")
-        InvoiceController._assert_can_access(doc, current_user)
+        await InvoiceController._assert_can_access(doc, current_user)
         from utils.invoice_whatsapp_service import (
             list_invoice_whatsapp_deliveries,
             public_whatsapp_delivery_summary,
@@ -164,7 +164,7 @@ class InvoiceController:
         doc = await db.invoices.find_one({"id": invoice_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Invoice not found")
-        InvoiceController._assert_can_resend_whatsapp(doc, current_user)
+        await InvoiceController._assert_can_resend_whatsapp(doc, current_user)
 
         from utils.invoice_whatsapp_service import (
             public_whatsapp_delivery_summary,
@@ -204,16 +204,16 @@ class InvoiceController:
         }
 
     @staticmethod
-    def _assert_can_resend_whatsapp(doc: dict, current_user: dict) -> None:
+    async def _assert_can_resend_whatsapp(doc: dict, current_user: dict) -> None:
         role = _role(current_user)
         if role == UserRole.SUPER_ADMIN.value:
             return
         if role == UserRole.BRANCH_MANAGER.value:
-            InvoiceController._assert_can_access(doc, current_user)
+            await InvoiceController._assert_can_access(doc, current_user)
             return
         if role == UserRole.STUDENT.value:
             # Students may resend to their own invoice phone
-            InvoiceController._assert_can_access(doc, current_user)
+            await InvoiceController._assert_can_access(doc, current_user)
             return
         raise HTTPException(status_code=403, detail="Not allowed to resend invoice WhatsApp")
 
@@ -231,7 +231,7 @@ class InvoiceController:
                 doc = await generate_invoice_for_payment(payment_doc=pay)
             if not doc:
                 raise HTTPException(status_code=404, detail="Invoice not found for this payment")
-        InvoiceController._assert_can_access(doc, current_user)
+        await InvoiceController._assert_can_access(doc, current_user)
         payload = public_invoice_payload(doc, include_html=False)
         try:
             from utils.invoice_whatsapp_service import (
@@ -254,7 +254,7 @@ class InvoiceController:
         doc = await db.invoices.find_one({"id": invoice_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Invoice not found")
-        InvoiceController._assert_can_access(doc, current_user)
+        await InvoiceController._assert_can_access(doc, current_user)
         html = doc.get("document_html")
         if not html:
             from utils.invoice_document import build_invoice_html
@@ -267,7 +267,7 @@ class InvoiceController:
         return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
 
     @staticmethod
-    def _assert_can_access(doc: dict, current_user: dict) -> None:
+    async def _assert_can_access(doc: dict, current_user: dict) -> None:
         role = _role(current_user)
         if role == UserRole.SUPER_ADMIN.value:
             return
@@ -277,7 +277,7 @@ class InvoiceController:
                 return
             raise HTTPException(status_code=403, detail="Not allowed to view this invoice")
         if role == UserRole.BRANCH_MANAGER.value:
-            branches = _managed_branch_ids(current_user)
+            branches = await _managed_branch_ids(current_user)
             if doc.get("branch_id") and doc.get("branch_id") in branches:
                 return
             raise HTTPException(status_code=403, detail="Not allowed to view this invoice")

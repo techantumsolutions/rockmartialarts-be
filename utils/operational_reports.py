@@ -34,10 +34,9 @@ async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[st
     role = current_user.get("role")
     db = get_db()
     if role == "branch_manager":
-        managed = await db.branches.find(
-            {"manager_id": current_user.get("id"), "is_active": True}
-        ).to_list(length=None)
-        ids = [b["id"] for b in managed]
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        ids = await get_managed_branch_ids_for_user(db, current_user)
         if not ids:
             return {"branch_id": {"$in": []}}
         return {"branch_id": {"$in": ids}}

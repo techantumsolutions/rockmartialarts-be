@@ -23,7 +23,16 @@ from models.lead_coach_assignment_models import (
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
-from utils.lead_service import _assert_lead_access, lead_to_response_dict
+from utils.lead_service import (
+    _append_follow_up_event,
+    _assert_lead_access,
+    _normalize_lead_priority,
+    _normalize_lead_status,
+    create_lead_follow_up,
+    lead_to_response_dict,
+    list_lead_follow_ups,
+    update_lead_status_with_history,
+)
 from utils.student_status_service import get_managed_branch_ids_for_user
 
 logger = logging.getLogger(__name__)
@@ -205,6 +214,40 @@ async def get_lead_assignment(
     }
 
 
+async def _set_pipeline_status(
+    db,
+    lead: dict,
+    *,
+    to_status: str,
+    note: str,
+    current_user: dict,
+    only_from: Optional[set] = None,
+) -> dict:
+    """Move the lead pipeline status and record follow-up history. No-op outside only_from."""
+    current = str(lead.get("status") or "new").lower()
+    if only_from is not None and current not in only_from:
+        return lead
+    if current == to_status:
+        return lead
+    now = datetime.utcnow()
+    await db[COL_LEADS].update_one(
+        {"id": lead["id"]},
+        {"$set": {"status": to_status, "updated_at": now}},
+    )
+    await _append_follow_up_event(
+        db,
+        lead_id=lead["id"],
+        action="status_change",
+        note=note,
+        from_status=current,
+        to_status=to_status,
+        next_follow_up_at=lead.get("next_follow_up_at"),
+        actor=current_user,
+    )
+    updated = await db[COL_LEADS].find_one({"id": lead["id"]})
+    return updated or lead
+
+
 async def _set_lead_denorm(db, lead_id: str, assignment: Optional[dict]) -> None:
     now = datetime.utcnow()
     if not assignment:
@@ -302,11 +345,14 @@ async def assign_coach_to_lead(
     await db[COL].insert_one(doc)
     await _set_lead_denorm(db, lead_id, doc)
 
-    # Soft pipeline nudge: new → contacted when first assigned
+    # Waiting on the coach. "Assigned" is set only after they accept.
     if status == "new":
-        await db[COL_LEADS].update_one(
-            {"id": lead_id},
-            {"$set": {"status": "contacted", "updated_at": now}},
+        await _set_pipeline_status(
+            db,
+            lead,
+            to_status="pending_acceptance",
+            note=f"Waiting for {coach_name} to accept",
+            current_user=current_user,
         )
 
     updated_lead = await db[COL_LEADS].find_one({"id": lead_id})
@@ -356,6 +402,19 @@ async def cancel_lead_assignment(
         },
     )
     await _set_lead_denorm(db, lead_id, None)
+    if (
+        str(lead.get("status") or "").lower() == "assigned"
+        and str(lead.get("coach_assignment_status") or "").lower() == "pending"
+    ):
+        lead = {**lead, "status": "pending_acceptance"}
+    await _set_pipeline_status(
+        db,
+        lead,
+        to_status="new",
+        note="Coach request cancelled",
+        current_user=current_user,
+        only_from={"pending_acceptance"},
+    )
     updated = await db[COL].find_one({"id": doc["id"]})
     lead2 = await db[COL_LEADS].find_one({"id": lead_id})
     return {
@@ -398,8 +457,21 @@ async def list_my_assignments(
         .limit(limit)
         .to_list(length=limit)
     )
+    lead_ids = [r.get("lead_id") for r in rows if r.get("lead_id")]
+    leads_by_id: Dict[str, dict] = {}
+    if lead_ids:
+        lead_rows = await db[COL_LEADS].find({"id": {"$in": lead_ids}}).to_list(length=len(lead_ids))
+        leads_by_id = {str(item.get("id")): item for item in lead_rows}
+    assignments = []
+    for row in rows:
+        item = _public(row)
+        lead = leads_by_id.get(str(row.get("lead_id") or ""))
+        if lead:
+            item["lead_status"] = _normalize_lead_status(lead.get("status"))
+            item["lead_priority"] = _normalize_lead_priority(lead.get("priority"))
+        assignments.append(item)
     return {
-        "assignments": [_public(r) for r in rows],
+        "assignments": assignments,
         "total": total,
         "skip": skip,
         "limit": limit,
@@ -451,14 +523,18 @@ async def accept_assignment(
     updated = await db[COL].find_one({"id": assignment_id})
     await _set_lead_denorm(db, doc["lead_id"], updated)
 
-    # Soft nudge lead toward qualified when coach accepts
+    # Assigned only after the coach accepts. Later statuses are left as they are.
     lead = await db[COL_LEADS].find_one({"id": doc["lead_id"]})
-    if lead and str(lead.get("status") or "").lower() in {"new", "contacted"}:
-        await db[COL_LEADS].update_one(
-            {"id": doc["lead_id"]},
-            {"$set": {"status": "qualified", "updated_at": now}},
+    if lead:
+        coach_name = doc.get("coach_name") or "coach"
+        lead = await _set_pipeline_status(
+            db,
+            lead,
+            to_status="assigned",
+            note=f"Accepted by {coach_name}",
+            current_user=current_user,
+            only_from={"new", "pending_acceptance", "contacted"},
         )
-        lead = await db[COL_LEADS].find_one({"id": doc["lead_id"]})
 
     return {
         "message": "Assignment accepted",
@@ -512,8 +588,98 @@ async def decline_assignment(
         },
     )
     lead = await db[COL_LEADS].find_one({"id": doc["lead_id"]})
+    if lead:
+        # Denorm is already cleared. Use the pre-decline status when this request never got past pending.
+        prior = str(doc.get("status") or "")
+        if prior == LeadCoachAssignmentStatus.PENDING.value and str(lead.get("status") or "").lower() == "assigned":
+            lead = {**lead, "status": "pending_acceptance"}
+        lead = await _set_pipeline_status(
+            db,
+            lead,
+            to_status="new",
+            note="Coach declined the request",
+            current_user=current_user,
+            only_from={"pending_acceptance"},
+        )
     return {
         "message": "Assignment declined",
         "assignment": _public(updated),
         "lead": lead_to_response_dict(serialize_doc(lead) or {}) if lead else None,
     }
+
+
+async def _accepted_assignment_for_coach(db, assignment_id: str, current_user: dict) -> dict:
+    doc = await _get_assignment_for_coach(db, assignment_id, current_user)
+    if doc.get("status") != LeadCoachAssignmentStatus.ACCEPTED.value:
+        raise HTTPException(
+            status_code=400,
+            detail="Accept the assignment before updating this lead.",
+        )
+    return doc
+
+
+async def coach_list_follow_ups(
+    assignment_id: str,
+    *,
+    current_user: dict,
+    skip: int = 0,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    doc = await _accepted_assignment_for_coach(db, assignment_id, current_user)
+    return await list_lead_follow_ups(
+        doc["lead_id"],
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+        access_already_checked=True,
+    )
+
+
+async def coach_create_follow_up(
+    assignment_id: str,
+    *,
+    note: Optional[str] = None,
+    action: str = "note",
+    status: Optional[str] = None,
+    next_follow_up_at=None,
+    clear_next_follow_up: bool = False,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    doc = await _accepted_assignment_for_coach(db, assignment_id, current_user)
+    return await create_lead_follow_up(
+        doc["lead_id"],
+        note=note,
+        action=action,
+        status=status,
+        next_follow_up_at=next_follow_up_at,
+        clear_next_follow_up=clear_next_follow_up,
+        current_user=current_user,
+        access_already_checked=True,
+    )
+
+
+async def coach_update_lead_status(
+    assignment_id: str,
+    *,
+    status: str,
+    note: Optional[str] = None,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    doc = await _accepted_assignment_for_coach(db, assignment_id, current_user)
+    lead = await update_lead_status_with_history(
+        doc["lead_id"],
+        status=status,
+        note=note,
+        current_user=current_user,
+        access_already_checked=True,
+    )
+    return {"message": "Lead status updated", "lead": lead}

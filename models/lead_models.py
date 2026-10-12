@@ -2,8 +2,21 @@ from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Literal, Optional
 
-LeadStatus = Literal["new", "contacted", "qualified", "converted", "lost"]
-LEAD_STATUSES = ("new", "contacted", "qualified", "converted", "lost")
+LeadStatus = Literal[
+    "new", "pending_acceptance", "assigned", "contacted", "qualified", "converted", "lost"
+]
+LEAD_STATUSES = (
+    "new",
+    "pending_acceptance",
+    "assigned",
+    "contacted",
+    "qualified",
+    "converted",
+    "lost",
+)
+
+LeadPriority = Literal["low", "medium", "high", "urgent"]
+LEAD_PRIORITIES = ("low", "medium", "high", "urgent")
 
 LeadFollowUpAction = Literal[
     "note", "call", "email", "meeting", "status_change", "scheduled", "other"
@@ -52,6 +65,7 @@ class LeadStatusUpdate(BaseModel):
     """Backward-compatible status PATCH. Optional note is logged to follow-up history."""
     status: LeadStatus
     note: Optional[str] = Field(default=None, max_length=2000)
+    priority: Optional[LeadPriority] = None
 
 
 class LeadFollowUpCreate(BaseModel):
@@ -99,6 +113,7 @@ class LeadResponse(BaseModel):
     branch_name: Optional[str] = None
     message: Optional[str] = None
     status: LeadStatus = "new"
+    priority: LeadPriority = "medium"
     phone_canonical: Optional[str] = None
     capture_count: int = 1
     last_captured_at: Optional[datetime] = None

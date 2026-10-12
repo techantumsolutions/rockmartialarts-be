@@ -2959,15 +2959,10 @@ class PaymentController:
                     raise HTTPException(status_code=403, detail="Student ID not found")
                 base_filter["student_id"] = student_id
             elif current_role == "branch_manager":
-                # Branch managers can only see stats from their managed branches
-                branch_manager_id = current_user.get("id")
-                if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-                # Find all branches managed by this branch manager
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-
-                if not managed_branches:
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if not managed_branch_ids:
                     return {
                         "total_collected": 0,
                         "pending_payments": 0,
@@ -2979,11 +2974,6 @@ class PaymentController:
                         "average_payment": 0,
                     }
 
-                # Get all branch IDs managed by this branch manager
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
-                print(f"Branch manager {branch_manager_id} manages branches for payment stats: {managed_branch_ids}")
-
-                # Filter by branch_id in branch_details
                 base_filter["branch_details.branch_id"] = {"$in": managed_branch_ids}
             elif current_role == "coach" or current_role == "coach_admin":
                 # Coaches can see stats from their assigned branch
@@ -3280,22 +3270,11 @@ class PaymentController:
                         # Hide cancelled attempts from student dashboard by default.
                         filter_query["payment_status"] = {"$ne": "cancelled"}
                 elif current_role == "branch_manager":
-                    # Branch managers can only see payments from their managed branches
-                    branch_manager_id = current_user.get("id")
-                    if not branch_manager_id:
-                        raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                    from utils.student_status_service import get_managed_branch_ids_for_user
 
-                    # Find all branches managed by this branch manager
-                    managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-
-                    if not managed_branches:
+                    managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                    if not managed_branch_ids:
                         return {"payments": []}
-
-                    # Get all branch IDs managed by this branch manager
-                    managed_branch_ids = [branch["id"] for branch in managed_branches]
-                    print(f"Branch manager {branch_manager_id} manages branches for payments: {managed_branch_ids}")
-
-                    # Filter payments by branch_id in branch_details
                     filter_query["branch_details.branch_id"] = {"$in": managed_branch_ids}
                 elif current_role == "coach" or current_role == "coach_admin":
                     # Coaches can see payments from their assigned branch
@@ -3771,8 +3750,10 @@ class PaymentController:
             if current_user:
                 user_role = current_user.get("role")
                 if user_role == UserRole.BRANCH_MANAGER.value:
-                    # Branch managers can only see payments from their managed branches
-                    managed_branches = current_user.get("managed_branches", [])
+                    from utils.student_status_service import get_managed_branch_ids_for_user
+
+                    db = get_db()
+                    managed_branches = await get_managed_branch_ids_for_user(db, current_user)
                     if managed_branches:
                         role_based_branches = managed_branches
                     else:

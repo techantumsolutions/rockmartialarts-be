@@ -563,8 +563,23 @@ async def disable_http_caching(request: Request, call_next):
         response.headers["Expires"] = "0"
         response.headers["Surrogate-Control"] = "no-store"
         # Helps some proxies/CDNs avoid coalescing stale variants.
-        response.headers["Vary"] = "Authorization, Cookie, Origin"
+        response.headers["Vary"] = "Authorization, Cookie, Origin, X-Active-Branch-Id"
     return response
+
+
+@app.middleware("http")
+async def bind_active_branch(request: Request, call_next):
+    """Remember the branch a branch manager selected so list queries stay on that branch."""
+    from utils.student_status_service import (
+        reset_request_active_branch_id,
+        set_request_active_branch_id,
+    )
+
+    token = set_request_active_branch_id(request.headers.get("x-active-branch-id"))
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_active_branch_id(token)
 
 # Include routers
 app.include_router(superadmin_router, prefix="/api/superadmin", tags=["Super Admin"])

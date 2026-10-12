@@ -328,20 +328,11 @@ class CourseController:
         managed_branch_ids = None
 
         if current_role == "branch_manager":
-            # Branch managers can only see courses from their managed branches
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-
-            if not managed_branches:
+            managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if not managed_branch_ids:
                 return {"courses": []}
-
-            # Get all branch IDs managed by this branch manager
-            managed_branch_ids = [branch["id"] for branch in managed_branches]
-            print(f"Branch manager {branch_manager_id} manages branches for courses: {managed_branch_ids}")
 
         courses = await db.courses.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
@@ -373,11 +364,23 @@ class CourseController:
                 ],
             }).to_list(length=100)
 
-            # Get student enrollment count
-            enrollment_count = await db.enrollments.count_documents({
-                "course_id": course["id"],
-                "is_active": True
-            })
+            # Student count. Branch managers see students enrolled in this course
+            # at their selected branch only; other roles keep the existing total.
+            if managed_branch_ids is not None:
+                student_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {
+                        "course_id": course["id"],
+                        "branch_id": {"$in": managed_branch_ids},
+                        "is_active": True,
+                    },
+                )
+                enrollment_count = len([student_id for student_id in student_ids if student_id])
+            else:
+                enrollment_count = await db.enrollments.count_documents({
+                    "course_id": course["id"],
+                    "is_active": True
+                })
 
             # Create enhanced course object
             enhanced_course = serialize_doc(course)
@@ -429,8 +432,14 @@ class CourseController:
             raise HTTPException(status_code=404, detail="Course not found")
 
         if current_user.get("role") == UserRole.BRANCH_MANAGER:
-            manager_id = current_user.get("id")
-            managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
+            from utils.student_status_service import get_managed_branch_ids_for_user
+
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
             if not any(
                 course_id in (b.get("assignments") or {}).get("courses", [])
                 for b in (managed_branches or [])
@@ -475,18 +484,14 @@ class CourseController:
             # Apply role-based access control
             current_role = current_user.get("role")
             if current_role == "branch_manager":
-                # Branch managers can only access courses from their managed branches
-                # Get the branch assignment from the branch manager's profile
-                branch_assignment = current_user.get("branch_assignment")
-                if branch_assignment and branch_assignment.get("branch_id"):
-                    managed_branch_id = branch_assignment["branch_id"]
-                    if managed_branch_id != branch_id:
-                        raise HTTPException(
-                            status_code=403,
-                            detail="You can only access courses from your managed branch"
-                        )
-                else:
-                    raise HTTPException(status_code=403, detail="No branch assigned to this manager")
+                from utils.student_status_service import get_managed_branch_ids_for_user
+
+                allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if branch_id not in allowed_ids:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You can only access courses from your selected branch",
+                    )
 
             # First, get the branch to find assigned courses
             branch = await db.branches.find_one({"id": branch_id})
@@ -503,7 +508,7 @@ class CourseController:
             courses = await db.courses.find({
                 "id": {"$in": course_ids},
                 "settings.active": True
-            }).to_list(length=100)
+            }).to_list(length=1000)
 
             # Enhance courses with additional data
             enhanced_courses = []
@@ -571,11 +576,14 @@ class CourseController:
 
         # Branch Manager permission check
         elif current_user["role"] == UserRole.BRANCH_MANAGER:
-            # Check if this course is assigned to any branch managed by this branch manager
-            manager_id = current_user["id"]
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Find branches managed by this branch manager
-            bm_managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            bm_managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
 
             if not bm_managed_branches:
                 raise HTTPException(status_code=403, detail="You don't manage any branches.")

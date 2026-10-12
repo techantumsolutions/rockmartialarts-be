@@ -162,6 +162,7 @@ class CoachController:
         area_of_expertise: Optional[str] = None,
         current_user: dict = None,
         approval_status: Optional[str] = None,
+        branch_id: Optional[str] = None,
     ):
         """Get coaches with filtering. Branch managers see only coaches in their managed branches."""
         db = get_db()
@@ -185,27 +186,37 @@ class CoachController:
                 filter_query["approval_status"] = status
 
         role = str((current_user or {}).get("role") or "").lower()
-        if current_user and role in {"branch_manager", "branch_admin", "branchmanager"}:
+        bid = (branch_id or "").strip()
+        if bid.lower() == "all":
+            bid = ""
+        is_branch_manager = role in {"branch_manager", "branch_admin", "branchmanager"}
+
+        if current_user and is_branch_manager:
             from utils.student_status_service import get_managed_branch_ids_for_user
 
+            # Live branches.manager_id for this login. branch_assignment can point at
+            # a branch this manager no longer manages.
             managed_branch_ids = [
                 str(x) for x in await get_managed_branch_ids_for_user(db, current_user) if x
             ]
-            # Coaches may be linked via branch_id and/or service_location_ids (registration).
-            branch_scope = (
-                {
-                    "$or": [
-                        {"branch_id": {"$in": managed_branch_ids}},
-                        {"service_location_ids": {"$in": managed_branch_ids}},
-                    ]
-                }
-                if managed_branch_ids
-                else {"id": {"$in": []}}
-            )
+            if bid and bid in managed_branch_ids:
+                branch_scope = {"branch_id": bid}
+            elif managed_branch_ids:
+                branch_scope = {"branch_id": {"$in": managed_branch_ids}}
+            else:
+                branch_scope = {"id": {"$in": []}}
             and_parts = list(filter_query.pop("$and", []) or [])
             if "$or" in filter_query:
                 and_parts.append({"$or": filter_query.pop("$or")})
             and_parts.append(branch_scope)
+            filter_query["$and"] = and_parts
+        elif bid:
+            # Super admin and other roles: coaches.branch_id == branches.id
+            assigned_scope = {"branch_id": bid}
+            and_parts = list(filter_query.pop("$and", []) or [])
+            if "$or" in filter_query:
+                and_parts.append({"$or": filter_query.pop("$or")})
+            and_parts.append(assigned_scope)
             filter_query["$and"] = and_parts
 
         coaches = await db.coaches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
@@ -603,6 +614,90 @@ class CoachController:
                     if assigned_course["id"] not in course_ids_seen:
                         courses.append(assigned_course)
 
+            # Batches for this coach's assigned courses, plus batches that name this coach.
+            match_ids = {str(coach_id)}
+            linked_user_id = str(coach.get("user_id") or "").strip()
+            if linked_user_id:
+                match_ids.add(linked_user_id)
+
+            coach_emails = set()
+            for raw_email in (
+                coach.get("email"),
+                (coach.get("contact_info") or {}).get("email") if isinstance(coach.get("contact_info"), dict) else None,
+            ):
+                if isinstance(raw_email, str) and raw_email.strip():
+                    coach_emails.add(raw_email.strip().lower())
+            if coach_emails:
+                # Batch trainer ids are sometimes the branch-manager record for the same person.
+                managers = await db.branch_managers.find(
+                    {},
+                    {"id": 1, "email": 1, "contact_info.email": 1},
+                ).to_list(length=200)
+                for manager in managers:
+                    manager_emails = set()
+                    for raw_email in (
+                        manager.get("email"),
+                        (manager.get("contact_info") or {}).get("email") if isinstance(manager.get("contact_info"), dict) else None,
+                    ):
+                        if isinstance(raw_email, str) and raw_email.strip():
+                            manager_emails.add(raw_email.strip().lower())
+                    if coach_emails & manager_emails and manager.get("id"):
+                        match_ids.add(str(manager["id"]))
+
+            assigned_course_ids = {course["id"] for course in courses}
+            coach_branch_id = str(coach.get("branch_id") or "").strip()
+
+            branch_filter = {"is_active": True}
+            role = str((current_user or {}).get("role") or "").lower()
+            is_branch_manager = role in {"branch_manager", "branch_admin", "branchmanager"}
+            if is_branch_manager:
+                from utils.student_status_service import get_managed_branch_ids_for_user
+
+                allowed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                branch_filter["id"] = {"$in": allowed_branch_ids or ["__none__"]}
+
+            schedule_branches = await db.branches.find(
+                branch_filter,
+                {"id": 1, "branch.name": 1, "assignments.course_schedule": 1},
+            ).to_list(length=500)
+
+            batches_by_course = {}
+            for branch in schedule_branches:
+                branch_name = ((branch.get("branch") or {}).get("name")) or "Branch"
+                schedule = ((branch.get("assignments") or {}).get("course_schedule")) or []
+                for entry in schedule:
+                    if not isinstance(entry, dict):
+                        continue
+                    course_id = str(entry.get("course_id") or entry.get("courseId") or "").strip()
+                    if not course_id:
+                        continue
+                    for index, batch in enumerate(entry.get("batches") or []):
+                        if not isinstance(batch, dict):
+                            continue
+                        trainer_id = str(batch.get("coach_id") or batch.get("coachId") or "").strip()
+                        trainer_match = bool(trainer_id) and trainer_id in match_ids
+                        on_coach_branch = is_branch_manager or (
+                            not coach_branch_id or str(branch.get("id") or "") == coach_branch_id
+                        )
+                        if not (trainer_match or (course_id in assigned_course_ids and on_coach_branch)):
+                            continue
+                        days = [str(day) for day in (batch.get("days") or []) if day]
+                        batch_name = str(batch.get("batch_name") or batch.get("name") or "").strip()
+                        batches_by_course.setdefault(course_id, []).append({
+                            "batch_name": batch_name or f"Batch {index + 1}",
+                            "days": days,
+                            "start_time": str(batch.get("start_time") or batch.get("startTime") or "").strip(),
+                            "end_time": str(batch.get("end_time") or batch.get("endTime") or "").strip(),
+                            "branch_id": branch.get("id"),
+                            "branch_name": branch_name,
+                        })
+
+            known_course_ids = {course["id"] for course in courses}
+            missing_course_ids = [cid for cid in batches_by_course if cid not in known_course_ids]
+            if missing_course_ids:
+                extra_courses = await db.courses.find({"id": {"$in": missing_course_ids}}).to_list(length=200)
+                courses.extend(extra_courses)
+
             # Enhance courses with additional data
             enhanced_courses = []
             for course in courses:
@@ -618,15 +713,17 @@ class CoachController:
                     "is_active": True
                 }).to_list(length=10)
 
+                course_batches = batches_by_course.get(course["id"], [])
                 enhanced_course = serialize_doc(course)
                 enhanced_course.update({
                     "name": course.get("title", course.get("name", "Unknown Course")),
                     "enrolled_students": enrollment_count,
                     "difficulty_level": course.get("difficulty_level", "Beginner"),
+                    "batches": course_batches,
                     "branch_assignments": [
                         {
                             "branch_id": branch["id"],
-                            "branch_name": branch["branch"]["name"]
+                            "branch_name": (branch.get("branch") or {}).get("name") or "Branch"
                         }
                         for branch in branches
                     ]
