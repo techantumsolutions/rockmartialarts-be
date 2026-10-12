@@ -10,12 +10,16 @@ from models.lead_coach_assignment_models import (
     LeadCoachAssignBody,
     LeadCoachDeclineBody,
 )
+from models.lead_models import LeadFollowUpCreate, LeadStatusUpdate
 from models.user_models import UserRole
 from utils.unified_auth import require_role_unified
 from utils.lead_coach_assignment_service import (
     accept_assignment,
     assign_coach_to_lead,
     cancel_lead_assignment,
+    coach_create_follow_up,
+    coach_list_follow_ups,
+    coach_update_lead_status,
     decline_assignment,
     get_lead_assignment,
     list_eligible_coaches,
@@ -99,4 +103,47 @@ async def api_decline(
 ):
     return await decline_assignment(
         assignment_id, body or LeadCoachDeclineBody(), current_user=current_user
+    )
+
+
+@coach_assignment_router.get("/{assignment_id}/follow-ups")
+async def api_coach_list_follow_ups(
+    assignment_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: dict = Depends(require_role_unified(_COACH)),
+):
+    return await coach_list_follow_ups(
+        assignment_id, current_user=current_user, skip=skip, limit=limit
+    )
+
+
+@coach_assignment_router.post("/{assignment_id}/follow-ups", status_code=201)
+async def api_coach_create_follow_up(
+    assignment_id: str,
+    body: LeadFollowUpCreate,
+    current_user: dict = Depends(require_role_unified(_COACH)),
+):
+    return await coach_create_follow_up(
+        assignment_id,
+        note=body.note,
+        action=body.action,
+        status=body.status,
+        next_follow_up_at=body.next_follow_up_at,
+        clear_next_follow_up=body.clear_next_follow_up,
+        current_user=current_user,
+    )
+
+
+@coach_assignment_router.patch("/{assignment_id}/lead-status")
+async def api_coach_update_lead_status(
+    assignment_id: str,
+    body: LeadStatusUpdate,
+    current_user: dict = Depends(require_role_unified(_COACH)),
+):
+    return await coach_update_lead_status(
+        assignment_id,
+        status=body.status,
+        note=body.note,
+        current_user=current_user,
     )

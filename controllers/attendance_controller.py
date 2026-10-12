@@ -272,16 +272,13 @@ class AttendanceController:
             # Apply role-based filtering for branch managers
             managed_branch_ids = None
             if current_user and current_user.get("role") == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                if not managed_branches:
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if not managed_branch_ids:
                     return {"students": [], "total": 0}
 
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
-                # Prefer an explicit branch_id when it belongs to this manager; otherwise all managed.
+                # Selected branch only. An explicit branch_id is used when it is that branch.
                 if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
                     filter_query["branch_id"] = branch_id
                 else:
@@ -528,15 +525,11 @@ class AttendanceController:
             # Apply role-based filtering for branch managers
             managed_branch_ids = None
             if current_user and current_user.get("role") == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                if not managed_branches:
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if not managed_branch_ids:
                     return {"coaches": [], "total": 0}
-
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
                 coach_filter["branch_id"] = {"$in": managed_branch_ids}
 
             if branch_id and current_user.get("role") != "branch_manager":
@@ -721,12 +714,10 @@ class AttendanceController:
 
             # Apply role-based filtering for branch managers
             if current_user and current_user.get("role") == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                if not branch_manager_id:
-                    raise HTTPException(status_code=403, detail="Branch manager ID not found")
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                if not managed_branches:
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if not managed_branch_ids:
                     return {
                         "total_students": 0,
                         "total_coaches": 0,
@@ -741,7 +732,6 @@ class AttendanceController:
                         "coach_attendance_rate": 0
                     }
 
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
                 filter_query["branch_id"] = {"$in": managed_branch_ids}
 
             if branch_id and current_user.get("role") != "branch_manager":
@@ -1137,10 +1127,9 @@ class AttendanceController:
 
             # If branch manager, verify they can mark attendance for this coach
             if user_role == "branch_manager":
-                branch_manager_id = current_user.get("id")
-                managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-                managed_branch_ids = [branch["id"] for branch in managed_branches]
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
+                managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
                 if attendance_data.branch_id not in managed_branch_ids:
                     raise HTTPException(status_code=403, detail="Cannot mark attendance for coaches outside your managed branches")
 

@@ -37,13 +37,14 @@ class BranchesWithCoursesController:
         # Apply role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
-            # Branch managers can only access branches they manage
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
 
             if not managed_branches:
                 return {
@@ -251,15 +252,14 @@ class BranchesWithCoursesController:
         # Apply role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
-            # Branch managers can only access branches they manage
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Verify this branch is managed by the current branch manager
-            managed_branch = await db.branches.find_one({"id": branch_id, "manager_id": branch_manager_id, "is_active": True})
-            if not managed_branch:
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if branch_id not in allowed_ids:
                 raise HTTPException(status_code=403, detail="You don't have permission to access this branch")
+            managed_branch = await db.branches.find_one({"id": branch_id})
+            if not managed_branch:
+                raise HTTPException(status_code=404, detail="Branch not found")
         else:
             # For other roles, just check if branch exists
             managed_branch = await db.branches.find_one({"id": branch_id})

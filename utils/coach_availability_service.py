@@ -342,6 +342,10 @@ async def update_availability(
     if overlap:
         raise HTTPException(status_code=400, detail=overlap)
 
+    from utils.coach_batch_schedule import assert_availability_covers_assigned_batches
+
+    await assert_availability_covers_assigned_batches(db, coach, weekly_slots)
+
     now = datetime.utcnow()
     existing = await db[COL].find_one({"coach_id": coach_id})
     doc = {

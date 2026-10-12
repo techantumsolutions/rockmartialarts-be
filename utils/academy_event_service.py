@@ -152,6 +152,7 @@ async def list_academy_events(
     search: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -165,7 +166,13 @@ async def list_academy_events(
         if event_type not in ACADEMY_EVENT_TYPES:
             raise HTTPException(status_code=400, detail=f"Invalid event_type: {event_type}")
         q["event_type"] = event_type
-    if branch_id and branch_id != "all":
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user or {})
+        q["branch_id"] = {"$in": allowed or ["__none__"]}
+    elif branch_id and branch_id != "all":
         q["branch_id"] = branch_id
     if search and search.strip():
         s = search.strip()
@@ -190,13 +197,20 @@ async def list_academy_events(
     return {"events": out, "total": total, "skip": skip, "limit": limit}
 
 
-async def get_academy_event(event_id: str) -> Dict[str, Any]:
+async def get_academy_event(event_id: str, current_user: Optional[dict] = None) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     doc = await db[COL].find_one({"id": event_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Event not found")
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user or {})
+        if str(doc.get("branch_id") or "") not in allowed:
+            raise HTTPException(status_code=404, detail="Event not found")
     return {"event": await _enrich(db, doc)}
 
 
@@ -300,6 +314,15 @@ async def create_academy_event(
         raise HTTPException(status_code=500, detail="Database connection not available")
     await ensure_academy_event_indexes(db)
 
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user)
+        if len(allowed) == 1:
+            body = body.model_copy(update={"branch_id": allowed[0]})
+        elif not body.branch_id or body.branch_id not in allowed:
+            raise HTTPException(status_code=403, detail="You can only manage events for your selected branch")
     branch_id = await _validate_branch(db, body.branch_id)
     now = datetime.utcnow()
     status = (

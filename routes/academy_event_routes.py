@@ -70,6 +70,7 @@ async def admin_list_events(
         search=search,
         skip=skip,
         limit=limit,
+        current_user=current_user,
     )
 
 
@@ -86,7 +87,7 @@ async def admin_get_event(
     event_id: str,
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    return await get_academy_event(event_id)
+    return await get_academy_event(event_id, current_user=current_user)
 
 
 @router.patch("/{event_id}")

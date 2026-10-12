@@ -76,6 +76,7 @@ async def api_list_champions(
         limit=limit,
         include_archived=include_archived,
         published_only=published_only,
+        current_user=current_user,
     )
 
 
@@ -162,7 +163,7 @@ async def api_get_champion(
     champion_id: str,
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    return await get_champion(champion_id)
+    return await get_champion(champion_id, current_user=current_user)
 
 
 @router.patch("/{champion_id}")

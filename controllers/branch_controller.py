@@ -143,15 +143,14 @@ class BranchController:
         current_role = current_user.get("role")
 
         if current_role == "branch_manager":
-            # Branch managers can only see branches they manage
-            # The unified auth system populates managed_branches array
-            managed_branches = current_user.get("managed_branches", [])
+            # Full assigned list (not the selected branch) so the header switch can list them.
+            from utils.student_status_service import get_assigned_branch_ids_for_user
+
+            managed_branches = await get_assigned_branch_ids_for_user(db, current_user)
 
             if managed_branches:
-                # Filter to only show branches managed by this branch manager
                 filter_query["id"] = {"$in": managed_branches}
             else:
-                # If no branches are managed, return empty result
                 return {
                     "branches": [],
                     "total_count": 0,
@@ -762,6 +761,18 @@ class BranchController:
         # would erase saved batch data — carry forward the previous schedule.
         if "assignments" in update_data and isinstance(update_data["assignments"], dict):
             new_asg = update_data["assignments"]
+            if "course_schedule" in new_asg:
+                from utils.coach_batch_schedule import assert_batch_coach_assignments
+
+                branch_payload = update_data.get("branch") if isinstance(update_data.get("branch"), dict) else {}
+                existing_branch = existing_for_geo.get("branch") if isinstance(existing_for_geo.get("branch"), dict) else {}
+                branch_name = branch_payload.get("name") or existing_branch.get("name") or "Branch"
+                await assert_batch_coach_assignments(
+                    db,
+                    branch_id,
+                    branch_name,
+                    new_asg.get("course_schedule") or [],
+                )
             if "course_schedule" not in new_asg:
                 prev_doc = await db.branches.find_one(
                     {"id": branch_id},

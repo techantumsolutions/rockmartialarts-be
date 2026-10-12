@@ -106,6 +106,7 @@ async def list_champions(
     limit: int = 50,
     include_archived: bool = False,
     published_only: bool = False,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -130,6 +131,13 @@ async def list_champions(
             {"short_bio": {"$regex": term, "$options": "i"}},
         ]
 
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user)
+        q["branch_id"] = {"$in": allowed or ["__none__"]}
+
     skip = max(0, skip)
     limit = max(1, min(limit, 200))
     total = await db[COL].count_documents(q)
@@ -149,7 +157,7 @@ async def list_champions(
     }
 
 
-async def get_champion(champion_id: str) -> Dict[str, Any]:
+async def get_champion(champion_id: str, current_user: Optional[dict] = None) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
@@ -158,6 +166,13 @@ async def get_champion(champion_id: str) -> Dict[str, Any]:
         doc = await db[COL].find_one({"slug": champion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Champion not found")
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user or {})
+        if str(doc.get("branch_id") or "") not in allowed:
+            raise HTTPException(status_code=404, detail="Champion not found")
     return {"champion": enrich_champion(doc)}
 
 
@@ -170,6 +185,16 @@ async def create_champion(
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     await ensure_champion_indexes(db)
+
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user or {})
+        if len(allowed) == 1:
+            body.branch_id = allowed[0]
+        if not body.branch_id or body.branch_id not in allowed:
+            raise HTTPException(status_code=403, detail="You can only manage champions for your selected branch")
 
     student_name = await _resolve_student_name(db, body.student_id)
     # If linked, prefer student display name when name omitted is same — name is required
