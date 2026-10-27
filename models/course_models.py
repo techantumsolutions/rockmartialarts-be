@@ -78,6 +78,10 @@ class Course(BaseModel):
     # Public course page: hero_section (bullet_points[]), about_section (content_blocks: [{ title, description, bullet_points[], image? }]), etc.
     page_content: Optional[Dict[str, Any]] = None
     seo: Optional[CourseSEO] = None
+    created_by: Optional[str] = None
+    created_by_role: Optional[str] = None
+    created_by_name: Optional[str] = None
+    branch_ids: Optional[List[str]] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -99,6 +103,10 @@ class CourseCreate(BaseModel):
     settings: Settings
     page_content: Optional[Dict[str, Any]] = None
     seo: Optional[CourseSEO] = None
+    created_by: Optional[str] = None
+    created_by_role: Optional[str] = None
+    created_by_name: Optional[str] = None
+    branch_ids: Optional[List[str]] = None
 
 class CourseUpdate(BaseModel):
     title: Optional[str] = None
