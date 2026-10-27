@@ -106,6 +106,11 @@ class EnrollmentController:
         current_user: dict = Depends(get_current_active_user)
     ):
         """Get enrollments with filtering"""
+        # Resolve DB at call time (module-level `db` import can stay None after init_db)
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         filter_query = {}
         if student_id:
             filter_query["student_id"] = student_id
@@ -131,12 +136,29 @@ class EnrollmentController:
 
         enrollments = await db.enrollments.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         student_ids = list({e.get("student_id") for e in enrollments if e.get("student_id")})
+        course_ids = list({e.get("course_id") for e in enrollments if e.get("course_id")})
+        branch_ids = list({e.get("branch_id") for e in enrollments if e.get("branch_id")})
+
         users = (
             await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids))
             if student_ids
             else []
         )
+        courses = (
+            await db.courses.find({"id": {"$in": course_ids}}).to_list(length=len(course_ids))
+            if course_ids
+            else []
+        )
+        branches = (
+            await db.branches.find({"id": {"$in": branch_ids}}).to_list(length=len(branch_ids))
+            if branch_ids
+            else []
+        )
+
         user_map = {u["id"]: u for u in users}
+        course_map = {c["id"]: c for c in courses}
+        branch_map = {b["id"]: b for b in branches}
+
         enriched = []
         for e in enrollments:
             doc = serialize_doc(e)
@@ -145,8 +167,33 @@ class EnrollmentController:
                 doc["student_name"] = (
                     u.get("full_name")
                     or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                    or u.get("email")
                     or "Student"
                 )
+            else:
+                doc["student_name"] = "Unknown student"
+
+            c = course_map.get(e.get("course_id"))
+            if c:
+                doc["course_name"] = (
+                    c.get("title")
+                    or c.get("name")
+                    or c.get("course_name")
+                    or "Course"
+                )
+            else:
+                doc["course_name"] = "Unknown course"
+
+            b = branch_map.get(e.get("branch_id"))
+            if b:
+                doc["branch_name"] = (
+                    (b.get("branch") or {}).get("name")
+                    or b.get("name")
+                    or "Branch"
+                )
+            else:
+                doc["branch_name"] = "Unknown branch"
+
             enriched.append(doc)
         return {"enrollments": enriched}
 
