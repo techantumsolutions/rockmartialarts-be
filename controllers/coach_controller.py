@@ -163,8 +163,9 @@ class CoachController:
         current_user: dict = None,
         approval_status: Optional[str] = None,
         branch_id: Optional[str] = None,
+        course_id: Optional[str] = None,
     ):
-        """Get coaches with filtering. Branch managers see only coaches in their managed branches."""
+        """Get coaches with filters. Branch managers see only coaches in their managed branches."""
         db = get_db()
         
         filter_query = {}
@@ -184,6 +185,20 @@ class CoachController:
                 ]
             elif status in ("pending", "rejected"):
                 filter_query["approval_status"] = status
+
+        if course_id:
+            course = await db.courses.find_one({"id": course_id})
+            if not course:
+                raise HTTPException(status_code=404, detail="Course not found")
+
+            course_conditions = [
+                {"assignment_details.courses": course_id},
+                {"areas_of_expertise": {"$in": [course_id]}},
+            ]
+            instructor_id = course.get("instructor_id")
+            if instructor_id:
+                course_conditions.append({"id": instructor_id})
+            filter_query.setdefault("$and", []).append({"$or": course_conditions})
 
         role = str((current_user or {}).get("role") or "").lower()
         bid = (branch_id or "").strip()
