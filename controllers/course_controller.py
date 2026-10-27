@@ -293,6 +293,35 @@ class CourseController:
             settings["active"] = True
         course_dict["settings"] = settings
 
+        # Store creator information
+        creator_id = current_user.get("id")
+        creator_role = current_user.get("role")
+        creator_name = current_user.get("full_name") or f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip()
+        course_dict["created_by"] = creator_id
+        course_dict["created_by_role"] = str(creator_role) if creator_role else None
+        course_dict["created_by_name"] = creator_name or None
+
+        current_role = current_user.get("role")
+        if current_role == UserRole.BRANCH_MANAGER or str(current_role) == "branch_manager":
+            from utils.student_status_service import get_managed_branch_ids_for_user
+            from utils.branch_courses import upsert_branch_course
+
+            managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+            course_dict["branch_ids"] = managed_branch_ids or []
+
+            await db.courses.insert_one(course_dict)
+
+            # Automatically assign this course to the branch manager's managed branch(es)
+            if managed_branch_ids:
+                for b_id in managed_branch_ids:
+                    try:
+                        await upsert_branch_course(db, b_id, course.id, is_available=True)
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).error(f"Failed to auto-assign course {course.id} to branch {b_id}: {e}")
+
+            return {"message": "Course created successfully", "course_id": course.id}
+
         await db.courses.insert_one(course_dict)
         return {"message": "Course created successfully", "course_id": course.id}
 
@@ -351,8 +380,28 @@ class CourseController:
 
             branches = await db.branches.find(branch_query).to_list(length=100)
 
+            # Check if this course was created by this branch manager
+            is_created_by_manager = (
+                current_role == "branch_manager" and (
+                    course.get("created_by") == current_user.get("id") or
+                    (managed_branch_ids and any(bid in (course.get("branch_ids") or []) for bid in managed_branch_ids))
+                )
+            )
+
+            # If created by this branch manager but not yet assigned to their branch(es),
+            # auto-assign to their managed branch(es) so it is available
+            if is_created_by_manager and len(branches) == 0 and managed_branch_ids:
+                from utils.branch_courses import upsert_branch_course
+                for mb_id in managed_branch_ids:
+                    try:
+                        await upsert_branch_course(db, mb_id, course["id"], is_available=True)
+                    except Exception:
+                        pass
+                branches = await db.branches.find(branch_query).to_list(length=100)
+
             # For branch managers, skip courses that aren't assigned to any of their managed branches
-            if managed_branch_ids is not None and len(branches) == 0:
+            # and were not created by them
+            if managed_branch_ids is not None and len(branches) == 0 and not is_created_by_manager:
                 continue
 
             # Get instructor assignments (coaches assigned to this course)
@@ -440,7 +489,11 @@ class CourseController:
                 if allowed_ids
                 else []
             )
-            if not any(
+            is_creator = (
+                course.get("created_by") == current_user.get("id") or
+                (allowed_ids and any(bid in (course.get("branch_ids") or []) for bid in allowed_ids))
+            )
+            if not is_creator and not any(
                 course_id in (b.get("assignments") or {}).get("courses", [])
                 for b in (managed_branches or [])
             ):
@@ -596,7 +649,11 @@ class CourseController:
                     course_assigned_to_managed_branch = True
                     break
 
-            if not course_assigned_to_managed_branch:
+            is_creator = (
+                existing_course.get("created_by") == current_user.get("id") or
+                (allowed_ids and any(bid in (existing_course.get("branch_ids") or []) for bid in allowed_ids))
+            )
+            if not course_assigned_to_managed_branch and not is_creator:
                 raise HTTPException(status_code=403, detail="You can only update courses assigned to branches you manage.")
 
         # Branch managers may only merge branch-specific fees (branch_pricing) for their branches
