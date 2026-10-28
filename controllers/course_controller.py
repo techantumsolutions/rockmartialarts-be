@@ -16,6 +16,7 @@ from utils.course_hierarchy import (
     name_slug,
 )
 from utils.branch_courses import available_course_ids_for_branch, assert_course_available_at_branch
+from utils.subscription_dates import is_subscription_period_over
 from controllers.student_showcase_achievement_controller import list_for_course_with_fallback
 
 logger = logging.getLogger(__name__)
@@ -805,6 +806,43 @@ class CourseController:
         return {"message": "Course updated successfully"}
 
     @staticmethod
+    def _enrollment_is_completed(enrollment: dict) -> bool:
+        """
+        Completed for course stats:
+        - explicit status completed, or progress >= 100
+        - enrollment period finished (end_date over)
+        - inactive enrollment that was not cancelled
+        Cancelled / superseded rows are not completed.
+        """
+        if enrollment.get("superseded_by_enrollment_id"):
+            return False
+
+        status = str(enrollment.get("status") or "").strip().lower()
+        payment_status = str(enrollment.get("payment_status") or "").strip().lower()
+        if status in {"cancelled", "canceled"} or payment_status in {"cancelled", "canceled"}:
+            return False
+
+        if status == "completed":
+            return True
+
+        progress = enrollment.get("progress_percent")
+        if progress is None:
+            progress = enrollment.get("progress")
+        try:
+            if progress is not None and float(progress) >= 100:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        if is_subscription_period_over(enrollment.get("end_date")):
+            return True
+
+        if enrollment.get("is_active") is False:
+            return True
+
+        return False
+
+    @staticmethod
     async def get_course_stats(
         course_id: str,
         current_user: dict = None
@@ -818,11 +856,32 @@ class CourseController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
-        active_enrollments = await db.enrollments.count_documents({"course_id": course_id, "is_active": True})
+        enrollments = await db.enrollments.find({"course_id": course_id}).to_list(length=None)
+        # Prefer current rows; ignore superseded renewals so totals stay accurate
+        current_rows = [
+            e for e in enrollments
+            if not e.get("superseded_by_enrollment_id")
+        ]
+        if not current_rows:
+            current_rows = enrollments
+
+        student_ids = {e.get("student_id") for e in current_rows if e.get("student_id")}
+        completed_student_ids = {
+            e.get("student_id")
+            for e in current_rows
+            if e.get("student_id") and CourseController._enrollment_is_completed(e)
+        }
+        active_enrollments = sum(1 for e in current_rows if e.get("is_active", True))
+        total_enrolled = len(student_ids)
+        completed = len(completed_student_ids)
+        completion_rate = int(round((completed / total_enrolled) * 100)) if total_enrolled else 0
 
         stats = {
             "course_details": serialize_doc(course),
-            "active_enrollments": active_enrollments
+            "total_enrolled": total_enrolled,
+            "active_enrollments": active_enrollments,
+            "completed": completed,
+            "completion_rate": completion_rate,
         }
         return stats
 
