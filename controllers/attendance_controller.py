@@ -276,10 +276,22 @@ class AttendanceController:
 
                 managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
                 if not managed_branch_ids:
+                    if date:
+                        return {
+                            "students": [],
+                            "date": date,
+                            "total": 0,
+                            "attendance_marked": 0,
+                        }
                     return {"students": [], "total": 0}
 
-                # Selected branch only. An explicit branch_id is used when it is that branch.
-                if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
+                # Selected branch only. If branch_id is specified, it must be in the managed branches.
+                if branch_id:
+                    if str(branch_id) not in {str(b) for b in managed_branch_ids}:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Branch Manager cannot view attendance for other branches",
+                        )
                     filter_query["branch_id"] = branch_id
                 else:
                     filter_query["branch_id"] = {"$in": managed_branch_ids}
@@ -339,11 +351,21 @@ class AttendanceController:
                 enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
                 if must_filter_by_enrollment or user_role in ["branch_manager", "coach", "coach_admin"]:
                     enrolled_student_ids = set(
-                        enrollment.get("student_id")
+                        str(enrollment.get("student_id"))
                         for enrollment in enrollments
                         if enrollment.get("student_id")
                     )
-                    students = [student for student in students if student.get("id") in enrolled_student_ids]
+                    students = [student for student in students if str(student.get("id")) in enrolled_student_ids]
+
+                # Ensure unique students (multiple enrollments do not duplicate a student)
+                seen_student_ids = set()
+                unique_students = []
+                for student in students:
+                    sid = str(student.get("id") or "")
+                    if sid and sid not in seen_student_ids:
+                        seen_student_ids.add(sid)
+                        unique_students.append(student)
+                students = unique_students
 
                 # Get attendance records for the specific date
                 attendance_records = await db.attendance.find(filter_query).to_list(length=None)
@@ -390,8 +412,14 @@ class AttendanceController:
                 course_by_id = {c.get("id"): c for c in course_docs if c.get("id")}
 
                 result_students = []
+                target_branch_id = None
+                if branch_id and (not managed_branch_ids or str(branch_id) in {str(b) for b in managed_branch_ids}):
+                    target_branch_id = str(branch_id)
+                elif managed_branch_ids and len(managed_branch_ids) == 1:
+                    target_branch_id = str(managed_branch_ids[0])
+
                 for student in students:
-                    student_id = student.get("id")
+                    student_id = str(student.get("id"))
                     attendance_info = attendance_map.get(student_id, {
                         "id": None,
                         "attendance_id": None,
@@ -407,7 +435,7 @@ class AttendanceController:
                     })
 
                     # Get student's enrollments for course information
-                    student_enrollments = [e for e in enrollments if e.get("student_id") == student_id]
+                    student_enrollments = [e for e in enrollments if str(e.get("student_id")) == student_id]
                     courses = []
 
                     for enrollment in student_enrollments:
@@ -421,11 +449,27 @@ class AttendanceController:
                                 "course_name": course.get("name", course.get("title", "Unknown Course"))
                             })
 
+                    enrolled_branch_ids = [
+                        str(e.get("branch_id")) for e in student_enrollments if e.get("branch_id")
+                    ]
+                    # Ensure branch_id accurately reflects the authorized/scoped branch
+                    student_branch_id = (
+                        (target_branch_id if target_branch_id and (target_branch_id in enrolled_branch_ids or not enrolled_branch_ids) else None)
+                        or (enrolled_branch_ids[0] if enrolled_branch_ids else None)
+                        or (str(student.get("branch_id")) if student.get("branch_id") else None)
+                        or (str(managed_branch_ids[0]) if managed_branch_ids else None)
+                    )
+
+                    all_branch_ids = list(dict.fromkeys(
+                        ([student_branch_id] if student_branch_id else []) + enrolled_branch_ids
+                    ))
+
                     result_students.append({
                         "id": student_id,
                         "full_name": student.get("full_name", "Unknown"),
                         "email": student.get("email", ""),
-                        "branch_id": student_enrollments[0]["branch_id"] if student_enrollments else None,
+                        "branch_id": student_branch_id,
+                        "branches": [{"id": bid} for bid in all_branch_ids],
                         "courses": courses,
                         "attendance": attendance_info
                     })
@@ -502,6 +546,8 @@ class AttendanceController:
                     "total": len(serialized_students)
                 }
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
 
