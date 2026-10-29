@@ -103,6 +103,85 @@ async def write_export_audit(
         pass
 
 
+async def _enrich_named_entity_rows(db, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add readable student/course/branch names for enrollment and renewal (payment) rows."""
+    student_cache: Dict[str, str] = {}
+    course_cache: Dict[str, str] = {}
+    branch_cache: Dict[str, str] = {}
+
+    async def _student_name(sid: str) -> str:
+        if sid in student_cache:
+            return student_cache[sid]
+        user = await db.users.find_one({"id": sid})
+        name = ""
+        if user:
+            name = (
+                user.get("full_name")
+                or f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+                or user.get("email")
+                or ""
+            )
+        student_cache[sid] = name or sid
+        return student_cache[sid]
+
+    async def _course_name(cid: str) -> str:
+        if cid in course_cache:
+            return course_cache[cid]
+        course = await db.courses.find_one({"id": cid})
+        name = ""
+        if course:
+            name = course.get("title") or course.get("name") or ""
+        course_cache[cid] = name or cid
+        return course_cache[cid]
+
+    async def _branch_name(bid: str) -> str:
+        if bid in branch_cache:
+            return branch_cache[bid]
+        branch = await db.branches.find_one({"id": bid})
+        name = ""
+        if branch:
+            name = ((branch.get("branch") or {}).get("name")) or branch.get("name") or ""
+        branch_cache[bid] = name or bid
+        return branch_cache[bid]
+
+    enriched: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        sid = str(item.get("student_id") or item.get("user_id") or "").strip()
+        cid = str(item.get("course_id") or "").strip()
+        bid = str(item.get("branch_id") or "").strip()
+
+        course_details = item.get("course_details") if isinstance(item.get("course_details"), dict) else {}
+        branch_details = item.get("branch_details") if isinstance(item.get("branch_details"), dict) else {}
+
+        if sid:
+            item["student_name"] = await _student_name(sid)
+        if cid:
+            item["course_name"] = (
+                course_details.get("course_name")
+                or course_details.get("name")
+                or course_details.get("title")
+                or await _course_name(cid)
+            )
+        elif course_details.get("course_name") or course_details.get("name") or course_details.get("title"):
+            item["course_name"] = (
+                course_details.get("course_name")
+                or course_details.get("name")
+                or course_details.get("title")
+            )
+        if bid:
+            item["branch_name"] = (
+                branch_details.get("branch_name")
+                or branch_details.get("name")
+                or await _branch_name(bid)
+            )
+        elif branch_details.get("branch_name") or branch_details.get("name"):
+            item["branch_name"] = branch_details.get("branch_name") or branch_details.get("name")
+
+        enriched.append(item)
+    return enriched
+
+
 async def list_operational(
     collection: str,
     current_user: dict,
@@ -126,7 +205,10 @@ async def list_operational(
     coll = db[collection]
     total = await coll.count_documents(q)
     rows = await coll.find(q).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
-    return {"rows": serialize_doc(rows), "total": total, "skip": skip, "limit": limit}
+    serialized = serialize_doc(rows)
+    if collection in ("enrollments", "payments") and isinstance(serialized, list):
+        serialized = await _enrich_named_entity_rows(db, serialized)
+    return {"rows": serialized, "total": total, "skip": skip, "limit": limit}
 
 
 async def export_operational(
@@ -199,6 +281,8 @@ async def export_operational(
 
     rows = await coll.find(q).sort("created_at", -1).limit(10000).to_list(length=10000)
     serialized = serialize_doc(rows) or []
+    if collection in ("enrollments", "payments") and isinstance(serialized, list):
+        serialized = await _enrich_named_entity_rows(db, serialized)
     if not fieldnames and serialized:
         fieldnames = list(serialized[0].keys())[:20]
     fieldnames = fieldnames or ["id"]
@@ -223,6 +307,8 @@ async def _run_export_job(
         await db.export_jobs.update_one({"id": job_id}, {"$set": {"status": "processing"}})
         rows = await db[collection].find(query).sort("created_at", -1).limit(50000).to_list(length=50000)
         serialized = serialize_doc(rows) or []
+        if collection in ("enrollments", "payments") and isinstance(serialized, list):
+            serialized = await _enrich_named_entity_rows(db, serialized)
         fn = fieldnames or (list(serialized[0].keys())[:20] if serialized else ["id"])
         content = _to_csv(serialized, fn) if fmt == "csv" else _to_excel_xml(serialized, fn)
         await db.export_jobs.update_one(
