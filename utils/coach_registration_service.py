@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -219,7 +220,7 @@ async def register_coach(
         "last_name": body.last_name.strip(),
         "full_name": full_name,
         "role": "coach",
-        "password_hash": hash_password(body.password),
+        "password_hash": hash_password(body.password or secrets.token_urlsafe(32)),
         "profile_image_url": (body.profile_image_url or "").strip() or None,
         "about_short": (body.about_short or "").strip() or None,
         "featured_on_homepage": False,

@@ -72,7 +72,7 @@ class CoachRegistrationCreate(BaseModel):
     email: EmailStr
     country_code: str = Field(default="+91", max_length=8)
     phone: str = Field(..., min_length=5, max_length=20)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
     address: str = Field(..., min_length=1, max_length=300)
     area: str = Field(default="", max_length=120)
     city: str = Field(..., min_length=1, max_length=120)
