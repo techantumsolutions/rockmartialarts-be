@@ -751,76 +751,262 @@ class CoachController:
             raise HTTPException(status_code=500, detail=f"Error fetching coach courses: {str(e)}")
 
     @staticmethod
+    async def _coach_match_ids(db, coach: dict, coach_id: str) -> set:
+        """IDs that may appear as batch trainer (coach id, linked user, same-email managers)."""
+        match_ids = {str(coach_id)}
+        linked_user_id = str(coach.get("user_id") or "").strip()
+        if linked_user_id:
+            match_ids.add(linked_user_id)
+
+        coach_emails = set()
+        for raw_email in (
+            coach.get("email"),
+            (coach.get("contact_info") or {}).get("email") if isinstance(coach.get("contact_info"), dict) else None,
+        ):
+            if isinstance(raw_email, str) and raw_email.strip():
+                coach_emails.add(raw_email.strip().lower())
+        if coach_emails:
+            managers = await db.branch_managers.find(
+                {},
+                {"id": 1, "email": 1, "contact_info.email": 1},
+            ).to_list(length=200)
+            for manager in managers:
+                manager_emails = set()
+                for raw_email in (
+                    manager.get("email"),
+                    (manager.get("contact_info") or {}).get("email") if isinstance(manager.get("contact_info"), dict) else None,
+                ):
+                    if isinstance(raw_email, str) and raw_email.strip():
+                        manager_emails.add(raw_email.strip().lower())
+                if coach_emails & manager_emails and manager.get("id"):
+                    match_ids.add(str(manager["id"]))
+        return match_ids
+
+    @staticmethod
     async def get_coach_students(coach_id: str, current_user: dict = None):
-        """Get students enrolled in courses taught by a specific coach"""
+        """Get students enrolled in courses/batches taught by a specific coach."""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
 
-        # Verify coach exists
         coach = await db.coaches.find_one({"id": coach_id})
         if not coach:
             raise HTTPException(status_code=404, detail="Coach not found")
 
-        # Permission check: coaches can only view their own students unless admin
         if current_user["role"] == UserRole.COACH and current_user["id"] != coach_id:
             raise HTTPException(status_code=403, detail="You can only view your own students")
 
         try:
-            # Get courses taught by this coach
-            course_ids = []
+            course_ids: List[str] = []
 
-            # Get courses where this coach is the instructor
             instructor_courses = await db.courses.find({
                 "instructor_id": coach_id,
                 "settings.active": True
             }).to_list(length=100)
             course_ids.extend([course["id"] for course in instructor_courses])
 
-            # Also get courses from coach's assignment_details
-            assigned_course_ids = coach.get("assignment_details", {}).get("courses", [])
-            course_ids.extend(assigned_course_ids)
+            assigned_course_ids = coach.get("assignment_details", {}).get("courses", []) or []
+            course_ids.extend([cid for cid in assigned_course_ids if cid])
+            course_ids = list({str(cid) for cid in course_ids if cid})
 
-            # Remove duplicates
-            course_ids = list(set(course_ids))
+            coach_branch_id = str(coach.get("branch_id") or "").strip()
+            match_ids = await CoachController._coach_match_ids(db, coach, coach_id)
+
+            # Resolve batches for this coach from branch schedules (for filters + batch names).
+            branch_query: dict = {"is_active": True}
+            if coach_branch_id:
+                branch_query["id"] = coach_branch_id
+            schedule_branches = await db.branches.find(
+                branch_query,
+                {"id": 1, "branch.name": 1, "assignments.course_schedule": 1},
+            ).to_list(length=500)
+
+            batch_lookup = {}  # batch_ref -> meta
+            batches_for_filters = []
+            course_ids_from_batches = set()
+
+            for branch in schedule_branches:
+                branch_name = ((branch.get("branch") or {}).get("name")) or "Branch"
+                schedule = ((branch.get("assignments") or {}).get("course_schedule")) or []
+                for entry in schedule:
+                    if not isinstance(entry, dict):
+                        continue
+                    course_id = str(entry.get("course_id") or entry.get("courseId") or "").strip()
+                    if not course_id:
+                        continue
+                    for index, batch in enumerate(entry.get("batches") or []):
+                        if not isinstance(batch, dict):
+                            continue
+                        trainer_id = str(batch.get("coach_id") or batch.get("coachId") or "").strip()
+                        trainer_match = bool(trainer_id) and trainer_id in match_ids
+                        on_assigned_course = course_id in course_ids
+                        if not (trainer_match or on_assigned_course):
+                            continue
+                        if trainer_match:
+                            course_ids_from_batches.add(course_id)
+                        batch_ref = str(
+                            batch.get("batch_id") or batch.get("id") or f"__index:{index}__"
+                        ).strip()
+                        batch_name = str(batch.get("batch_name") or batch.get("name") or "").strip() or f"Batch {index + 1}"
+                        meta = {
+                            "batch_ref": batch_ref,
+                            "batch_name": batch_name,
+                            "course_id": course_id,
+                            "branch_id": branch.get("id"),
+                            "branch_name": branch_name,
+                        }
+                        batch_lookup[batch_ref] = meta
+                        # Also index by name for legacy enrollments that store the name
+                        if batch_name and batch_name not in batch_lookup:
+                            batch_lookup[batch_name] = meta
+                        batches_for_filters.append(meta)
+
+            # Include courses that only appear via trainer-matched batches
+            for cid in course_ids_from_batches:
+                if cid not in course_ids:
+                    course_ids.append(cid)
 
             if not course_ids:
-                return {"students": [], "total": 0}
+                return {
+                    "students": [],
+                    "total": 0,
+                    "coach_id": coach_id,
+                    "coach_name": coach.get("full_name", ""),
+                    "filters": {"courses": [], "batches": []},
+                }
 
-            # Get enrollments for these courses
-            enrollments = await db.enrollments.find({
-                "course_id": {"$in": course_ids},
-                "is_active": True
-            }).to_list(length=1000)
+            # Atlas (this cluster) rejects $in/$or/$eq on enrollments — use plain equality per course.
+            async def _enrollments_for_courses(use_branch: bool) -> list:
+                rows = []
+                for course_id in course_ids:
+                    query: dict = {"course_id": course_id, "is_active": True}
+                    if use_branch and coach_branch_id:
+                        query["branch_id"] = coach_branch_id
+                    rows.extend(await db.enrollments.find(query).to_list(length=1000))
+                return rows
 
-            # Get student details and course information
-            enhanced_students = []
-            for enrollment in enrollments:
-                # Get student details
-                student = await db.users.find_one({
-                    "id": enrollment["student_id"],
-                    "role": "student"
+            enrollments = await _enrollments_for_courses(use_branch=True)
+            if not enrollments and coach_branch_id:
+                enrollments = await _enrollments_for_courses(use_branch=False)
+
+            course_by_id = {}
+            for course_id in course_ids:
+                course = await db.courses.find_one({"id": course_id})
+                if course:
+                    course_by_id[course_id] = course
+            courses_for_filters = [
+                {
+                    "id": c["id"],
+                    "name": c.get("title") or c.get("name") or "Unknown Course",
+                }
+                for c in course_by_id.values()
+            ]
+
+            # Batches grouped by course for single-batch inference when enrollment.batch_ref is empty
+            batches_by_course: dict = {}
+            for b in batches_for_filters:
+                batches_by_course.setdefault(b["course_id"], []).append(b)
+
+            # Deduplicate filter batches by (course_id, batch_ref)
+            seen_batch_keys = set()
+            unique_batches = []
+            for b in batches_for_filters:
+                key = (b["course_id"], b["batch_ref"])
+                if key in seen_batch_keys:
+                    continue
+                seen_batch_keys.add(key)
+                course = course_by_id.get(b["course_id"])
+                unique_batches.append({
+                    **b,
+                    "course_name": (course.get("title") or course.get("name") or "Unknown Course") if course else "Unknown Course",
                 })
 
-                # Get course details
-                course = await db.courses.find_one({"id": enrollment["course_id"]})
+            enhanced_students = []
+            has_unassigned = False
+            for enrollment in enrollments:
+                student = await db.users.find_one({
+                    "id": enrollment["student_id"],
+                    "role": "student",
+                })
+                course = course_by_id.get(enrollment["course_id"]) or await db.courses.find_one(
+                    {"id": enrollment["course_id"]}
+                )
+                if not student or not course:
+                    continue
 
-                if student and course:
-                    enhanced_student = {
-                        "id": student["id"],
-                        "student_name": student.get("full_name", f"{student.get('first_name', '')} {student.get('last_name', '')}".strip()),
-                        "email": student.get("email", student.get("contact_info", {}).get("email", "")),
-                        "course_id": course["id"],
-                        "course_name": course.get("title", course.get("name", "Unknown Course")),
-                        "enrollment_date": enrollment.get("enrollment_date", enrollment.get("created_at", "")),
-                        "status": "active" if enrollment.get("is_active", True) else "inactive",
-                        "progress": enrollment.get("progress", 0),
-                        "branch_id": enrollment.get("branch_id", "")
-                    }
-                    enhanced_students.append(enhanced_student)
+                raw_batch_ref = str(enrollment.get("batch_ref") or "").strip()
+                batch_meta = batch_lookup.get(raw_batch_ref) if raw_batch_ref else None
 
-            return {"students": enhanced_students, "total": len(enhanced_students)}
+                # Infer batch when enrollment has no batch_ref but the course has exactly one batch
+                if not batch_meta and not raw_batch_ref:
+                    course_batches = batches_by_course.get(course["id"]) or []
+                    # Prefer batches on the enrollment's branch when available
+                    enr_branch = str(enrollment.get("branch_id") or "").strip()
+                    if enr_branch:
+                        branch_batches = [b for b in course_batches if str(b.get("branch_id") or "") == enr_branch]
+                        if branch_batches:
+                            course_batches = branch_batches
+                    if len(course_batches) == 1:
+                        batch_meta = course_batches[0]
+                        raw_batch_ref = batch_meta.get("batch_ref") or ""
+
+                if batch_meta:
+                    resolved_ref = str(batch_meta.get("batch_ref") or raw_batch_ref or "").strip()
+                    batch_name = batch_meta.get("batch_name") or resolved_ref or "Unassigned"
+                elif raw_batch_ref:
+                    resolved_ref = raw_batch_ref
+                    batch_name = raw_batch_ref
+                else:
+                    resolved_ref = "__unassigned__"
+                    batch_name = "Unassigned"
+                    has_unassigned = True
+
+                contact = student.get("contact_info") if isinstance(student.get("contact_info"), dict) else {}
+                enhanced_students.append({
+                    "id": student["id"],
+                    "student_name": student.get(
+                        "full_name",
+                        f"{student.get('first_name', '')} {student.get('last_name', '')}".strip(),
+                    ) or "Unknown Student",
+                    "email": student.get("email") or contact.get("email") or "",
+                    "phone": student.get("phone") or contact.get("phone") or "",
+                    "course_id": course["id"],
+                    "course_name": course.get("title") or course.get("name") or "Unknown Course",
+                    "batch_ref": resolved_ref,
+                    "batch_name": batch_name,
+                    "enrollment_date": enrollment.get("enrollment_date", enrollment.get("created_at", "")),
+                    "status": "active" if enrollment.get("is_active", True) else "inactive",
+                    "progress": enrollment.get("progress", 0),
+                    "branch_id": enrollment.get("branch_id", ""),
+                    "enrollment_id": enrollment.get("id"),
+                })
+
+            if has_unassigned:
+                unassigned_key = ("__unassigned__", "__unassigned__")
+                if unassigned_key not in seen_batch_keys:
+                    unique_batches.append({
+                        "batch_ref": "__unassigned__",
+                        "batch_name": "Unassigned",
+                        "course_id": "",
+                        "course_name": "",
+                        "branch_id": "",
+                        "branch_name": "",
+                    })
+
+            # Sort by student name then course
+            enhanced_students.sort(key=lambda s: ((s.get("student_name") or "").lower(), (s.get("course_name") or "").lower()))
+
+            return {
+                "students": enhanced_students,
+                "total": len(enhanced_students),
+                "coach_id": coach_id,
+                "coach_name": coach.get("full_name", ""),
+                "filters": {
+                    "courses": courses_for_filters,
+                    "batches": unique_batches,
+                },
+            }
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error fetching coach students: {str(e)}")
