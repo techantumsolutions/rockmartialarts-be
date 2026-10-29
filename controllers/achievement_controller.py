@@ -66,6 +66,7 @@ class AchievementController:
             description=data.description,
             images=data.images or [],
             documents=data.documents or [],
+            is_featured=False,
             created_by=current_user.get("id"),
         )
         doc = achievement.dict()
@@ -95,6 +96,11 @@ class AchievementController:
             update_fields["images"] = data.images
         if data.documents is not None:
             update_fields["documents"] = data.documents
+        if data.is_featured is not None:
+            role = current_user.get("role")
+            if role not in ("super_admin", "superadmin"):
+                raise HTTPException(status_code=403, detail="Only super admin can set featured")
+            update_fields["is_featured"] = bool(data.is_featured)
         update_fields["updated_at"] = datetime.utcnow()
         await db.student_achievements.update_one(
             {"id": achievement_id},
@@ -161,15 +167,16 @@ class AchievementController:
 
     @staticmethod
     async def get_global_public(skip: int = 0, limit: int = 6):
-        """Public endpoint: most recent achievements across all branches (for homepage)."""
+        """Public: featured achievements for homepage (is_featured=True)."""
         db = get_db()
         cursor = db.student_achievements.find({
-            "is_deleted": False
+            "is_deleted": False,
+            "is_featured": True,
         }).sort("created_at", -1).skip(skip).limit(limit)
         items = await cursor.to_list(length=limit)
         # Enrich with student names
         student_ids = list({a["student_id"] for a in items})
-        users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids))
+        users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids)) if student_ids else []
         user_map = {u["id"]: u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Student" for u in users}
         result = []
         for a in items:
@@ -177,3 +184,55 @@ class AchievementController:
             d["student_name"] = user_map.get(a["student_id"], "Student")
             result.append(d)
         return {"achievements": result}
+
+    @staticmethod
+    async def list_for_showcase_manage(current_user: dict, featured_only: bool = False):
+        """Super admin: list student achievements for homepage featured management."""
+        role = current_user.get("role")
+        if role not in ("super_admin", "superadmin"):
+            raise HTTPException(status_code=403, detail="Only super admin can manage featured achievements")
+        db = get_db()
+        q: dict = {"is_deleted": False}
+        if featured_only:
+            q["is_featured"] = True
+        cursor = db.student_achievements.find(q).sort([("is_featured", -1), ("created_at", -1)])
+        items = await cursor.to_list(length=500)
+        student_ids = list({a["student_id"] for a in items})
+        users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids)) if student_ids else []
+        user_map = {
+            u["id"]: u.get("full_name")
+            or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+            or "Student"
+            for u in users
+        }
+        branch_ids = list({a.get("branch_id") for a in items if a.get("branch_id")})
+        branches = await db.branches.find({"id": {"$in": branch_ids}}).to_list(length=len(branch_ids)) if branch_ids else []
+        branch_map = {
+            b["id"]: (b.get("branch") or {}).get("name") or b.get("name") or b["id"]
+            for b in branches
+        }
+        result = []
+        for a in items:
+            d = serialize_doc(a)
+            d["student_name"] = user_map.get(a["student_id"], "Student")
+            d["branch_name"] = branch_map.get(a.get("branch_id"), a.get("branch_id") or "—")
+            d["is_featured"] = bool(a.get("is_featured", False))
+            result.append(d)
+        return {"achievements": result}
+
+    @staticmethod
+    async def set_featured(achievement_id: str, is_featured: bool, current_user: dict):
+        """Super admin: mark/unmark achievement for homepage."""
+        role = current_user.get("role")
+        if role not in ("super_admin", "superadmin"):
+            raise HTTPException(status_code=403, detail="Only super admin can set featured")
+        db = get_db()
+        achievement = await db.student_achievements.find_one({"id": achievement_id, "is_deleted": False})
+        if not achievement:
+            raise HTTPException(status_code=404, detail="Achievement not found")
+        await db.student_achievements.update_one(
+            {"id": achievement_id},
+            {"$set": {"is_featured": bool(is_featured), "updated_at": datetime.utcnow()}},
+        )
+        updated = await db.student_achievements.find_one({"id": achievement_id})
+        return serialize_doc(updated)
