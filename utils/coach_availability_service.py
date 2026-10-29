@@ -125,14 +125,17 @@ async def _resolve_locations(
 def _coach_allowed_location_ids(coach: dict) -> List[str]:
     ids: List[str] = []
     seen = set()
+    bid = coach.get("branch_id")
+    if bid:
+        s = str(bid).strip()
+        if s:
+            seen.add(s)
+            ids.append(s)
     for x in coach.get("service_location_ids") or []:
         s = str(x).strip()
         if s and s not in seen:
             seen.add(s)
             ids.append(s)
-    bid = coach.get("branch_id")
-    if bid and str(bid) not in seen:
-        ids.append(str(bid))
     return ids
 
 
@@ -255,11 +258,21 @@ async def get_availability_options(
     weekdays = [{"value": d, "label": d.capitalize()} for d in (
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     )]
+    allocated_bid = str(coach.get("branch_id") or "").strip()
+    if allocated_bid and not any(loc.get("id") == allocated_bid for loc in locations):
+        b = await db.branches.find_one({"id": allocated_bid})
+        if b:
+            locations.insert(0, {
+                "id": allocated_bid,
+                "name": (b.get("branch") or {}).get("name") or b.get("name") or allocated_bid,
+            })
+
     return {
         "coach_id": coach_id,
         "locations": locations,
         "weekdays": weekdays,
         "coach_service_location_ids": allowed,
+        "allocated_branch_id": allocated_bid or None,
         "timezone_default": "Asia/Kolkata",
     }
 
@@ -273,12 +286,31 @@ async def get_availability(
     coach = await _get_coach(db, coach_id)
     await _assert_can_view(db, coach, current_user)
 
+    bid = str(coach.get("branch_id") or "").strip()
     doc = await db[COL].find_one({"coach_id": coach_id})
     if not doc:
         empty = _empty_availability(coach_id)
         # Prefill locations from coach profile
-        empty["service_location_ids"] = _coach_allowed_location_ids(coach)
+        empty["service_location_ids"] = [bid] if bid else _coach_allowed_location_ids(coach)
         return await _enrich(db, empty)
+
+    # If the coach is allocated to a branch, ensure availability reflects that branch
+    if bid:
+        doc_locs = [str(x).strip() for x in (doc.get("service_location_ids") or []) if str(x).strip()]
+        if not doc_locs or doc_locs[0] != bid:
+            doc["service_location_ids"] = [bid]
+            for slot in doc.get("weekly_slots") or []:
+                slot["service_location_id"] = bid
+            try:
+                await db[COL].update_one(
+                    {"coach_id": coach_id},
+                    {"$set": {
+                        "service_location_ids": [bid],
+                        "weekly_slots": doc.get("weekly_slots") or []
+                    }}
+                )
+            except Exception:
+                logger.exception("Failed to sync coach_availability with branch_id")
 
     return await _enrich(db, doc)
 

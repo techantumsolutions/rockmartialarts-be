@@ -446,7 +446,9 @@ class AttendanceController:
                                 "id": course["id"],
                                 "name": course.get("name", course.get("title", "Unknown Course")),
                                 "course_id": course["id"],
-                                "course_name": course.get("name", course.get("title", "Unknown Course"))
+                                "course_name": course.get("name", course.get("title", "Unknown Course")),
+                                "batch_ref": enrollment.get("batch_ref") or (student.get("course") or {}).get("batch_ref"),
+                                "branch_id": enrollment.get("branch_id"),
                             })
 
                     enrolled_branch_ids = [
@@ -464,12 +466,17 @@ class AttendanceController:
                         ([student_branch_id] if student_branch_id else []) + enrolled_branch_ids
                     ))
 
+                    student_batch_ref = (
+                        (student_enrollments[0].get("batch_ref") if student_enrollments else None)
+                        or (student.get("course") or {}).get("batch_ref")
+                    )
                     result_students.append({
                         "id": student_id,
                         "full_name": student.get("full_name", "Unknown"),
                         "email": student.get("email", ""),
                         "branch_id": student_branch_id,
                         "branches": [{"id": bid} for bid in all_branch_ids],
+                        "batch_ref": student_batch_ref,
                         "courses": courses,
                         "attendance": attendance_info
                     })
