@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -36,6 +36,33 @@ def _role(user: dict) -> str:
 
 def _normalize_code(code: str) -> str:
     return (code or "").strip().upper().replace(" ", "_")
+
+
+def _format_utc_timestamp(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=timezone.utc)
+        else:
+            val = val.astimezone(timezone.utc)
+        return val.isoformat().replace("+00:00", "Z")
+    if isinstance(val, str) and val:
+        s = val.strip()
+        if s.endswith("Z") or ("+" in s[10:]) or ("-" in s[10:]):
+            return s
+        return f"{s}Z"
+    return str(val)
+
+
+def _serialize_assessment(doc: Dict[str, Any]) -> Dict[str, Any]:
+    serialized = serialize_doc(doc)
+    if not isinstance(serialized, dict):
+        return serialized
+    for field in ("evaluated_at", "created_at", "updated_at"):
+        if field in serialized and serialized[field] is not None:
+            serialized[field] = _format_utc_timestamp(doc.get(field, serialized[field]))
+    return serialized
 
 
 async def ensure_kpi_assessment_indexes(db=None) -> None:
@@ -319,7 +346,7 @@ async def upsert_student_assessment(
     if not body.scores:
         raise HTTPException(status_code=400, detail="At least one KPI score is required")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     evaluator_id = current_user.get("id")
     evaluator_name = (
         current_user.get("full_name")
@@ -338,14 +365,18 @@ async def upsert_student_assessment(
             errors.append({"kpi_id": score.kpi_id, "error": "KPI is inactive"})
             continue
 
-        min_score = float(kpi.get("min_score") or 0)
-        max_score = float(kpi.get("max_score") or 100)
+        min_val = kpi.get("min_score")
+        max_val = kpi.get("max_score")
+        min_score = float(min_val if min_val is not None else 0)
+        max_score = float(max_val if max_val is not None else 100)
         raw = float(score.raw_score)
         if raw < min_score or raw > max_score:
+            min_disp = int(min_score) if min_score.is_integer() else min_score
+            max_disp = int(max_score) if max_score.is_integer() else max_score
             errors.append(
                 {
                     "kpi_id": score.kpi_id,
-                    "error": f"Score must be between {min_score} and {max_score}",
+                    "error": f"Score must be between {min_disp} and {max_disp}",
                 }
             )
             continue
@@ -386,7 +417,7 @@ async def upsert_student_assessment(
             doc["created_at"] = now
             doc["action"] = "created"
             await db[COL_ASSESSMENTS].insert_one(doc)
-        saved.append(serialize_doc(doc))
+        saved.append(_serialize_assessment(doc))
 
     if not saved and errors:
         raise HTTPException(status_code=400, detail={"message": "No scores saved", "errors": errors})
@@ -401,7 +432,7 @@ async def upsert_student_assessment(
         "course_id": body.course_id,
         "branch_id": branch_id,
         "evaluator_id": evaluator_id,
-        "evaluated_at": now.isoformat(),
+        "evaluated_at": _format_utc_timestamp(now),
     }
 
 
@@ -448,7 +479,11 @@ async def list_assessments(
         .limit(limit)
         .to_list(length=limit)
     )
-    return {"assessments": serialize_doc(rows), "total": total, "count": len(rows)}
+    return {
+        "assessments": [_serialize_assessment(r) for r in rows],
+        "total": total,
+        "count": len(rows),
+    }
 
 
 async def list_eligible_students(
