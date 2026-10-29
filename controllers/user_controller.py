@@ -637,8 +637,39 @@ class UserController:
 
         # Role-based access control
         if current_role in [UserRole.COACH_ADMIN, UserRole.COACH]:
-            # Coach Admin and Coach can only view users from their own branch
-            if current_user.get("branch_id") != user.get("branch_id"):
+            coach_branch = current_user.get("branch_id")
+            user_branch = user.get("branch_id") or (user.get("branch") or {}).get("branch_id")
+            allowed = False
+            if coach_branch and user_branch and str(coach_branch) == str(user_branch):
+                allowed = True
+            elif coach_branch and user.get("role") == "student":
+                enr = await db.enrollments.find_one({
+                    "student_id": user_id,
+                    "branch_id": coach_branch,
+                    "is_active": True
+                })
+                if enr:
+                    allowed = True
+            if not allowed and user.get("role") == "student":
+                coach_id = current_user.get("id")
+                student_enrs = await db.enrollments.find({
+                    "student_id": user_id,
+                    "is_active": True
+                }).to_list(100)
+                student_course_ids = [e.get("course_id") for e in student_enrs if e.get("course_id")]
+                if student_course_ids:
+                    coach_doc = await db.coaches.find_one({"id": coach_id})
+                    assigned_courses = (coach_doc.get("assignment_details") or {}).get("courses", []) if coach_doc else []
+                    taught = await db.courses.find_one({
+                        "id": {"$in": student_course_ids},
+                        "$or": [
+                            {"instructor_id": coach_id},
+                            {"id": {"$in": assigned_courses}}
+                        ]
+                    })
+                    if taught:
+                        allowed = True
+            if not allowed and coach_branch and user_branch and str(coach_branch) != str(user_branch):
                 raise HTTPException(status_code=403, detail="You can only view users from your own branch")
         elif current_role == UserRole.BRANCH_MANAGER:
             from utils.student_status_service import get_managed_branch_ids_for_user
@@ -1777,8 +1808,16 @@ class UserController:
         # Permission check: coaches can only view students from their branch
         current_role = current_user.get("role")
         if current_role in ["coach", "coach_admin"] and current_user.get("branch_id"):
-            if user.get("branch_id") != current_user["branch_id"]:
-                raise HTTPException(status_code=403, detail="You can only view students from your branch")
+            coach_branch = current_user.get("branch_id")
+            user_branch = user.get("branch_id") or (user.get("branch") or {}).get("branch_id")
+            if coach_branch and user_branch and str(coach_branch) != str(user_branch):
+                enr = await db.enrollments.find_one({
+                    "student_id": user_id,
+                    "branch_id": coach_branch,
+                    "is_active": True
+                })
+                if not enr:
+                    raise HTTPException(status_code=403, detail="You can only view students from your branch")
         elif current_role == "branch_manager":
             # Branch managers can only view enrollments for students in branches they manage
             branch_assignment = current_user.get("branch_assignment", {})
@@ -1858,8 +1897,16 @@ class UserController:
         # Permission check: coaches can only view students from their branch
         current_role = current_user.get("role")
         if current_role in ["coach", "coach_admin"] and current_user.get("branch_id"):
-            if user.get("branch_id") != current_user["branch_id"]:
-                raise HTTPException(status_code=403, detail="You can only view students from your branch")
+            coach_branch = current_user.get("branch_id")
+            user_branch = user.get("branch_id") or (user.get("branch") or {}).get("branch_id")
+            if coach_branch and user_branch and str(coach_branch) != str(user_branch):
+                enr = await db.enrollments.find_one({
+                    "student_id": user_id,
+                    "branch_id": coach_branch,
+                    "is_active": True
+                })
+                if not enr:
+                    raise HTTPException(status_code=403, detail="You can only view students from your branch")
         elif current_role == "branch_manager":
             # Branch managers can only view payments for students in branches they manage
             branch_assignment = current_user.get("branch_assignment", {})

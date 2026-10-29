@@ -3,6 +3,7 @@ from typing import Optional, List
 from datetime import datetime
 import secrets
 import uuid
+import re
 
 from models.coach_models import CoachCreate, CoachUpdate, Coach, CoachResponse, CoachLogin, CoachLoginResponse
 from models.user_models import UserRole
@@ -440,6 +441,19 @@ class CoachController:
 
         if coach_update.branch_id is not None:  # Allow setting to None to remove branch assignment
             update_data["branch_id"] = coach_update.branch_id
+            update_data["service_location_ids"] = [coach_update.branch_id] if coach_update.branch_id else []
+            # Keep coach_availability synchronized with new branch assignment
+            if coach_update.branch_id:
+                try:
+                    await db["coach_availability"].update_one(
+                        {"coach_id": coach_id},
+                        {"$set": {
+                            "service_location_ids": [coach_update.branch_id],
+                            "weekly_slots.$[].service_location_id": coach_update.branch_id
+                        }}
+                    )
+                except Exception:
+                    pass
 
         if coach_update.assignment_details is not None:  # Allow updating course assignments
             update_data["assignment_details"] = coach_update.assignment_details.dict()
@@ -497,6 +511,133 @@ class CoachController:
 
         return {"message": "Coach updated successfully"}
 
+    @staticmethod
+    async def update_coach_profile(
+        coach_id: str,
+        coach_update: CoachUpdate,
+        request: Request,
+        current_coach: dict = None
+    ):
+        """Update coach's own profile - coaches can update their own information"""
+        db = get_db()
+
+        # Verify the coach is updating their own profile
+        if current_coach and current_coach.get("id") != coach_id and current_coach.get("role") not in [UserRole.SUPER_ADMIN, "super_admin"]:
+            raise HTTPException(status_code=403, detail="You can only update your own profile")
+
+        # Check if coach exists
+        existing_coach = await db.coaches.find_one({"id": coach_id})
+        if not existing_coach:
+            raise HTTPException(status_code=404, detail="Coach not found")
+
+        update_data = {}
+
+        # Update personal info
+        if coach_update.personal_info:
+            update_data["personal_info"] = coach_update.personal_info.dict()
+
+            # Update derived fields - individual name fields and full_name
+            update_data["first_name"] = coach_update.personal_info.first_name
+            update_data["last_name"] = coach_update.personal_info.last_name
+            update_data["full_name"] = f"{coach_update.personal_info.first_name} {coach_update.personal_info.last_name}".strip()
+
+            # Validate date format if provided
+            if coach_update.personal_info.date_of_birth:
+                dob = coach_update.personal_info.date_of_birth.strip().split("T")[0]
+                try:
+                    datetime.strptime(dob, "%Y-%m-%d")
+                    update_data["personal_info"]["date_of_birth"] = dob
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+        if coach_update.contact_info:
+            # Check for email conflicts if email is being changed
+            new_email = coach_update.contact_info.email.strip().lower() if coach_update.contact_info.email else ""
+            existing_email = (existing_coach.get("email") or existing_coach.get("contact_info", {}).get("email", "")).strip().lower()
+            if new_email and new_email != existing_email:
+                email_conflict = await db.coaches.find_one({
+                    "email": {"$regex": f"^{re.escape(new_email)}$", "$options": "i"},
+                    "id": {"$ne": coach_id}
+                })
+                if email_conflict:
+                    raise HTTPException(status_code=400, detail="Email already exists")
+
+            # Check for phone conflicts
+            full_phone = f"{coach_update.contact_info.country_code}{coach_update.contact_info.phone}".strip()
+            existing_phone = existing_coach.get("contact_info", {}).get("phone", "") or ""
+            existing_full_phone = existing_coach.get("phone", "") or ""
+            if coach_update.contact_info.phone != existing_phone and full_phone != existing_full_phone:
+                phone_conflict = await db.coaches.find_one({
+                    "$or": [
+                        {"phone": full_phone},
+                        {"contact_info.phone": coach_update.contact_info.phone}
+                    ],
+                    "id": {"$ne": coach_id}
+                })
+                if phone_conflict:
+                    raise HTTPException(status_code=400, detail="Phone number already exists")
+
+            # Update contact info (exclude password from nested structure)
+            update_data["contact_info"] = {
+                "email": coach_update.contact_info.email,
+                "country_code": coach_update.contact_info.country_code,
+                "phone": coach_update.contact_info.phone
+            }
+            update_data["email"] = coach_update.contact_info.email
+            update_data["phone"] = full_phone
+
+            # Handle password update if provided
+            if coach_update.contact_info.password and coach_update.contact_info.password.strip():
+                update_data["password_hash"] = hash_password(coach_update.contact_info.password)
+
+        if coach_update.address_info:
+            update_data["address_info"] = coach_update.address_info.dict()
+
+        if coach_update.professional_info:
+            update_data["professional_info"] = coach_update.professional_info.dict()
+
+        if coach_update.areas_of_expertise is not None:
+            update_data["areas_of_expertise"] = coach_update.areas_of_expertise
+
+        if coach_update.emergency_contact is not None:
+            update_data["emergency_contact"] = coach_update.emergency_contact.dict()
+
+        patch = coach_update.model_dump(exclude_unset=True) if hasattr(coach_update, "model_dump") else coach_update.dict(exclude_unset=True)
+        if "profile_image_url" in patch:
+            update_data["profile_image_url"] = patch["profile_image_url"]
+        if "about_short" in patch:
+            update_data["about_short"] = patch["about_short"]
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No update data provided")
+
+        update_data["updated_at"] = datetime.utcnow()
+
+        # Update coach
+        result = await db.coaches.update_one(
+            {"id": coach_id},
+            {"$set": update_data}
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Coach not found")
+
+        # Log activity
+        user_id = current_coach.get("id", coach_id) if current_coach else coach_id
+        user_name = current_coach.get("full_name", "Coach") if current_coach else existing_coach.get("full_name", "Coach")
+        await log_activity(
+            request=request,
+            action="coach_profile_update",
+            user_id=user_id,
+            user_name=user_name,
+            details={
+                "updated_coach_id": coach_id,
+                "updated_fields": list(update_data.keys())
+            }
+        )
+
+        return {"message": "Profile updated successfully"}
+
  
 
     @staticmethod
@@ -526,6 +667,55 @@ class CoachController:
         )
 
         return {"message": "Coach deactivated successfully"}
+
+    @staticmethod
+    async def activate_coach(
+        coach_id: str,
+        request: Request,
+        current_admin: dict
+    ):
+        """Activate coach"""
+        db = get_db()
+
+        # First, get the coach to check if it exists and get branch info
+        coach = await db.coaches.find_one({"id": coach_id})
+        if not coach:
+            raise HTTPException(status_code=404, detail="Coach not found")
+
+        # If current user is a branch manager, ensure they can only activate coaches from their branch
+        current_role = current_admin.get("role")
+        if current_role == "branch_manager" or current_role == UserRole.BRANCH_MANAGER:
+            manager_branch_id = current_admin.get("branch_id")
+            if not manager_branch_id:
+                branch_assignment = current_admin.get("branch_assignment")
+                if branch_assignment and isinstance(branch_assignment, dict):
+                    manager_branch_id = branch_assignment.get("branch_id")
+
+            managed_branches = list(current_admin.get("managed_branches") or [])
+            if manager_branch_id and manager_branch_id not in managed_branches:
+                managed_branches.append(manager_branch_id)
+
+            if coach.get("branch_id") not in managed_branches:
+                raise HTTPException(status_code=403, detail="You can only activate coaches from your assigned branch")
+
+        result = await db.coaches.update_one(
+            {"id": coach_id},
+            {"$set": {"is_active": True, "updated_at": datetime.utcnow()}}
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Coach not found")
+
+        # Log activity
+        await log_activity(
+            request=request,
+            action="coach_activation",
+            user_id=current_admin["id"],
+            user_name=current_admin.get("full_name", "Admin"),
+            details={"activated_coach_id": coach_id}
+        )
+
+        return {"message": "Coach activated successfully"}
 
     @staticmethod
     async def get_coaches_by_course(course_id: str, current_user: dict = None):
@@ -585,6 +775,43 @@ class CoachController:
                 "course_id": course_id,
                 "course_title": course.get("title", "Unknown Course"),
             }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching coaches for course: {str(e)}")
+
+    @staticmethod
+    async def get_coaches_by_course_public(course_id: str):
+        """Get coaches assigned to a specific course - Public endpoint (no authentication required)"""
+        db = get_db()
+
+        try:
+            course = await db.courses.find_one({"id": course_id})
+            if not course:
+                raise HTTPException(status_code=404, detail="Course not found")
+
+            coaches = []
+
+            if course.get("instructor_id"):
+                instructor = await db.coaches.find_one({
+                    "id": course["instructor_id"],
+                    "is_active": True
+                })
+                if instructor:
+                    coaches.append(instructor)
+
+            assigned_coaches = await db.coaches.find({
+                "assignment_details.courses": course_id,
+                "is_active": True
+            }).to_list(100)
+
+            coach_ids = {c["id"] for c in coaches}
+            for coach in assigned_coaches:
+                if coach["id"] not in coach_ids:
+                    coaches.append(coach)
+
+            return [serialize_doc(coach) for coach in coaches]
 
         except HTTPException:
             raise
@@ -698,8 +925,12 @@ class CoachController:
                             continue
                         days = [str(day) for day in (batch.get("days") or []) if day]
                         batch_name = str(batch.get("batch_name") or batch.get("name") or "").strip()
+                        b_id = str(batch.get("id") or batch.get("batch_id") or "").strip()
                         batches_by_course.setdefault(course_id, []).append({
+                            "id": b_id,
+                            "batch_id": b_id,
                             "batch_name": batch_name or f"Batch {index + 1}",
+                            "coach_id": trainer_id,
                             "days": days,
                             "start_time": str(batch.get("start_time") or batch.get("startTime") or "").strip(),
                             "end_time": str(batch.get("end_time") or batch.get("endTime") or "").strip(),

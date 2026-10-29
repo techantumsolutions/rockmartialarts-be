@@ -527,6 +527,7 @@ class SearchController:
                 # Get course details
                 course = await db.courses.find_one({"id": enrollment["course_id"]})
                 if course:
+                    b_ref = enrollment.get("batch_ref") or (student.get("course") or {}).get("batch_ref")
                     courses.append({
                         "id": course["id"],
                         "name": course.get("name", course.get("title", "Unknown Course")),
@@ -534,7 +535,10 @@ class SearchController:
                         "enrollment_date": enrollment["enrollment_date"],
                         "start_date": enrollment["start_date"],
                         "end_date": enrollment["end_date"],
-                        "payment_status": enrollment.get("payment_status", "unknown")
+                        "payment_status": enrollment.get("payment_status", "unknown"),
+                        "batch_ref": b_ref,
+                        "batch_name": enrollment.get("batch_name"),
+                        "branch_id": enrollment.get("branch_id"),
                     })
 
                 # Get branch details
@@ -555,8 +559,13 @@ class SearchController:
             student_data.pop("password", None)
 
             # Add enriched data
+            student_batch_ref = (
+                (student_enrollments[0].get("batch_ref") if student_enrollments else None)
+                or (student.get("course") or {}).get("batch_ref")
+            )
             enriched_student = {
                 **student_data,
+                "batch_ref": student_batch_ref,
                 "courses": courses,
                 "branches": branches,
                 "total_enrollments": len(student_enrollments),
