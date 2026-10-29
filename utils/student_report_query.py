@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
@@ -153,16 +152,9 @@ async def query_student_report_rows(
     if is_active is not None:
         student_filter["is_active"] = bool(is_active)
 
-    if q and len(str(q).strip()) >= 2:
-        pattern = {"$regex": re.escape(str(q).strip()), "$options": "i"}
-        student_filter["$or"] = [
-            {"full_name": pattern},
-            {"first_name": pattern},
-            {"last_name": pattern},
-            {"email": pattern},
-            {"phone": pattern},
-            {"id": pattern},
-        ]
+    # Text search is applied in Python below. Atlas blocks $regex / $regexMatch
+    # on this cluster, so Mongo regex filters return empty results.
+    search_term = str(q).strip().lower() if q and len(str(q).strip()) >= 2 else ""
 
     start_dt = _parse_iso_date(start_date)
     end_dt = _parse_iso_date(end_date, end_of_day=True)
@@ -212,9 +204,33 @@ async def query_student_report_rows(
     skip = max(0, int(skip or 0))
     limit = max(1, min(int(limit or 50), 10000))
 
-    total = await db.users.count_documents(student_filter)
-    cursor = db.users.find(student_filter).sort("created_at", -1).skip(skip).limit(limit)
-    students = await cursor.to_list(length=limit)
+    def _student_matches_search(doc: Dict[str, Any], term: str) -> bool:
+        if not term:
+            return True
+        haystacks = [
+            doc.get("full_name"),
+            doc.get("first_name"),
+            doc.get("last_name"),
+            doc.get("email"),
+            doc.get("phone"),
+            doc.get("id"),
+            doc.get("student_id"),
+        ]
+        blob = " ".join(str(v) for v in haystacks if v).lower()
+        return term in blob
+
+    if search_term:
+        # Load candidates then filter + paginate in app (Atlas-safe, no $regex)
+        candidates = (
+            await db.users.find(student_filter).sort("created_at", -1).to_list(length=20000)
+        )
+        matched = [s for s in candidates if _student_matches_search(s, search_term)]
+        total = len(matched)
+        students = matched[skip : skip + limit]
+    else:
+        total = await db.users.count_documents(student_filter)
+        cursor = db.users.find(student_filter).sort("created_at", -1).skip(skip).limit(limit)
+        students = await cursor.to_list(length=limit)
 
     enriched: List[Dict[str, Any]] = []
     for student in students:
