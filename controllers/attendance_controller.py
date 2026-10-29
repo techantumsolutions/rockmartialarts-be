@@ -258,7 +258,8 @@ class AttendanceController:
         date: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        current_user: dict = None
+        current_user: dict = None,
+        batch_ref: Optional[str] = None,
     ):
         """Get student attendance data with aggregated statistics"""
         try:
@@ -341,12 +342,17 @@ class AttendanceController:
                 # Only apply course filtering when explicitly requested
                 if course_id:
                     enrollment_filter["course_id"] = course_id
+                if batch_ref and batch_ref != "all":
+                    enrollment_filter["$or"] = [
+                        {"batch_ref": batch_ref},
+                        {"batch_id": batch_ref}
+                    ]
 
                 # Get matching enrollments
                 # For superadmin without any branch/course filter, show all students even if
                 # enrollments collection is incomplete (prevents "empty attendance" UI).
                 user_role = str(current_user.get("role") or "").lower() if current_user else ""
-                must_filter_by_enrollment = bool(managed_branch_ids or branch_id or course_id)
+                must_filter_by_enrollment = bool(managed_branch_ids or branch_id or course_id or (batch_ref and batch_ref != "all"))
                 # Always load enrollments for course context (but don't always filter student list by them).
                 enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
                 if must_filter_by_enrollment or user_role in ["branch_manager", "coach", "coach_admin"]:
@@ -446,7 +452,8 @@ class AttendanceController:
                                 "id": course["id"],
                                 "name": course.get("name", course.get("title", "Unknown Course")),
                                 "course_id": course["id"],
-                                "course_name": course.get("name", course.get("title", "Unknown Course"))
+                                "course_name": course.get("name", course.get("title", "Unknown Course")),
+                                "batch_ref": enrollment.get("batch_ref") or enrollment.get("batch_id"),
                             })
 
                     enrolled_branch_ids = [
@@ -464,6 +471,13 @@ class AttendanceController:
                         ([student_branch_id] if student_branch_id else []) + enrolled_branch_ids
                     ))
 
+                    batch_refs = [
+                        str(e.get("batch_ref") or e.get("batch_id"))
+                        for e in student_enrollments
+                        if (e.get("batch_ref") or e.get("batch_id"))
+                    ]
+                    primary_batch_ref = batch_refs[0] if batch_refs else None
+
                     result_students.append({
                         "id": student_id,
                         "full_name": student.get("full_name", "Unknown"),
@@ -471,6 +485,8 @@ class AttendanceController:
                         "branch_id": student_branch_id,
                         "branches": [{"id": bid} for bid in all_branch_ids],
                         "courses": courses,
+                        "batch_ref": primary_batch_ref,
+                        "batch_refs": batch_refs,
                         "attendance": attendance_info
                     })
 
@@ -550,6 +566,120 @@ class AttendanceController:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
+
+    @staticmethod
+    async def get_course_batches(
+        course_id: str,
+        branch_id: Optional[str] = None,
+        current_user: dict = None
+    ):
+        """Fetch all batches for a specific course at a branch or across all branches."""
+        try:
+            db = get_db()
+            if db is None:
+                raise HTTPException(status_code=500, detail="Database connection not available")
+
+            batches = []
+            seen = set()
+
+            # 1. If branch_id provided, look in that branch first
+            if branch_id and branch_id != "all":
+                branch = await db.branches.find_one({"id": branch_id})
+                if branch:
+                    sched = branch.get("assignments", {}).get("course_schedule", [])
+                    for cs in sched:
+                        if str(cs.get("course_id")) == str(course_id):
+                            for b in cs.get("batches", []):
+                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
+                                if bid and bid not in seen:
+                                    seen.add(bid)
+                                    batches.append(b)
+
+            # 2. If no batches found yet in specified branch (or branch_id is all/none),
+            # search across all other branches
+            if not batches:
+                all_branches = await db.branches.find({}).to_list(None)
+                for br in all_branches:
+                    sched = br.get("assignments", {}).get("course_schedule", [])
+                    for cs in sched:
+                        if str(cs.get("course_id")) == str(course_id):
+                            for b in cs.get("batches", []):
+                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
+                                if bid and bid not in seen:
+                                    seen.add(bid)
+                                    batches.append(b)
+
+            # 3. Also check student enrollments for any batch_ref
+            enr_filter = {"course_id": course_id}
+            if branch_id and branch_id != "all":
+                enr_filter["branch_id"] = branch_id
+            enr_batch_refs = await db.enrollments.distinct("batch_ref", enr_filter)
+            if enr_batch_refs:
+                all_branches_cache = None
+                for bref in enr_batch_refs:
+                    if not bref:
+                        continue
+                    bref_str = str(bref).strip()
+                    if bref_str and bref_str not in seen:
+                        if all_branches_cache is None:
+                            all_branches_cache = await db.branches.find({}).to_list(None)
+                        found_b = None
+                        for br in all_branches_cache:
+                            sched = br.get("assignments", {}).get("course_schedule", [])
+                            for cs in sched:
+                                for b in cs.get("batches", []):
+                                    if str(b.get("batch_id") or b.get("id") or "").strip() == bref_str:
+                                        found_b = b
+                                        break
+                                if found_b:
+                                    break
+                            if found_b:
+                                break
+                        if found_b:
+                            seen.add(bref_str)
+                            batches.append(found_b)
+                        else:
+                            seen.add(bref_str)
+                            batches.append({
+                                "batch_id": bref_str,
+                                "batch_name": f"Batch {bref_str[:8]}",
+                                "start_time": "",
+                                "end_time": "",
+                                "days": []
+                            })
+
+            # Format batches cleanly
+            formatted = []
+            for idx, b in enumerate(batches):
+                bid = str(b.get("batch_id") or b.get("id") or f"batch_{idx}").strip()
+                bname = str(b.get("batch_name") or b.get("name") or "").strip()
+                st = str(b.get("start_time") or b.get("startTime") or "").strip()
+                et = str(b.get("end_time") or b.get("endTime") or "").strip()
+                days = b.get("days") if isinstance(b.get("days"), list) else []
+                time_str = f"{st} - {et}" if (st and et) else (st or et)
+                concise_name = bname or f"Batch {idx + 1}"
+                short_label = f"{concise_name} ({time_str})" if time_str else concise_name
+                day_abbr = ", ".join([str(d)[:3] for d in days]) if days else ""
+                full_label = f"{short_label} • {day_abbr}" if day_abbr else short_label
+
+                formatted.append({
+                    "batch_id": bid,
+                    "batch_ref": bid,
+                    "batch_name": bname or None,
+                    "name": bname or None,
+                    "start_time": st or None,
+                    "end_time": et or None,
+                    "days": days,
+                    "short_label": short_label,
+                    "label": short_label,
+                    "full_label": full_label,
+                })
+
+            return {"batches": formatted, "count": len(formatted), "course_id": course_id}
+        except Exception as e:
+            print(f"Error fetching course batches: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch course batches: {str(e)}")
+
 
     @staticmethod
     async def get_coach_attendance(
@@ -1944,3 +2074,117 @@ class AttendanceController:
         except Exception as e:
             print(f"❌ Error fetching student attendance: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
+
+    @staticmethod
+    async def get_course_batches(
+        course_id: str,
+        branch_id: Optional[str] = None,
+        current_user: dict = None
+    ):
+        """Fetch all batches for a specific course at a branch or across all branches."""
+        try:
+            db = get_db()
+            if db is None:
+                raise HTTPException(status_code=500, detail="Database connection not available")
+
+            batches = []
+            seen = set()
+
+            # 1. If branch_id provided, look in that branch first
+            if branch_id and branch_id != "all":
+                branch = await db.branches.find_one({"id": branch_id})
+                if branch:
+                    sched = branch.get("assignments", {}).get("course_schedule", [])
+                    for cs in sched:
+                        if str(cs.get("course_id")) == str(course_id):
+                            for b in cs.get("batches", []):
+                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
+                                if bid and bid not in seen:
+                                    seen.add(bid)
+                                    batches.append(b)
+
+            # 2. If no batches found yet in specified branch (or branch_id is all/none),
+            # search across all other branches
+            if not batches:
+                all_branches = await db.branches.find({}).to_list(None)
+                for br in all_branches:
+                    sched = br.get("assignments", {}).get("course_schedule", [])
+                    for cs in sched:
+                        if str(cs.get("course_id")) == str(course_id):
+                            for b in cs.get("batches", []):
+                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
+                                if bid and bid not in seen:
+                                    seen.add(bid)
+                                    batches.append(b)
+
+            # 3. Also check student enrollments for any batch_ref
+            enr_filter = {"course_id": course_id}
+            if branch_id and branch_id != "all":
+                enr_filter["branch_id"] = branch_id
+            enr_batch_refs = await db.enrollments.distinct("batch_ref", enr_filter)
+            if enr_batch_refs:
+                all_branches_cache = None
+                for bref in enr_batch_refs:
+                    if not bref:
+                        continue
+                    bref_str = str(bref).strip()
+                    if bref_str and bref_str not in seen:
+                        if all_branches_cache is None:
+                            all_branches_cache = await db.branches.find({}).to_list(None)
+                        found_b = None
+                        for br in all_branches_cache:
+                            sched = br.get("assignments", {}).get("course_schedule", [])
+                            for cs in sched:
+                                for b in cs.get("batches", []):
+                                    if str(b.get("batch_id") or b.get("id") or "").strip() == bref_str:
+                                        found_b = b
+                                        break
+                                if found_b:
+                                    break
+                            if found_b:
+                                break
+                        if found_b:
+                            seen.add(bref_str)
+                            batches.append(found_b)
+                        else:
+                            seen.add(bref_str)
+                            batches.append({
+                                "batch_id": bref_str,
+                                "batch_name": f"Batch {bref_str[:8]}",
+                                "start_time": "",
+                                "end_time": "",
+                                "days": []
+                            })
+
+            # Format batches cleanly
+            formatted = []
+            for idx, b in enumerate(batches):
+                bid = str(b.get("batch_id") or b.get("id") or f"batch_{idx}").strip()
+                bname = str(b.get("batch_name") or b.get("name") or "").strip()
+                st = str(b.get("start_time") or b.get("startTime") or "").strip()
+                et = str(b.get("end_time") or b.get("endTime") or "").strip()
+                days = b.get("days") if isinstance(b.get("days"), list) else []
+                time_str = f"{st} - {et}" if (st and et) else (st or et)
+                concise_name = bname or f"Batch {idx + 1}"
+                short_label = f"{concise_name} ({time_str})" if time_str else concise_name
+                day_abbr = ", ".join([str(d)[:3] for d in days]) if days else ""
+                full_label = f"{short_label} • {day_abbr}" if day_abbr else short_label
+
+                formatted.append({
+                    "batch_id": bid,
+                    "batch_ref": bid,
+                    "batch_name": bname or None,
+                    "name": bname or None,
+                    "start_time": st or None,
+                    "end_time": et or None,
+                    "days": days,
+                    "short_label": short_label,
+                    "label": short_label,
+                    "full_label": full_label,
+                })
+
+            return {"batches": formatted, "count": len(formatted), "course_id": course_id}
+        except Exception as e:
+            print(f"Error fetching course batches: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch course batches: {str(e)}")
+

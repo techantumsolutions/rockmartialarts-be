@@ -85,15 +85,28 @@ async def get_attendance_reports(
 async def get_student_attendance(
     branch_id: Optional[str] = Query(None),
     course_id: Optional[str] = Query(None),
+    batch_ref: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None),
     date: Optional[str] = Query(None, description="Single date in ISO format (YYYY-MM-DD)"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get student attendance data"""
+    effective_batch = batch_ref or batch_id
     return await AttendanceController.get_student_attendance(
-        branch_id, course_id, date, start_date, end_date, current_user
+        branch_id, course_id, date, start_date, end_date, current_user, batch_ref=effective_batch
     )
+
+@router.get("/batches")
+async def get_attendance_course_batches(
+    course_id: str = Query(..., description="Course ID to fetch batches for"),
+    branch_id: Optional[str] = Query(None, description="Optional branch ID"),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+):
+    """Fetch batches for a course (at the branch or across branches)"""
+    return await AttendanceController.get_course_batches(course_id, branch_id, current_user)
+
 
 @router.get("/coaches")
 async def get_coach_attendance(
