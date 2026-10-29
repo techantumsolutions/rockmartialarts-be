@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query
-from models.achievement_models import AchievementCreate, AchievementUpdate
+from models.achievement_models import AchievementCreate, AchievementUpdate, AchievementFeaturedUpdate
 from models.user_models import UserRole
-from utils.unified_auth import require_role_unified, get_current_user_or_superadmin
+from utils.unified_auth import require_role_unified
 from controllers.achievement_controller import AchievementController
 
 router = APIRouter()
@@ -44,12 +44,31 @@ async def get_student_achievements(
     return await AchievementController.get_by_student(student_id, current_user)
 
 
+@router.get("/manage/showcase")
+async def list_achievements_for_showcase(
+    featured_only: bool = Query(False),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super admin: list student achievements to feature on the homepage."""
+    return await AchievementController.list_for_showcase_manage(current_user, featured_only=featured_only)
+
+
+@router.patch("/{achievement_id}/featured")
+async def set_achievement_featured(
+    achievement_id: str,
+    data: AchievementFeaturedUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super admin: toggle homepage featured flag."""
+    return await AchievementController.set_featured(achievement_id, data.is_featured, current_user)
+
+
 @router.get("/public/global")
 async def get_global_achievements_public(
     skip: int = Query(0, ge=0),
     limit: int = Query(6, ge=1, le=50),
 ):
-    """Public: get most recent achievements across all branches (for homepage). No auth."""
+    """Public: featured achievements for homepage. No auth."""
     return await AchievementController.get_global_public(skip=skip, limit=limit)
 
 
