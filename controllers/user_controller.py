@@ -1747,6 +1747,7 @@ class UserController:
             "course": 1,
             "address": 1,
             "student_level": 1,
+            "created_by": 1,
         }
 
         # Get students (newest first)
