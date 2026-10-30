@@ -9,7 +9,7 @@ from models.student_models import (
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
 )
-from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody
+from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody, CreateRegistrationOrderBody
 from models.user_models import UserRole
 from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin, get_optional_current_user_or_superadmin
@@ -87,10 +87,19 @@ async def confirm_razorpay_payment(
     """Record Razorpay payment and update enrollment (student-only)."""
     return await PaymentController.confirm_razorpay_payment(data, current_user)
 
+@router.post("/create-registration-order", status_code=status.HTTP_200_OK)
+async def create_registration_order(body: CreateRegistrationOrderBody):
+    """Create a Razorpay order for online student registration checkout."""
+    return await PaymentController.create_registration_order(body)
+
+
 @router.post("/process-registration", status_code=status.HTTP_201_CREATED)
-async def process_registration_payment(payment_data: RegistrationPaymentCreate):
-    """Process payment for student registration (public endpoint)"""
-    return await PaymentController.process_registration_payment(payment_data)
+async def process_registration_payment(
+    payment_data: RegistrationPaymentCreate,
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin)
+):
+    """Process payment for student registration (public or authenticated admin/coach endpoint)"""
+    return await PaymentController.process_registration_payment(payment_data, current_user)
 
 @router.post("/renew-subscription", status_code=status.HTTP_200_OK)
 async def renew_subscription(

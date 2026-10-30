@@ -233,6 +233,11 @@ async def assert_availability_covers_assigned_batches(
             if _availability_problem(batch, weekly_slots) is None and weekly_slots:
                 continue
             if not weekly_slots or _availability_problem(batch, weekly_slots):
-                missed.append(f"{_label(batch)} is outside the new availability.")
+                missed.append(f"Batch '{batch['batch_name']}' ({_label(batch)})")
     if missed:
-        raise HTTPException(status_code=400, detail=" ".join(missed[:6]))
+        detail_msg = (
+            "Cannot remove or modify availability: The coach is currently assigned to "
+            + ", ".join(missed[:6])
+            + ". Please reassign or change the coach for the assigned batch(es) first before modifying availability."
+        )
+        raise HTTPException(status_code=400, detail=detail_msg)

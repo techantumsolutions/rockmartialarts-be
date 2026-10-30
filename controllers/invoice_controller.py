@@ -58,6 +58,16 @@ class InvoiceController:
             if not branches:
                 return {"invoices": [], "total": 0, "skip": skip, "limit": limit}
             query["branch_id"] = {"$in": branches}
+        elif role == UserRole.COACH.value or role == "coach":
+            coach = await db.coaches.find_one({"$or": [{"id": current_user.get("id")}, {"user_id": current_user.get("id")}]})
+            b_id = coach.get("branch_id") if coach else None
+            if b_id:
+                query["branch_id"] = b_id
+            else:
+                query["$or"] = [
+                    {"created_by.user_id": current_user.get("id")},
+                    {"student_id": current_user.get("id")},
+                ]
         elif role != UserRole.SUPER_ADMIN.value:
             raise HTTPException(status_code=403, detail="Not allowed to list invoices")
 
@@ -281,6 +291,8 @@ class InvoiceController:
             if doc.get("branch_id") and doc.get("branch_id") in branches:
                 return
             raise HTTPException(status_code=403, detail="Not allowed to view this invoice")
+        if role == UserRole.COACH.value or role == "coach":
+            return
         raise HTTPException(status_code=403, detail="Not allowed")
 
     @staticmethod

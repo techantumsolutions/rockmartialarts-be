@@ -27,6 +27,9 @@ async def ensure_invoice_indexes(db=None) -> None:
     if db is None:
         return
     try:
+        # Clean up any null cart_checkout_id and payment_id so sparse unique indexes do not conflict on null
+        await db.invoices.update_many({"cart_checkout_id": None}, {"$unset": {"cart_checkout_id": ""}})
+        await db.invoices.update_many({"payment_id": None}, {"$unset": {"payment_id": ""}})
         await db.invoices.create_index("id", unique=True)
         await db.invoices.create_index("invoice_number", unique=True)
         await db.invoices.create_index("payment_id", unique=True, sparse=True)
@@ -277,7 +280,12 @@ async def generate_invoice_for_payment(
         logger.warning("Invoice skipped: payment not found payment_id=%s cart=%s", payment_id, checkout_id)
         return None
 
-    status = str(payment.get("payment_status") or payment.get("status") or "").lower()
+    status = payment.get("payment_status") or payment.get("status") or ""
+    if hasattr(status, "value"):
+        status = status.value
+    status = str(status).lower()
+    if status.startswith("paymentstatus."):
+        status = status.split(".", 1)[1]
     if status not in {"paid", "completed", "success"}:
         # Still allow if cart already fulfilled
         if not checkout_id:
@@ -340,13 +348,22 @@ async def generate_invoice_for_payment(
     paid_at = payment.get("payment_date") or payment.get("updated_at") or datetime.utcnow()
     invoice_number = await next_invoice_number(paid_at=paid_at if isinstance(paid_at, datetime) else None)
 
+    pm_raw = payment.get("payment_method")
+    if hasattr(pm_raw, "value"):
+        pm_raw = pm_raw.value
+    pm_str = str(pm_raw or "").lower()
+    gateway_label = payment.get("gateway_payment_label")
+    if not gateway_label:
+        if pm_str in ("physical_cash", "cash", "hand_cash"):
+            gateway_label = "Physical Hand Cash"
+        elif pm_str in ("razorpay", "online"):
+            gateway_label = "Razorpay"
+
     now = datetime.utcnow()
     doc: Dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "invoice_number": invoice_number,
         "status": InvoiceStatus.ISSUED.value,
-        "payment_id": payment.get("id"),
-        "cart_checkout_id": checkout_id,
         "student_id": student_id,
         "account_user_id": account_user_id or student_id,
         "branch_id": branch_id,
@@ -362,14 +379,18 @@ async def generate_invoice_for_payment(
         "payment_reference": payment.get("razorpay_payment_id")
         or payment.get("transaction_id")
         or payment.get("id"),
-        "payment_method": payment.get("payment_method"),
-        "payment_gateway_label": payment.get("gateway_payment_label"),
+        "payment_method": pm_str or "physical_cash",
+        "payment_gateway_label": gateway_label,
         "paid_at": paid_at,
         "notes": payment.get("notes"),
         "source": source,
         "created_at": now,
         "updated_at": now,
     }
+    if payment.get("id"):
+        doc["payment_id"] = payment.get("id")
+    if checkout_id:
+        doc["cart_checkout_id"] = checkout_id
     doc["document_html"] = build_invoice_html(doc)
 
     try:
