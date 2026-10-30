@@ -376,23 +376,25 @@ class AttendanceController:
                 # Get attendance records for the specific date
                 attendance_records = await db.attendance.find(filter_query).to_list(length=None)
 
-                # Create a map of student attendance
+                # Create maps of student attendance by student_id and by (student_id, course_id)
                 attendance_map = {}
+                attendance_by_course = {}
                 for record in attendance_records:
-                    student_id = record.get("student_id")
+                    student_id = str(record.get("student_id") or "")
+                    rec_course_id = str(record.get("course_id") or "").strip()
                     if student_id:
-                        # Use stored status if available, otherwise fall back to is_present logic
                         stored_status = record.get("status")
                         if stored_status:
                             status = stored_status
                         else:
-                            # Fallback for old records without status field
                             status = "present" if record.get("is_present") else "absent"
 
-                        attendance_map[student_id] = {
+                        att_obj = {
                             "id": record.get("id"),
                             "attendance_id": record.get("id"),
                             "status": status,
+                            "course_id": record.get("course_id"),
+                            "batch_ref": record.get("batch_ref") or record.get("batch_id"),
                             "check_in_time": record.get("check_in_time"),
                             "check_out_time": record.get("check_out_time"),
                             "notes": record.get("notes", ""),
@@ -402,6 +404,9 @@ class AttendanceController:
                             "attendance_modified_by": record.get("attendance_modified_by"),
                             "correction_reason": record.get("correction_reason"),
                         }
+                        if rec_course_id:
+                            attendance_by_course[(student_id, rec_course_id)] = att_obj
+                        attendance_map[student_id] = att_obj
 
                 # Combine student data with attendance and course information
                 # Prefetch courses referenced by the enrollments for this result set.
@@ -426,19 +431,6 @@ class AttendanceController:
 
                 for student in students:
                     student_id = str(student.get("id"))
-                    attendance_info = attendance_map.get(student_id, {
-                        "id": None,
-                        "attendance_id": None,
-                        "status": "not_marked",
-                        "check_in_time": None,
-                        "check_out_time": None,
-                        "notes": "",
-                        "marked_by": None,
-                        "admin_adjusted": False,
-                        "attendance_modified_at": None,
-                        "attendance_modified_by": None,
-                        "correction_reason": None,
-                    })
 
                     # Get student's enrollments for course information
                     student_enrollments = [e for e in enrollments if str(e.get("student_id")) == student_id]
@@ -448,6 +440,8 @@ class AttendanceController:
                         # Get course details
                         course = course_by_id.get(enrollment.get("course_id"))
                         if course:
+                            cid = str(course["id"])
+                            c_att = attendance_by_course.get((student_id, cid))
                             courses.append({
                                 "id": course["id"],
                                 "name": course.get("name", course.get("title", "Unknown Course")),
@@ -455,7 +449,30 @@ class AttendanceController:
                                 "course_name": course.get("name", course.get("title", "Unknown Course")),
                                 "batch_ref": enrollment.get("batch_ref") or (student.get("course") or {}).get("batch_ref"),
                                 "branch_id": enrollment.get("branch_id"),
+                                "attendance": c_att,
                             })
+
+                    # Match attendance to requested course_id or to the student's course
+                    target_course_id = str(course_id) if course_id else (str(courses[0]["id"]) if courses else None)
+                    attendance_info = None
+                    if target_course_id:
+                        attendance_info = attendance_by_course.get((student_id, target_course_id))
+
+                    if not attendance_info:
+                        attendance_info = {
+                            "id": None,
+                            "attendance_id": None,
+                            "status": "not_marked",
+                            "course_id": target_course_id,
+                            "check_in_time": None,
+                            "check_out_time": None,
+                            "notes": "",
+                            "marked_by": None,
+                            "admin_adjusted": False,
+                            "attendance_modified_at": None,
+                            "attendance_modified_by": None,
+                            "correction_reason": None,
+                        }
 
                     enrolled_branch_ids = [
                         str(e.get("branch_id")) for e in student_enrollments if e.get("branch_id")
@@ -483,6 +500,12 @@ class AttendanceController:
                         (student_enrollments[0].get("batch_ref") if student_enrollments else None)
                         or (student.get("course") or {}).get("batch_ref")
                     )
+                    att_by_c = {}
+                    for c in courses:
+                        cid = str(c.get("id") or c.get("course_id") or "")
+                        if cid and (student_id, cid) in attendance_by_course:
+                            att_by_c[cid] = attendance_by_course[(student_id, cid)]
+
                     result_students.append({
                         "id": student_id,
                         "full_name": student.get("full_name", "Unknown"),
@@ -493,7 +516,8 @@ class AttendanceController:
                         "courses": courses,
                         "batch_ref": primary_batch_ref,
                         "batch_refs": batch_refs,
-                        "attendance": attendance_info
+                        "attendance": attendance_info,
+                        "attendance_by_course": att_by_c
                     })
 
                 return {
