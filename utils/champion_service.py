@@ -365,23 +365,50 @@ async def archive_champion(
 async def search_students_for_link(
     *,
     search: Optional[str] = None,
-    limit: int = 30,
+    limit: int = 500,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Student options for optional champion ↔ student linkage."""
+    """Student options for optional champion ↔ student linkage.
+
+    Super admin / coach admin: any student account (same roster as students page).
+    Branch manager: students with an active enrollment in managed branches
+    (matches users/students/details branch scoping).
+    """
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
+    # Match students/details: include active + inactive accounts (missing is_active = active).
     q: Dict[str, Any] = {"role": "student"}
+
+    role = str((current_user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        allowed = await get_managed_branch_ids_for_user(db, current_user or {})
+        if not allowed:
+            return {"students": []}
+        # Treat missing enrollment.is_active as active (same as app defaults elsewhere).
+        enrolled_ids = await db.enrollments.distinct(
+            "student_id",
+            {"branch_id": {"$in": allowed}, "is_active": {"$ne": False}},
+        )
+        enrolled_ids = [str(sid) for sid in enrolled_ids if sid]
+        if not enrolled_ids:
+            return {"students": []}
+        q["id"] = {"$in": enrolled_ids}
+
     if search and search.strip():
         term = search.strip()
         q["$or"] = [
             {"full_name": {"$regex": term, "$options": "i"}},
             {"name": {"$regex": term, "$options": "i"}},
+            {"first_name": {"$regex": term, "$options": "i"}},
+            {"last_name": {"$regex": term, "$options": "i"}},
             {"email": {"$regex": term, "$options": "i"}},
             {"phone": {"$regex": term, "$options": "i"}},
             {"id": term},
         ]
-    limit = max(1, min(int(limit or 30), 100))
+    limit = max(1, min(int(limit or 500), 500))
     rows = (
         await db.users.find(
             q,
@@ -389,6 +416,8 @@ async def search_students_for_link(
                 "id": 1,
                 "full_name": 1,
                 "name": 1,
+                "first_name": 1,
+                "last_name": 1,
                 "email": 1,
                 "phone": 1,
                 "batch_ref": 1,
@@ -398,17 +427,25 @@ async def search_students_for_link(
         .limit(limit)
         .to_list(length=limit)
     )
-    students = [
-        {
-            "id": str(r["id"]),
-            "name": r.get("full_name") or r.get("name") or str(r["id"]),
-            "email": r.get("email"),
-            "phone": r.get("phone"),
-            "batch_ref": r.get("batch_ref"),
-        }
-        for r in rows
-        if r.get("id")
-    ]
+    students = []
+    for r in rows:
+        if not r.get("id"):
+            continue
+        name = (
+            r.get("full_name")
+            or r.get("name")
+            or f"{r.get('first_name', '')} {r.get('last_name', '')}".strip()
+            or str(r["id"])
+        )
+        students.append(
+            {
+                "id": str(r["id"]),
+                "name": name,
+                "email": r.get("email"),
+                "phone": r.get("phone"),
+                "batch_ref": r.get("batch_ref"),
+            }
+        )
     return {"students": students}
 
 

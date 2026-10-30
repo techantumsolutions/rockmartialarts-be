@@ -1054,8 +1054,13 @@ class CoachController:
             ).to_list(length=500)
 
             batch_lookup = {}  # batch_ref -> meta
-            batches_for_filters = []
+            assigned_course_batches = []  # batches on assigned courses (fallback filters)
+            trainer_batches = []  # batches where this coach is the trainer
             course_ids_from_batches = set()
+            # Batches where this coach is the assigned trainer (authoritative for student count)
+            coach_trainer_batch_refs = set()
+            coach_trainer_batch_names = set()
+            coach_trainer_batch_keys = set()  # (course_id, batch_ref)
 
             for branch in schedule_branches:
                 branch_name = ((branch.get("branch") or {}).get("name")) or "Branch"
@@ -1091,7 +1096,17 @@ class CoachController:
                         # Also index by name for legacy enrollments that store the name
                         if batch_name and batch_name not in batch_lookup:
                             batch_lookup[batch_name] = meta
-                        batches_for_filters.append(meta)
+                        if trainer_match:
+                            coach_trainer_batch_refs.add(batch_ref)
+                            if batch_name:
+                                coach_trainer_batch_names.add(batch_name)
+                            coach_trainer_batch_keys.add((course_id, batch_ref))
+                            trainer_batches.append(meta)
+                        elif on_assigned_course:
+                            assigned_course_batches.append(meta)
+
+            # Prefer trainer batches for filters; fall back to assigned-course batches
+            batches_for_filters = trainer_batches if trainer_batches else assigned_course_batches
 
             # Include courses that only appear via trainer-matched batches
             for cid in course_ids_from_batches:
@@ -1155,6 +1170,9 @@ class CoachController:
 
             enhanced_students = []
             has_unassigned = False
+            seen_student_course = set()
+            restrict_to_coach_batches = bool(coach_trainer_batch_refs)
+
             for enrollment in enrollments:
                 student = await db.users.find_one({
                     "id": enrollment["student_id"],
@@ -1193,6 +1211,22 @@ class CoachController:
                     batch_name = "Unassigned"
                     has_unassigned = True
 
+                # When this coach trains specific batches, only count students in those batches
+                if restrict_to_coach_batches:
+                    belongs_to_coach = (
+                        resolved_ref in coach_trainer_batch_refs
+                        or raw_batch_ref in coach_trainer_batch_refs
+                        or (batch_name and batch_name in coach_trainer_batch_names)
+                        or (course["id"], resolved_ref) in coach_trainer_batch_keys
+                    )
+                    if not belongs_to_coach:
+                        continue
+
+                dedupe_key = (str(student["id"]), str(course["id"]), resolved_ref)
+                if dedupe_key in seen_student_course:
+                    continue
+                seen_student_course.add(dedupe_key)
+
                 contact = student.get("contact_info") if isinstance(student.get("contact_info"), dict) else {}
                 enhanced_students.append({
                     "id": student["id"],
@@ -1213,7 +1247,7 @@ class CoachController:
                     "enrollment_id": enrollment.get("id"),
                 })
 
-            if has_unassigned:
+            if has_unassigned and not restrict_to_coach_batches:
                 unassigned_key = ("__unassigned__", "__unassigned__")
                 if unassigned_key not in seen_batch_keys:
                     unique_batches.append({
@@ -1228,9 +1262,11 @@ class CoachController:
             # Sort by student name then course
             enhanced_students.sort(key=lambda s: ((s.get("student_name") or "").lower(), (s.get("course_name") or "").lower()))
 
+            unique_student_ids = {str(s.get("id")) for s in enhanced_students if s.get("id")}
             return {
                 "students": enhanced_students,
                 "total": len(enhanced_students),
+                "unique_students": len(unique_student_ids),
                 "coach_id": coach_id,
                 "coach_name": coach.get("full_name", ""),
                 "filters": {
