@@ -37,7 +37,7 @@ from utils.unified_auth import require_role_unified
 
 router = APIRouter()
 
-_ADMIN = [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN]
+_ADMIN = [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
 
 
 # --- M20-S03 public surfaces (no auth; before /{champion_id}) ---
@@ -91,11 +91,13 @@ async def api_create_champion(
 @router.get("/student-options")
 async def api_champion_student_options(
     search: Optional[str] = Query(None),
-    limit: int = Query(30, ge=1, le=100),
+    limit: int = Query(500, ge=1, le=500),
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    """Students available to link to a champion profile."""
-    return await search_students_for_link(search=search, limit=limit)
+    """Students available to link to a champion profile (branch-scoped for branch managers)."""
+    return await search_students_for_link(
+        search=search, limit=limit, current_user=current_user
+    )
 
 
 # --- M20-S02 nested achievements (before bare /{champion_id}) ---
