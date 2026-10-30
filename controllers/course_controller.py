@@ -185,6 +185,52 @@ def _timing_field(t: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+SHORT_DAYS_PY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_INDEX_PY = {
+    "mon": 0, "monday": 0, "mondays": 0,
+    "tue": 1, "tues": 1, "tuesday": 1, "tuesdays": 1,
+    "wed": 2, "wednesday": 2, "wednesdays": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "thursdays": 3,
+    "fri": 4, "friday": 4, "fridays": 4,
+    "sat": 5, "saturday": 5, "saturdays": 5,
+    "sun": 6, "sunday": 6, "sundays": 6,
+}
+
+
+def _format_weekday_ranges(days: Any) -> str:
+    """Format days into Mon - Sat or Mon, Wed, Fri with breakers."""
+    if not days or not isinstance(days, (list, tuple)):
+        return ""
+    indices = []
+    for d in days:
+        if isinstance(d, str):
+            idx = DAY_INDEX_PY.get(d.strip().lower())
+            if idx is not None:
+                indices.append(idx)
+    unique = sorted(set(indices))
+    if not unique:
+        return ", ".join(str(d) for d in days if d)
+    parts: list[str] = []
+    run_start = unique[0]
+    run_end = unique[0]
+    for idx in unique[1:]:
+        if idx == run_end + 1:
+            run_end = idx
+        else:
+            parts.append(
+                f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+                if run_start != run_end
+                else SHORT_DAYS_PY[run_start]
+            )
+            run_start = run_end = idx
+    parts.append(
+        f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+        if run_start != run_end
+        else SHORT_DAYS_PY[run_start]
+    )
+    return ", ".join(parts)
+
+
 def format_branch_timings_display(timings_list: Any) -> str:
     """Build a single display string from branch operational_details.timings (flexible field names)."""
     if not timings_list or not isinstance(timings_list, (list, tuple)):
@@ -196,11 +242,16 @@ def format_branch_timings_display(timings_list: Any) -> str:
         open_t = _timing_field(t, "open", "open_time", "start", "from")
         close_t = _timing_field(t, "close", "close_time", "end", "to")
         day = _timing_field(t, "day", "weekday")
+        day_short = (
+            SHORT_DAYS_PY[DAY_INDEX_PY[day.strip().lower()]]
+            if day and day.strip().lower() in DAY_INDEX_PY
+            else day
+        )
         if open_t and close_t:
-            parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
+            parts.append(f"{day_short}: {open_t} to {close_t}" if day_short else f"{open_t} to {close_t}")
         elif open_t or close_t:
             slot = f"{open_t} – {close_t}".strip(" –") if (open_t and close_t) else (open_t or close_t)
-            parts.append(f"{day}: {slot}" if day else slot)
+            parts.append(f"{day_short}: {slot}" if day_short else slot)
     if parts:
         return " | ".join(parts)
     first = timings_list[0] if timings_list else None
@@ -231,7 +282,7 @@ def _format_course_batches_timings(course_id: str, schedule: Any) -> str:
         if not isinstance(b, dict):
             continue
         days = b.get("days") or []
-        ds = ", ".join(str(d) for d in days if d) if days else ""
+        ds = _format_weekday_ranges(days) if days else ""
         st = str(b.get("start_time") or "").strip()
         en = str(b.get("end_time") or "").strip()
         ts = f"{st} – {en}" if st and en else (st or en)
