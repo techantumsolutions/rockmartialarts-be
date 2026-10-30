@@ -185,6 +185,52 @@ def _timing_field(t: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+SHORT_DAYS_PY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_INDEX_PY = {
+    "mon": 0, "monday": 0, "mondays": 0,
+    "tue": 1, "tues": 1, "tuesday": 1, "tuesdays": 1,
+    "wed": 2, "wednesday": 2, "wednesdays": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "thursdays": 3,
+    "fri": 4, "friday": 4, "fridays": 4,
+    "sat": 5, "saturday": 5, "saturdays": 5,
+    "sun": 6, "sunday": 6, "sundays": 6,
+}
+
+
+def _format_weekday_ranges(days: Any) -> str:
+    """Format days into Mon - Sat or Mon, Wed, Fri with breakers."""
+    if not days or not isinstance(days, (list, tuple)):
+        return ""
+    indices = []
+    for d in days:
+        if isinstance(d, str):
+            idx = DAY_INDEX_PY.get(d.strip().lower())
+            if idx is not None:
+                indices.append(idx)
+    unique = sorted(set(indices))
+    if not unique:
+        return ", ".join(str(d) for d in days if d)
+    parts: list[str] = []
+    run_start = unique[0]
+    run_end = unique[0]
+    for idx in unique[1:]:
+        if idx == run_end + 1:
+            run_end = idx
+        else:
+            parts.append(
+                f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+                if run_start != run_end
+                else SHORT_DAYS_PY[run_start]
+            )
+            run_start = run_end = idx
+    parts.append(
+        f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+        if run_start != run_end
+        else SHORT_DAYS_PY[run_start]
+    )
+    return ", ".join(parts)
+
+
 def format_branch_timings_display(timings_list: Any) -> str:
     """Build a single display string from branch operational_details.timings (flexible field names)."""
     if not timings_list or not isinstance(timings_list, (list, tuple)):
@@ -196,11 +242,16 @@ def format_branch_timings_display(timings_list: Any) -> str:
         open_t = _timing_field(t, "open", "open_time", "start", "from")
         close_t = _timing_field(t, "close", "close_time", "end", "to")
         day = _timing_field(t, "day", "weekday")
+        day_short = (
+            SHORT_DAYS_PY[DAY_INDEX_PY[day.strip().lower()]]
+            if day and day.strip().lower() in DAY_INDEX_PY
+            else day
+        )
         if open_t and close_t:
-            parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
+            parts.append(f"{day_short}: {open_t} to {close_t}" if day_short else f"{open_t} to {close_t}")
         elif open_t or close_t:
             slot = f"{open_t} – {close_t}".strip(" –") if (open_t and close_t) else (open_t or close_t)
-            parts.append(f"{day}: {slot}" if day else slot)
+            parts.append(f"{day_short}: {slot}" if day_short else slot)
     if parts:
         return " | ".join(parts)
     first = timings_list[0] if timings_list else None
@@ -231,7 +282,7 @@ def _format_course_batches_timings(course_id: str, schedule: Any) -> str:
         if not isinstance(b, dict):
             continue
         days = b.get("days") or []
-        ds = ", ".join(str(d) for d in days if d) if days else ""
+        ds = _format_weekday_ranges(days) if days else ""
         st = str(b.get("start_time") or "").strip()
         en = str(b.get("end_time") or "").strip()
         ts = f"{st} – {en}" if st and en else (st or en)
@@ -620,15 +671,13 @@ class CourseController:
         if not existing_course:
             raise HTTPException(status_code=404, detail="Course not found")
         
-        bm_managed_branches = None
-
         # Coach Admin permission check
         if current_user["role"] == UserRole.COACH_ADMIN:
             # Check if user is the instructor of this course or can manage it
             if existing_course.get("instructor_id") != current_user["id"]:
                 raise HTTPException(status_code=403, detail="You can only update courses where you are the instructor.")
 
-        # Branch Manager permission check
+        # Branch Manager permission check — full edit for courses assigned to managed branches
         elif current_user["role"] == UserRole.BRANCH_MANAGER:
             from utils.student_status_service import get_managed_branch_ids_for_user
 
@@ -642,7 +691,6 @@ class CourseController:
             if not bm_managed_branches:
                 raise HTTPException(status_code=403, detail="You don't manage any branches.")
 
-            # Check if the course is assigned to any of the managed branches
             course_assigned_to_managed_branch = False
             for branch in bm_managed_branches:
                 assigned_courses = branch.get("assignments", {}).get("courses", [])
@@ -652,49 +700,14 @@ class CourseController:
 
             is_creator = (
                 existing_course.get("created_by") == current_user.get("id") or
-                (allowed_ids and any(bid in (existing_course.get("branch_ids") or []) for bid in allowed_ids))
+                (
+                    str(existing_course.get("created_by_role") or "").lower() == "branch_manager"
+                    and allowed_ids
+                    and any(bid in (existing_course.get("branch_ids") or []) for bid in allowed_ids)
+                )
             )
             if not course_assigned_to_managed_branch and not is_creator:
                 raise HTTPException(status_code=403, detail="You can only update courses assigned to branches you manage.")
-
-        # Branch managers may only merge branch-specific fees (branch_pricing) for their branches
-        if current_user["role"] == UserRole.BRANCH_MANAGER:
-            managed_branches = bm_managed_branches or []
-            managed_ids = {b["id"] for b in managed_branches}
-            raw = course_update.dict(exclude_unset=True)
-            if not raw:
-                raise HTTPException(status_code=400, detail="No update data provided")
-            pricing = raw.get("pricing")
-            if not isinstance(pricing, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Branch managers can only update branch-specific fees. Send pricing.branch_prices for your branch.",
-                )
-            branch_prices = pricing.get("branch_prices") or []
-            delta_bp = _expand_branch_prices_to_branch_pricing(branch_prices)
-            if not delta_bp:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide at least one branch fee in pricing.branch_prices for your branch.",
-                )
-            for bid in delta_bp.keys():
-                if bid not in managed_ids:
-                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
-                branch_doc = next((b for b in managed_branches if b["id"] == bid), None)
-                if not branch_doc:
-                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
-                assigned = branch_doc.get("assignments", {}).get("courses", [])
-                if course_id not in assigned:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="This course is not assigned to that branch.",
-                    )
-            merged_bp = _merge_branch_pricing_delta(existing_course.get("branch_pricing"), delta_bp)
-            update_data = {"branch_pricing": merged_bp, "updated_at": datetime.utcnow()}
-            result = await db.courses.update_one({"id": course_id}, {"$set": update_data})
-            if result.matched_count == 0:
-                raise HTTPException(status_code=404, detail="Course not found")
-            return {"message": "Course updated successfully"}
 
         update_data = {k: v for k, v in course_update.dict(exclude_unset=True).items()}
         if not update_data:

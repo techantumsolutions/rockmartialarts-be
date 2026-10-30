@@ -330,8 +330,10 @@ class AttendanceController:
                 # Get student IDs for enrollment filtering
                 student_ids = [student["id"] for student in students]
 
-                # Build enrollment filter based on role
-                enrollment_filter = {"student_id": {"$in": student_ids}}
+                # Build enrollment filter based on role.
+                # Require active enrollments so attendance roster matches students page
+                # (exclude accounts with only inactive/old enrollments).
+                enrollment_filter = {"student_id": {"$in": student_ids}, "is_active": True}
                 if managed_branch_ids:
                     if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
                         enrollment_filter["branch_id"] = branch_id
@@ -958,8 +960,10 @@ class AttendanceController:
             student_filter = {"role": "student", "is_active": True}
 
             if managed_branch_ids:
-                # For branch managers, get students from their branches via enrollments
-                enrollments = await db.enrollments.find({"branch_id": {"$in": managed_branch_ids}}).to_list(length=None)
+                # For branch managers, get students from their branches via active enrollments
+                enrollments = await db.enrollments.find(
+                    {"branch_id": {"$in": managed_branch_ids}, "is_active": True}
+                ).to_list(length=None)
                 if enrollments:
                     enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
                     student_filter["id"] = {"$in": enrolled_student_ids}
@@ -967,8 +971,10 @@ class AttendanceController:
                     # If no enrollments exist, show no students for branch managers
                     student_filter["id"] = {"$in": []}
             elif branch_id:
-                # For specific branch, get students from that branch via enrollments
-                enrollments = await db.enrollments.find({"branch_id": branch_id}).to_list(length=None)
+                # For specific branch, get students from that branch via active enrollments
+                enrollments = await db.enrollments.find(
+                    {"branch_id": branch_id, "is_active": True}
+                ).to_list(length=None)
                 if enrollments:
                     enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
                     student_filter["id"] = {"$in": enrolled_student_ids}

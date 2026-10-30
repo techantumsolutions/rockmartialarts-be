@@ -15,6 +15,22 @@ from utils.family_accounts import (
 )
 
 
+def cart_addition_blocking_issues(
+    issues: List[CartValidationIssue],
+    existing_item_ids: set[str],
+) -> List[CartValidationIssue]:
+    """Keep legacy enrollment issues from blocking unrelated cart additions."""
+    return [
+        issue
+        for issue in issues
+        if issue.code != "fee_drift"
+        and not (
+            issue.code == "already_enrolled"
+            and issue.item_id in existing_item_ids
+        )
+    ]
+
+
 def _item_key(item: dict) -> tuple:
     return (
         item.get("student_line_id"),
