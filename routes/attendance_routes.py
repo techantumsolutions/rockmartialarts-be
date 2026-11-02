@@ -239,6 +239,27 @@ async def get_coach_students_attendance(
     """Get students assigned to a specific coach with their attendance for a specific date"""
     return await AttendanceController.get_coach_students_attendance(coach_id, date, current_user)
 
+@router.get("/coach/my-attendance")
+async def get_my_coach_attendance(
+    coach_id: Optional[str] = Query(None),
+    month: Optional[int] = Query(None),
+    year: Optional[int] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+):
+    """Get attendance records and stats for the logged-in coach (or specified coach for admins)"""
+    return await AttendanceController.get_my_coach_attendance(
+        current_user=current_user,
+        coach_id=coach_id,
+        month=month,
+        year=year,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+    )
+
 @router.post("/coach/mark")
 async def mark_coach_attendance(
     attendance_data: CoachAttendanceCreate,

@@ -636,6 +636,181 @@ class AttendanceController:
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
 
     @staticmethod
+    async def get_my_coach_attendance(
+        current_user: dict,
+        coach_id: Optional[str] = None,
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
+        """Get attendance records and summary for the coach (marked by super admin or branch manager)."""
+        try:
+            db = get_db()
+            if db is None:
+                raise HTTPException(status_code=500, detail="Database connection not available")
+
+            # Determine coach id
+            target_coach_id = current_user.get("id")
+            if current_user.get("role") in ["super_admin", "superadmin", "branch_manager", "coach_admin"] and coach_id:
+                target_coach_id = coach_id
+
+            if not target_coach_id:
+                raise HTTPException(status_code=400, detail="Coach ID could not be identified")
+
+            # Find coach info
+            coach_doc = await db.coaches.find_one({"id": target_coach_id})
+            if not coach_doc:
+                coach_doc = await db.users.find_one({"id": target_coach_id, "role": "coach"})
+
+            coach_name = "Coach"
+            if coach_doc:
+                coach_name = coach_doc.get("full_name") or f"{coach_doc.get('first_name', '')} {coach_doc.get('last_name', '')}".strip() or "Coach"
+
+            coach_branch_id = (coach_doc or {}).get("branch_id")
+            branch_name = "Main Branch"
+            if coach_branch_id:
+                branch = await db.branches.find_one({"id": coach_branch_id})
+                if branch:
+                    branch_name = (branch.get("branch") or {}).get("name") or branch.get("name") or "Main Branch"
+
+            # Build query
+            query = {"coach_id": target_coach_id}
+
+            # Month and Year filter or start_date / end_date
+            if month and year:
+                try:
+                    start_dt = datetime(year, month, 1, 0, 0, 0)
+                    if month == 12:
+                        end_dt = datetime(year + 1, 1, 1, 0, 0, 0)
+                    else:
+                        end_dt = datetime(year, month + 1, 1, 0, 0, 0)
+                    query["attendance_date"] = {"$gte": start_dt, "$lt": end_dt}
+                except Exception as e:
+                    logger.warning(f"Invalid month/year: {e}")
+            elif start_date or end_date:
+                date_filter = {}
+                if start_date:
+                    try:
+                        s_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00")).replace(hour=0, minute=0, second=0, microsecond=0)
+                        date_filter["$gte"] = s_dt
+                    except Exception:
+                        pass
+                if end_date:
+                    try:
+                        e_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00")).replace(hour=23, minute=59, second=59, microsecond=999999)
+                        date_filter["$lte"] = e_dt
+                    except Exception:
+                        pass
+                if date_filter:
+                    query["attendance_date"] = date_filter
+
+            if status and status.lower() != "all":
+                query["status"] = status.lower()
+
+            raw_records = await db.coach_attendance.find(query).sort("attendance_date", -1).to_list(length=1000)
+
+            # Gather marked_by IDs to lookup who marked it
+            marker_ids = list({r.get("marked_by") for r in raw_records if r.get("marked_by")})
+            markers_map = {}
+            if marker_ids:
+                superadmins = await db.superadmins.find({"id": {"$in": marker_ids}}).to_list(length=None)
+                for sa in superadmins:
+                    name = sa.get("name") or sa.get("full_name") or sa.get("email") or "Super Admin"
+                    markers_map[sa.get("id")] = {"name": name, "role": "Super Admin"}
+
+                bms = await db.branch_managers.find({"id": {"$in": marker_ids}}).to_list(length=None)
+                for bm in bms:
+                    bm_name = bm.get("full_name") or f"{bm.get('first_name', '')} {bm.get('last_name', '')}".strip() or bm.get("email") or "Branch Manager"
+                    markers_map[bm.get("id")] = {"name": bm_name, "role": "Branch Manager"}
+
+                users = await db.users.find({"id": {"$in": marker_ids}}).to_list(length=None)
+                for u in users:
+                    if u.get("id") not in markers_map:
+                        u_name = u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Administrator"
+                        role_str = (u.get("role") or "admin").replace("_", " ").title()
+                        markers_map[u.get("id")] = {"name": u_name, "role": role_str}
+
+            # Branch cache for records that have their own branch_id
+            rec_branch_ids = list({r.get("branch_id") for r in raw_records if r.get("branch_id")})
+            rec_branches_map = {}
+            if rec_branch_ids:
+                branches = await db.branches.find({"id": {"$in": rec_branch_ids}}).to_list(length=None)
+                for b in branches:
+                    b_name = (b.get("branch") or {}).get("name") or b.get("name") or "Branch"
+                    rec_branches_map[b.get("id")] = b_name
+
+            formatted_records = []
+            for r in raw_records:
+                st = r.get("status")
+                if not st:
+                    st = "present" if r.get("is_present") else "absent"
+                st = str(st).lower()
+
+                marker_info = markers_map.get(r.get("marked_by"), {
+                    "name": "Super Admin / Branch Manager" if r.get("marked_by") else "System",
+                    "role": "Management"
+                })
+
+                r_branch_id = r.get("branch_id")
+                r_branch_name = rec_branches_map.get(r_branch_id) or branch_name
+
+                att_date_str = _attendance_calendar_day(r.get("attendance_date"))
+                att_date_dt = r.get("attendance_date")
+                day_name = att_date_dt.strftime("%A") if isinstance(att_date_dt, (datetime, date_cls)) else ""
+
+                formatted_records.append({
+                    "id": str(r.get("id") or r.get("_id")),
+                    "attendance_date": att_date_str,
+                    "day_name": day_name,
+                    "status": st,
+                    "is_present": bool(r.get("is_present", st == "present")),
+                    "check_in_time": _dt_to_ist_ampm(r.get("check_in_time")),
+                    "check_out_time": _dt_to_ist_ampm(r.get("check_out_time")),
+                    "raw_check_in": r.get("check_in_time").isoformat() if hasattr(r.get("check_in_time"), "isoformat") else None,
+                    "raw_check_out": r.get("check_out_time").isoformat() if hasattr(r.get("check_out_time"), "isoformat") else None,
+                    "method": r.get("method") or "manual",
+                    "notes": r.get("notes") or "",
+                    "marked_by": r.get("marked_by"),
+                    "marked_by_name": marker_info.get("name"),
+                    "marked_by_role": marker_info.get("role"),
+                    "branch_id": r_branch_id,
+                    "branch_name": r_branch_name,
+                    "created_at": r.get("created_at").isoformat() if hasattr(r.get("created_at"), "isoformat") else None,
+                    "updated_at": r.get("updated_at").isoformat() if hasattr(r.get("updated_at"), "isoformat") else None,
+                })
+
+            total_days = len(formatted_records)
+            present_days = sum(1 for r in formatted_records if r["status"] == "present")
+            absent_days = sum(1 for r in formatted_records if r["status"] == "absent")
+            attendance_rate = round((present_days / total_days * 100), 1) if total_days > 0 else 0
+
+            return {
+                "success": True,
+                "coach": {
+                    "id": target_coach_id,
+                    "name": coach_name,
+                    "branch_id": coach_branch_id,
+                    "branch_name": branch_name,
+                },
+                "summary": {
+                    "total_days": total_days,
+                    "present_days": present_days,
+                    "absent_days": absent_days,
+                    "attendance_rate": attendance_rate,
+                },
+                "records": formatted_records,
+                "total": total_days,
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to fetch coach attendance: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to get coach attendance: {str(e)}")
+
+    @staticmethod
     async def get_course_batches(
         course_id: str,
         branch_id: Optional[str] = None,
@@ -2306,4 +2481,3 @@ class AttendanceController:
         except Exception as e:
             print(f"❌ Error fetching student attendance: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
-

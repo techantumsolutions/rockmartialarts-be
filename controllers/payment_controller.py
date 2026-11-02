@@ -2511,6 +2511,25 @@ class PaymentController:
     @staticmethod
     async def create_registration_order(order_data: CreateRegistrationOrderBody) -> Dict[str, Any]:
         """Create a Razorpay order for student registration checkout."""
+        import re
+        db_check = get_db()
+        # Safeguard: Verify student email and phone are not already registered before creating payment order
+        student_email = (order_data.student_email or "").strip().lower()
+        student_phone = (order_data.student_phone or "").strip()
+        if student_email and db_check is not None:
+            existing_email = await db_check.users.find_one({"email": {"$regex": f"^{re.escape(student_email)}$", "$options": "i"}})
+            if existing_email:
+                raise HTTPException(status_code=400, detail="This email address is already registered. Please use a different email.")
+        if student_phone and db_check is not None:
+            digits = "".join(c for c in student_phone if c.isdigit())
+            if len(digits) >= 10:
+                norm = digits[-10:]
+                variants = [norm, f"91{norm}", f"+91{norm}", f"+91-{norm}", f"0{norm}", f"91-{norm}", f"+91 {norm}"]
+                existing_phone = await db_check.users.find_one({"phone": {"$in": variants}})
+                if not existing_phone:
+                    existing_phone = await db_check.users.find_one({"phone": {"$regex": re.escape(norm) + r"\s*$"}})
+                if existing_phone:
+                    raise HTTPException(status_code=400, detail="This mobile number is already registered. Please use a different number.")
         db = get_db()
         payment_info = await PaymentController.get_course_payment_info(
             order_data.course_id,
