@@ -1,0 +1,46 @@
+"""White-label partner organization APIs."""
+
+from models.partner_org_models import (
+    PartnerLogin,
+    PartnerOrgCreate,
+    PartnerOrgUpdateStatus,
+    PartnerOrgVerifyPayment,
+    PartnerSetPassword,
+)
+from utils import partner_org_service as svc
+
+
+class PartnerOrgController:
+    @staticmethod
+    async def list_orgs(skip: int = 0, limit: int = 100, include_inactive: bool = True):
+        return await svc.list_partner_orgs(
+            skip=skip, limit=limit, include_inactive=include_inactive
+        )
+
+    @staticmethod
+    async def create_offline(body: PartnerOrgCreate, current_user: dict):
+        return await svc.create_partner_offline(body, current_user)
+
+    @staticmethod
+    async def create_online_order(body: PartnerOrgCreate, current_user: dict):
+        return await svc.create_partner_online_order(body, current_user)
+
+    @staticmethod
+    async def verify_online(body: PartnerOrgVerifyPayment, current_user: dict):
+        return await svc.verify_partner_online_payment(body, current_user)
+
+    @staticmethod
+    async def set_password(body: PartnerSetPassword):
+        return await svc.set_partner_password(body)
+
+    @staticmethod
+    async def login(slug: str, body: PartnerLogin):
+        return await svc.login_partner(slug, body)
+
+    @staticmethod
+    async def public_by_slug(slug: str):
+        return await svc.get_partner_public_by_slug(slug)
+
+    @staticmethod
+    async def set_active(partner_org_id: str, body: PartnerOrgUpdateStatus, current_user: dict):
+        return await svc.set_partner_org_active(partner_org_id, body, current_user)

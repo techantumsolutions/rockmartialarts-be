@@ -28,6 +28,7 @@ CORRECTOR_ROLES = {
     "superadmin",
     "coach_admin",
     "branch_manager",
+    "partner_super_admin",
 }
 
 
@@ -101,7 +102,7 @@ async def assert_correction_permission(db, current_user: dict, branch_id: str) -
     if role not in CORRECTOR_ROLES:
         raise HTTPException(
             status_code=403,
-            detail="Only Super Admin, Coach Admin, or Branch Manager may correct attendance",
+            detail="Only Super Admin, Coach Admin, Branch Manager, or Partner Admin may correct attendance",
         )
     if role == "branch_manager":
         managed = await get_managed_branch_ids_for_user(db, current_user)
@@ -112,6 +113,10 @@ async def assert_correction_permission(db, current_user: dict, branch_id: str) -
                 status_code=403,
                 detail="Branch Manager cannot correct attendance for other branches",
             )
+    if role == "partner_super_admin":
+        from utils.partner_tenant import assert_partner_owns_branch
+
+        await assert_partner_owns_branch(db, current_user, branch_id)
 
 
 def _validate_times(
@@ -309,6 +314,11 @@ async def list_correction_history(
         if not managed:
             return {"corrections": [], "total": 0, "count": 0}
         q["branch_id"] = {"$in": managed}
+    elif current_user and _role(current_user) == "partner_super_admin":
+        from utils.partner_tenant import partner_branch_ids
+
+        p_bids = await partner_branch_ids(db, current_user)
+        q["branch_id"] = {"$in": list(p_bids or [])}
 
     skip = max(0, skip)
     limit = max(1, min(limit, 200))

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, EmailStr, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, EmailStr, AliasChoices, ConfigDict, field_validator
 from datetime import datetime, date
 from typing import Optional, Dict, List
 import uuid
@@ -14,9 +14,27 @@ class Address(BaseModel):
 class BranchInfo(BaseModel):
     name: str
     code: str
-    email: EmailStr
-    phone: str
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
     address: Address
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def empty_email_to_none(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def empty_phone_to_none(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v.strip() if isinstance(v, str) else v
 
 class OperationalTiming(BaseModel):
     day: str

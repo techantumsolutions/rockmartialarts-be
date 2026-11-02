@@ -114,6 +114,7 @@ from routes.champion_routes import (
 from routes.collaboration_partner_routes import (
     router as collaboration_partner_router,
 )
+from routes.partner_org_routes import router as partner_org_router
 
 # Import database utility
 from utils.database import db
@@ -690,6 +691,11 @@ app.include_router(
     collaboration_partner_router,
     prefix="/api/collaboration-partners",
     tags=["Collaboration Partners"],
+)
+app.include_router(
+    partner_org_router,
+    prefix="/api/partner-organizations",
+    tags=["Partner Organizations"],
 )
 app.include_router(callback_router, prefix="/api/callbacks", tags=["Callbacks"])
 app.include_router(dropdown_settings_router, prefix="/api/dropdown-settings", tags=["Master Data"])

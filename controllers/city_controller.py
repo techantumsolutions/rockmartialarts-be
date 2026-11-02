@@ -12,21 +12,41 @@ from utils.geography import (
     unique_slug,
 )
 from utils.branch_geography import count_active_branches_for_location
+from utils.partner_tenant import (
+    assert_tenant_doc_access,
+    merge_and_clause,
+    rock_owned_clause,
+    stamp_tenant,
+    tenant_or_rock_owned_filter,
+    uniqueness_scope_for_user,
+)
 
 
 class CityController:
     @staticmethod
-    async def _require_state(db, state_id: str, require_active: bool = False) -> dict:
+    async def _require_state(
+        db, state_id: str, current_user: dict = None, require_active: bool = False
+    ) -> dict:
         state = await db.states.find_one({"id": state_id})
         if not state:
             raise HTTPException(status_code=400, detail="Invalid state")
+        if current_user is not None:
+            assert_tenant_doc_access(state, current_user, entity="state")
         if require_active and not state.get("is_active", True):
             raise HTTPException(status_code=400, detail="Cannot assign a city to an inactive state")
         return state
 
     @staticmethod
-    async def _city_name_taken(db, name: str, state_id: str, exclude_id: Optional[str] = None) -> bool:
+    async def _city_name_taken(
+        db,
+        name: str,
+        state_id: str,
+        current_user: dict = None,
+        exclude_id: Optional[str] = None,
+    ) -> bool:
         query = name_conflict_query(name, extra={"state_id": state_id}, exclude_id=exclude_id)
+        if current_user is not None:
+            query = merge_and_clause(query, uniqueness_scope_for_user(current_user))
         found = await db.locations.find_one(query)
         return found is not None
 
@@ -42,17 +62,27 @@ class CityController:
             raise HTTPException(status_code=400, detail="State is required")
 
         db = get_db()
-        state = await CityController._require_state(db, city_data.state_id.strip(), require_active=True)
+        scope = uniqueness_scope_for_user(current_user)
+        state = await CityController._require_state(
+            db, city_data.state_id.strip(), current_user=current_user, require_active=True
+        )
 
-        if await CityController._city_name_taken(db, name, state["id"]):
-            raise HTTPException(status_code=400, detail="A city with this name already exists in the selected state")
+        if await CityController._city_name_taken(db, name, state["id"], current_user):
+            raise HTTPException(
+                status_code=400,
+                detail="A city with this name already exists in the selected state",
+            )
 
-        code = (city_data.code or "").strip().upper() or await unique_code(db.locations, name)
-        if await db.locations.find_one({"code": code}):
+        code = (city_data.code or "").strip().upper() or await unique_code(
+            db.locations, name, scope=scope
+        )
+        if await db.locations.find_one(merge_and_clause({"code": code}, scope)):
             raise HTTPException(status_code=400, detail="City code already exists")
 
-        slug = (city_data.slug or "").strip() or await unique_slug(db.locations, name)
-        if await db.locations.find_one({"slug": slug}):
+        slug = (city_data.slug or "").strip() or await unique_slug(
+            db.locations, name, scope=scope
+        )
+        if await db.locations.find_one(merge_and_clause({"slug": slug}, scope)):
             raise HTTPException(status_code=400, detail="City slug already exists")
 
         location = Location(
@@ -67,7 +97,9 @@ class CityController:
             display_order=city_data.display_order or 0,
             description=city_data.description,
         )
-        await db.locations.insert_one(location.dict())
+        location_dict = location.dict()
+        stamp_tenant(location_dict, current_user)
+        await db.locations.insert_one(location_dict)
         return {"message": "City created successfully", "city_id": location.id, "location_id": location.id}
 
     @staticmethod
@@ -90,6 +122,7 @@ class CityController:
             query["is_active"] = True
         if search and search.strip():
             query["name"] = {"$regex": search.strip(), "$options": "i"}
+        query = tenant_or_rock_owned_filter(query, current_user)
 
         cursor = db.locations.find(query).sort([("name", 1)]).skip(skip).limit(limit)
         cities = await cursor.to_list(limit)
@@ -120,13 +153,15 @@ class CityController:
         if limit > 200:
             limit = 200
 
-        query = {}
+        query = merge_and_clause({}, rock_owned_clause())
         if active_only:
-            query["is_active"] = True
+            query = merge_and_clause(query, {"is_active": True})
 
         active_state_ids = None
         if state_id:
-            state = await db.states.find_one({"id": state_id})
+            state = await db.states.find_one(
+                merge_and_clause({"id": state_id}, rock_owned_clause())
+            )
             if not state:
                 return {
                     "message": "Retrieved 0 cities successfully",
@@ -143,19 +178,25 @@ class CityController:
                     "skip": skip,
                     "limit": limit,
                 }
-            query["state_id"] = state_id
+            query = merge_and_clause(query, {"state_id": state_id})
         elif active_only:
-            active_states = await db.states.find({"is_active": True}).to_list(500)
+            active_states = await db.states.find(
+                merge_and_clause({"is_active": True}, rock_owned_clause())
+            ).to_list(500)
             active_state_ids = {s["id"] for s in active_states}
-            # Include cities linked to active states, plus legacy cities with no state_id
-            # so unmigrated location records still appear in dropdowns.
+            # Include cities linked to active Rock states, plus legacy cities with no state_id
             if active_state_ids:
-                query["$or"] = [
-                    {"state_id": {"$in": list(active_state_ids)}},
-                    {"state_id": {"$exists": False}},
-                    {"state_id": None},
-                    {"state_id": ""},
-                ]
+                query = merge_and_clause(
+                    query,
+                    {
+                        "$or": [
+                            {"state_id": {"$in": list(active_state_ids)}},
+                            {"state_id": {"$exists": False}},
+                            {"state_id": None},
+                            {"state_id": ""},
+                        ]
+                    },
+                )
 
         cursor = db.locations.find(query).sort([("name", 1)]).skip(skip).limit(limit)
         cities = await cursor.to_list(limit)
@@ -202,7 +243,9 @@ class CityController:
         existing = await db.locations.find_one({"id": city_id})
         if not existing:
             raise HTTPException(status_code=404, detail="City not found")
+        assert_tenant_doc_access(existing, current_user, entity="city")
 
+        scope = uniqueness_scope_for_user(current_user)
         updates = {k: v for k, v in city_update.dict().items() if v is not None}
         next_state_id = updates.get("state_id", existing.get("state_id"))
         next_name = str(updates.get("name", existing.get("name") or "")).strip()
@@ -216,13 +259,17 @@ class CityController:
             state_id = str(updates["state_id"]).strip()
             if not state_id:
                 raise HTTPException(status_code=400, detail="State is required")
-            state = await CityController._require_state(db, state_id, require_active=True)
+            state = await CityController._require_state(
+                db, state_id, current_user=current_user, require_active=True
+            )
             updates["state_id"] = state["id"]
             updates["state"] = state["name"]
             next_state_id = state["id"]
 
         if ("name" in updates or "state_id" in updates) and next_state_id:
-            if await CityController._city_name_taken(db, next_name, next_state_id, exclude_id=city_id):
+            if await CityController._city_name_taken(
+                db, next_name, next_state_id, current_user, exclude_id=city_id
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail="A city with this name already exists in the selected state",
@@ -233,7 +280,9 @@ class CityController:
             if not code:
                 raise HTTPException(status_code=400, detail="City code is required")
             updates["code"] = code
-            if await db.locations.find_one({"code": code, "id": {"$ne": city_id}}):
+            if await db.locations.find_one(
+                merge_and_clause({"code": code, "id": {"$ne": city_id}}, scope)
+            ):
                 raise HTTPException(status_code=400, detail="City code already exists")
 
         if "slug" in updates:
@@ -241,7 +290,9 @@ class CityController:
             if not slug:
                 raise HTTPException(status_code=400, detail="City slug is required")
             updates["slug"] = slug
-            if await db.locations.find_one({"slug": slug, "id": {"$ne": city_id}}):
+            if await db.locations.find_one(
+                merge_and_clause({"slug": slug, "id": {"$ne": city_id}}, scope)
+            ):
                 raise HTTPException(status_code=400, detail="City slug already exists")
 
         if not updates:

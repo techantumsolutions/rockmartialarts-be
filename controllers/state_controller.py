@@ -11,6 +11,14 @@ from utils.geography import (
     unique_code,
     unique_slug,
 )
+from utils.partner_tenant import (
+    assert_tenant_doc_access,
+    merge_and_clause,
+    rock_owned_clause,
+    stamp_tenant,
+    tenant_or_rock_owned_filter,
+    uniqueness_scope_for_user,
+)
 
 
 class StateController:
@@ -24,17 +32,25 @@ class StateController:
             raise HTTPException(status_code=400, detail="State name is required")
 
         db = get_db()
-        existing_name = await db.states.find_one(name_conflict_query(name))
+        scope = uniqueness_scope_for_user(current_user)
+
+        existing_name = await db.states.find_one(
+            merge_and_clause(name_conflict_query(name), scope)
+        )
         if existing_name:
             raise HTTPException(status_code=400, detail="A state with this name already exists")
 
-        code = (state_data.code or "").strip().upper() or await unique_code(db.states, name)
-        code_conflict = await db.states.find_one({"code": code})
+        code = (state_data.code or "").strip().upper() or await unique_code(
+            db.states, name, scope=scope
+        )
+        code_conflict = await db.states.find_one(merge_and_clause({"code": code}, scope))
         if code_conflict:
             raise HTTPException(status_code=400, detail="State code already exists")
 
-        slug = (state_data.slug or "").strip() or await unique_slug(db.states, name)
-        slug_conflict = await db.states.find_one({"slug": slug})
+        slug = (state_data.slug or "").strip() or await unique_slug(
+            db.states, name, scope=scope
+        )
+        slug_conflict = await db.states.find_one(merge_and_clause({"slug": slug}, scope))
         if slug_conflict:
             raise HTTPException(status_code=400, detail="State slug already exists")
 
@@ -45,7 +61,9 @@ class StateController:
             is_active=state_data.is_active,
             display_order=state_data.display_order or 0,
         )
-        await db.states.insert_one(state.dict())
+        state_dict = state.dict()
+        stamp_tenant(state_dict, current_user)
+        await db.states.insert_one(state_dict)
         return {"message": "State created successfully", "state_id": state.id}
 
     @staticmethod
@@ -65,6 +83,7 @@ class StateController:
             query["is_active"] = True
         if search and search.strip():
             query["name"] = {"$regex": search.strip(), "$options": "i"}
+        query = tenant_or_rock_owned_filter(query, current_user)
 
         cursor = db.states.find(query).sort([("name", 1)]).skip(skip).limit(limit)
         states = await cursor.to_list(limit)
@@ -72,7 +91,8 @@ class StateController:
 
         enriched = []
         for state in states:
-            city_count = await db.locations.count_documents({"state_id": state["id"]})
+            city_q = tenant_or_rock_owned_filter({"state_id": state["id"]}, current_user)
+            city_count = await db.locations.count_documents(city_q)
             enriched.append(serialize_state(state, city_count=city_count))
 
         return {
@@ -86,9 +106,9 @@ class StateController:
     @staticmethod
     async def get_public_states(active_only: bool = True, skip: int = 0, limit: int = 100):
         db = get_db()
-        query = {}
+        query = merge_and_clause({}, rock_owned_clause())
         if active_only:
-            query["is_active"] = True
+            query = merge_and_clause(query, {"is_active": True})
         if limit > 200:
             limit = 200
 
@@ -122,14 +142,21 @@ class StateController:
         existing = await db.states.find_one({"id": state_id})
         if not existing:
             raise HTTPException(status_code=404, detail="State not found")
+        assert_tenant_doc_access(existing, current_user, entity="state")
 
+        scope = uniqueness_scope_for_user(current_user)
         updates = {k: v for k, v in state_update.dict().items() if v is not None}
         if "name" in updates:
             name = str(updates["name"]).strip()
             if not name:
                 raise HTTPException(status_code=400, detail="State name is required")
             updates["name"] = name
-            name_conflict = await db.states.find_one(name_conflict_query(name, exclude_id=state_id))
+            name_conflict = await db.states.find_one(
+                merge_and_clause(
+                    name_conflict_query(name, exclude_id=state_id),
+                    scope,
+                )
+            )
             if name_conflict:
                 raise HTTPException(status_code=400, detail="A state with this name already exists")
 
@@ -138,7 +165,9 @@ class StateController:
             if not code:
                 raise HTTPException(status_code=400, detail="State code is required")
             updates["code"] = code
-            code_conflict = await db.states.find_one({"code": code, "id": {"$ne": state_id}})
+            code_conflict = await db.states.find_one(
+                merge_and_clause({"code": code, "id": {"$ne": state_id}}, scope)
+            )
             if code_conflict:
                 raise HTTPException(status_code=400, detail="State code already exists")
 
@@ -147,7 +176,9 @@ class StateController:
             if not slug:
                 raise HTTPException(status_code=400, detail="State slug is required")
             updates["slug"] = slug
-            slug_conflict = await db.states.find_one({"slug": slug, "id": {"$ne": state_id}})
+            slug_conflict = await db.states.find_one(
+                merge_and_clause({"slug": slug, "id": {"$ne": state_id}}, scope)
+            )
             if slug_conflict:
                 raise HTTPException(status_code=400, detail="State slug already exists")
 

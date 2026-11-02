@@ -133,6 +133,13 @@ class AttendanceController:
             if branch_id and role != "branch_manager":
                 filter_query["branch_id"] = branch_id
 
+            from utils.partner_tenant import apply_partner_branch_scope
+
+            # Attendance rows are scoped by branch ownership (not partner_org_id stamps).
+            filter_query = await apply_partner_branch_scope(
+                db, filter_query, current_user, branch_id=branch_id if role != "branch_manager" else None
+            )
+
             apply_status_filter(filter_query, status)
             apply_method_filter(filter_query, method)
 
@@ -303,6 +310,18 @@ class AttendanceController:
             if course_id:
                 filter_query["course_id"] = course_id
 
+            from utils.partner_tenant import (
+                apply_partner_branch_scope,
+                is_partner_super_admin,
+                partner_branch_ids,
+            )
+
+            partner_bids = await partner_branch_ids(db, current_user)
+            if partner_bids is not None and not managed_branch_ids:
+                filter_query = await apply_partner_branch_scope(
+                    db, filter_query, current_user, branch_id=branch_id
+                )
+
             # Date filtering - single date takes precedence over date range
             if date:
                 try:
@@ -339,6 +358,11 @@ class AttendanceController:
                         enrollment_filter["branch_id"] = branch_id
                     else:
                         enrollment_filter["branch_id"] = {"$in": managed_branch_ids}
+                elif partner_bids is not None:
+                    if branch_id:
+                        enrollment_filter["branch_id"] = branch_id
+                    else:
+                        enrollment_filter["branch_id"] = {"$in": list(partner_bids or [])}
                 elif branch_id:
                     enrollment_filter["branch_id"] = branch_id
                 # Only apply course filtering when explicitly requested
@@ -351,13 +375,25 @@ class AttendanceController:
                     ]
 
                 # Get matching enrollments
-                # For superadmin without any branch/course filter, show all students even if
+                # For Rock SA without branch/course filter, show all students even if
                 # enrollments collection is incomplete (prevents "empty attendance" UI).
+                # Partner SA must always stay within own org enrollments.
                 user_role = str(current_user.get("role") or "").lower() if current_user else ""
-                must_filter_by_enrollment = bool(managed_branch_ids or branch_id or course_id or (batch_ref and batch_ref != "all"))
+                must_filter_by_enrollment = bool(
+                    managed_branch_ids
+                    or partner_bids is not None
+                    or branch_id
+                    or course_id
+                    or (batch_ref and batch_ref != "all")
+                )
                 # Always load enrollments for course context (but don't always filter student list by them).
                 enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
-                if must_filter_by_enrollment or user_role in ["branch_manager", "coach", "coach_admin"]:
+                if must_filter_by_enrollment or user_role in [
+                    "branch_manager",
+                    "coach",
+                    "coach_admin",
+                    "partner_super_admin",
+                ]:
                     enrolled_student_ids = set(
                         str(enrollment.get("student_id"))
                         for enrollment in enrollments
@@ -614,9 +650,21 @@ class AttendanceController:
             batches = []
             seen = set()
 
+            from utils.partner_tenant import assert_partner_owns_branch, partner_branch_ids
+
+            partner_bids = await partner_branch_ids(db, current_user)
+            if partner_bids is not None and branch_id and branch_id != "all":
+                await assert_partner_owns_branch(db, current_user, branch_id)
+
+            branch_query = {}
+            if partner_bids is not None:
+                branch_query = {"id": {"$in": list(partner_bids or [])}}
+
             # 1. If branch_id provided, look in that branch first
             if branch_id and branch_id != "all":
                 branch = await db.branches.find_one({"id": branch_id})
+                if partner_bids is not None and branch and branch.get("id") not in set(partner_bids or []):
+                    branch = None
                 if branch:
                     sched = branch.get("assignments", {}).get("course_schedule", [])
                     for cs in sched:
@@ -628,9 +676,9 @@ class AttendanceController:
                                     batches.append(b)
 
             # 2. If no batches found yet in specified branch (or branch_id is all/none),
-            # search across all other branches
+            # search across branches (partner-scoped when applicable)
             if not batches:
-                all_branches = await db.branches.find({}).to_list(None)
+                all_branches = await db.branches.find(branch_query).to_list(None)
                 for br in all_branches:
                     sched = br.get("assignments", {}).get("course_schedule", [])
                     for cs in sched:
@@ -645,6 +693,8 @@ class AttendanceController:
             enr_filter = {"course_id": course_id}
             if branch_id and branch_id != "all":
                 enr_filter["branch_id"] = branch_id
+            elif partner_bids is not None:
+                enr_filter["branch_id"] = {"$in": list(partner_bids or [])}
             enr_batch_refs = await db.enrollments.distinct("batch_ref", enr_filter)
             if enr_batch_refs:
                 all_branches_cache = None
@@ -654,7 +704,7 @@ class AttendanceController:
                     bref_str = str(bref).strip()
                     if bref_str and bref_str not in seen:
                         if all_branches_cache is None:
-                            all_branches_cache = await db.branches.find({}).to_list(None)
+                            all_branches_cache = await db.branches.find(branch_query).to_list(None)
                         found_b = None
                         for br in all_branches_cache:
                             sched = br.get("assignments", {}).get("course_schedule", [])
@@ -708,6 +758,8 @@ class AttendanceController:
                 })
 
             return {"batches": formatted, "count": len(formatted), "course_id": course_id}
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"Error fetching course batches: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to fetch course batches: {str(e)}")
@@ -743,6 +795,38 @@ class AttendanceController:
             if branch_id and current_user.get("role") != "branch_manager":
                 coach_filter["branch_id"] = branch_id
 
+            from utils.partner_tenant import (
+                assert_partner_owns_branch,
+                partner_branch_ids,
+                partner_coach_ids,
+                partner_org_id_of,
+            )
+
+            partner_bids = await partner_branch_ids(db, current_user)
+            if partner_bids is not None and not managed_branch_ids:
+                if branch_id:
+                    await assert_partner_owns_branch(db, current_user, branch_id)
+                    coach_filter["branch_id"] = branch_id
+                else:
+                    org_id = partner_org_id_of(current_user)
+                    coach_ids = await partner_coach_ids(db, current_user) or []
+                    # Prefer id scope so coaches stamped with partner_org_id are included
+                    # even when branch_id field layout differs.
+                    if coach_ids:
+                        coach_filter["id"] = {"$in": list(coach_ids)}
+                        coach_filter.pop("branch_id", None)
+                    else:
+                        coach_filter["branch_id"] = {"$in": list(partner_bids or [])}
+                    if org_id and "id" not in coach_filter:
+                        coach_filter = {
+                            "is_active": True,
+                            "$or": [
+                                {"partner_org_id": org_id},
+                                {"branch_id": {"$in": list(partner_bids or [])}},
+                                {"assigned_branches": {"$in": list(partner_bids or [])}},
+                            ],
+                        }
+
             # Get coaches from the coaches collection (not users collection)
             coaches = await db.coaches.find(coach_filter).to_list(length=1000)
 
@@ -764,6 +848,11 @@ class AttendanceController:
                 # Apply branch filtering to attendance records
                 if managed_branch_ids:
                     attendance_filter["branch_id"] = {"$in": managed_branch_ids}
+                elif partner_bids is not None:
+                    if branch_id:
+                        attendance_filter["branch_id"] = branch_id
+                    else:
+                        attendance_filter["branch_id"] = {"$in": list(partner_bids or [])}
                 elif branch_id:
                     attendance_filter["branch_id"] = branch_id
 
@@ -945,6 +1034,14 @@ class AttendanceController:
             if branch_id and current_user.get("role") != "branch_manager":
                 filter_query["branch_id"] = branch_id
 
+            from utils.partner_tenant import apply_partner_branch_scope, partner_branch_ids
+
+            partner_bids = await partner_branch_ids(db, current_user)
+            if partner_bids is not None and not managed_branch_ids:
+                filter_query = await apply_partner_branch_scope(
+                    db, filter_query, current_user, branch_id=branch_id
+                )
+
             # Determine the date to use for attendance filtering
             if target_date:
                 # Use the provided date
@@ -955,8 +1052,8 @@ class AttendanceController:
                 attendance_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 next_day = attendance_date + timedelta(days=1)
 
-            # Get all students - for superadmin, show all students regardless of enrollment
-            # For branch managers, only show students from their managed branches
+            # Get all students - for Rock SA, show all students regardless of enrollment
+            # For branch managers / partner SA, only show students from their branches
             student_filter = {"role": "student", "is_active": True}
 
             if managed_branch_ids:
@@ -970,6 +1067,16 @@ class AttendanceController:
                 else:
                     # If no enrollments exist, show no students for branch managers
                     student_filter["id"] = {"$in": []}
+            elif partner_bids is not None:
+                scope_bids = [branch_id] if branch_id else list(partner_bids or [])
+                enrollments = await db.enrollments.find(
+                    {"branch_id": {"$in": scope_bids}, "is_active": True}
+                ).to_list(length=None)
+                if enrollments:
+                    enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
+                    student_filter["id"] = {"$in": enrolled_student_ids}
+                else:
+                    student_filter["id"] = {"$in": []}
             elif branch_id:
                 # For specific branch, get students from that branch via active enrollments
                 enrollments = await db.enrollments.find(
@@ -981,7 +1088,7 @@ class AttendanceController:
                 else:
                     # If no enrollments exist, show no students for specific branch
                     student_filter["id"] = {"$in": []}
-            # For superadmin without branch filter, show all students regardless of enrollment status
+            # For Rock SA without branch filter, show all students regardless of enrollment status
 
             all_students = await db.users.find(student_filter).to_list(length=None)
             # Unique roster (guard against duplicate user docs)
@@ -1026,6 +1133,24 @@ class AttendanceController:
             coach_filter = {"is_active": True}
             if managed_branch_ids:
                 coach_filter["branch_id"] = {"$in": managed_branch_ids}
+            elif partner_bids is not None:
+                from utils.partner_tenant import partner_coach_ids, partner_org_id_of
+
+                org_id = partner_org_id_of(current_user)
+                coach_ids = await partner_coach_ids(db, current_user) or []
+                if branch_id:
+                    coach_filter["branch_id"] = branch_id
+                elif coach_ids:
+                    coach_filter["id"] = {"$in": list(coach_ids)}
+                else:
+                    coach_filter = {
+                        "is_active": True,
+                        "$or": [
+                            {"partner_org_id": org_id},
+                            {"branch_id": {"$in": list(partner_bids or [])}},
+                            {"assigned_branches": {"$in": list(partner_bids or [])}},
+                        ],
+                    }
             elif branch_id:
                 coach_filter["branch_id"] = branch_id
 
@@ -1037,6 +1162,10 @@ class AttendanceController:
                 user_coach_filter = {"role": "coach", "is_active": True}
                 if managed_branch_ids:
                     user_coach_filter["branch_id"] = {"$in": managed_branch_ids}
+                elif partner_bids is not None:
+                    user_coach_filter["branch_id"] = (
+                        branch_id if branch_id else {"$in": list(partner_bids or [])}
+                    )
                 elif branch_id:
                     user_coach_filter["branch_id"] = branch_id
                 all_coaches = await db.users.find(user_coach_filter).to_list(length=None)
@@ -1109,16 +1238,25 @@ class AttendanceController:
             if db is None:
                 raise HTTPException(status_code=500, detail="Database connection not available")
 
+            from utils.partner_tenant import assert_partner_owns_branch, stamp_tenant
+
+            payload = attendance_data.dict()
+            await assert_partner_owns_branch(db, current_user, payload.get("branch_id"))
+
             # Create attendance record
             attendance = Attendance(
-                **attendance_data.dict(),
+                **payload,
                 check_in_time=datetime.utcnow(),
                 marked_by=current_user["id"]
             )
 
-            await db.attendance.insert_one(attendance.dict())
+            doc = attendance.dict()
+            stamp_tenant(doc, current_user)
+            await db.attendance.insert_one(doc)
             return {"message": "Attendance marked successfully", "attendance_id": attendance.id}
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to mark attendance: {str(e)}")
 
@@ -1227,6 +1365,14 @@ class AttendanceController:
 
             coach_branch_id = coach.get("branch_id")
             print(f"🔍 DEBUG: Coach branch_id: {coach_branch_id}")
+
+            from utils.partner_tenant import assert_partner_owns_branch, partner_coach_ids, partner_org_id_of
+
+            if partner_org_id_of(current_user):
+                allowed_coaches = set(await partner_coach_ids(db, current_user) or [])
+                if coach_id not in allowed_coaches and coach.get("partner_org_id") != partner_org_id_of(current_user):
+                    raise HTTPException(status_code=403, detail="Coach is outside your partner organization")
+                await assert_partner_owns_branch(db, current_user, coach_branch_id)
 
             if not coach_branch_id:
                 print("⚠️ DEBUG: Coach has no branch_id assigned")
@@ -1507,6 +1653,14 @@ class AttendanceController:
             if current_user.get("role") == "coach" and current_user.get("id") != coach_id:
                 raise HTTPException(status_code=403, detail="Access denied: Can only view your own students")
 
+            from utils.partner_tenant import partner_coach_ids, partner_org_id_of
+
+            if partner_org_id_of(current_user):
+                allowed = set(await partner_coach_ids(db, current_user) or [])
+                coach_doc = await db.coaches.find_one({"id": coach_id}) or await db.users.find_one({"id": coach_id})
+                if coach_id not in allowed and (coach_doc or {}).get("partner_org_id") != partner_org_id_of(current_user):
+                    raise HTTPException(status_code=403, detail="Coach is outside your partner organization")
+
             # Parse the date
             try:
                 target_date = datetime.fromisoformat(date.replace('Z', '+00:00'))
@@ -1638,6 +1792,20 @@ class AttendanceController:
             # Verify branch manager access
             if current_user.get("role") == "branch_manager" and current_user.get("id") != branch_manager_id:
                 raise HTTPException(status_code=403, detail="Access denied: Can only view your own branch students")
+
+            from utils.partner_tenant import assert_partner_owns_branch, partner_org_id_of
+
+            if partner_org_id_of(current_user):
+                bm = await db.branch_managers.find_one({"id": branch_manager_id}) or await db.users.find_one(
+                    {"id": branch_manager_id}
+                )
+                bm_branches = (bm or {}).get("managed_branches") or []
+                if (bm or {}).get("branch_id"):
+                    bm_branches = list({*bm_branches, (bm or {}).get("branch_id")})
+                if not bm_branches:
+                    raise HTTPException(status_code=403, detail="Branch manager is outside your partner organization")
+                for bid in bm_branches:
+                    await assert_partner_owns_branch(db, current_user, bid)
 
             # Parse the date
             try:
@@ -2138,117 +2306,4 @@ class AttendanceController:
         except Exception as e:
             print(f"❌ Error fetching student attendance: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
-
-    @staticmethod
-    async def get_course_batches(
-        course_id: str,
-        branch_id: Optional[str] = None,
-        current_user: dict = None
-    ):
-        """Fetch all batches for a specific course at a branch or across all branches."""
-        try:
-            db = get_db()
-            if db is None:
-                raise HTTPException(status_code=500, detail="Database connection not available")
-
-            batches = []
-            seen = set()
-
-            # 1. If branch_id provided, look in that branch first
-            if branch_id and branch_id != "all":
-                branch = await db.branches.find_one({"id": branch_id})
-                if branch:
-                    sched = branch.get("assignments", {}).get("course_schedule", [])
-                    for cs in sched:
-                        if str(cs.get("course_id")) == str(course_id):
-                            for b in cs.get("batches", []):
-                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
-                                if bid and bid not in seen:
-                                    seen.add(bid)
-                                    batches.append(b)
-
-            # 2. If no batches found yet in specified branch (or branch_id is all/none),
-            # search across all other branches
-            if not batches:
-                all_branches = await db.branches.find({}).to_list(None)
-                for br in all_branches:
-                    sched = br.get("assignments", {}).get("course_schedule", [])
-                    for cs in sched:
-                        if str(cs.get("course_id")) == str(course_id):
-                            for b in cs.get("batches", []):
-                                bid = str(b.get("batch_id") or b.get("id") or "").strip()
-                                if bid and bid not in seen:
-                                    seen.add(bid)
-                                    batches.append(b)
-
-            # 3. Also check student enrollments for any batch_ref
-            enr_filter = {"course_id": course_id}
-            if branch_id and branch_id != "all":
-                enr_filter["branch_id"] = branch_id
-            enr_batch_refs = await db.enrollments.distinct("batch_ref", enr_filter)
-            if enr_batch_refs:
-                all_branches_cache = None
-                for bref in enr_batch_refs:
-                    if not bref:
-                        continue
-                    bref_str = str(bref).strip()
-                    if bref_str and bref_str not in seen:
-                        if all_branches_cache is None:
-                            all_branches_cache = await db.branches.find({}).to_list(None)
-                        found_b = None
-                        for br in all_branches_cache:
-                            sched = br.get("assignments", {}).get("course_schedule", [])
-                            for cs in sched:
-                                for b in cs.get("batches", []):
-                                    if str(b.get("batch_id") or b.get("id") or "").strip() == bref_str:
-                                        found_b = b
-                                        break
-                                if found_b:
-                                    break
-                            if found_b:
-                                break
-                        if found_b:
-                            seen.add(bref_str)
-                            batches.append(found_b)
-                        else:
-                            seen.add(bref_str)
-                            batches.append({
-                                "batch_id": bref_str,
-                                "batch_name": f"Batch {bref_str[:8]}",
-                                "start_time": "",
-                                "end_time": "",
-                                "days": []
-                            })
-
-            # Format batches cleanly
-            formatted = []
-            for idx, b in enumerate(batches):
-                bid = str(b.get("batch_id") or b.get("id") or f"batch_{idx}").strip()
-                bname = str(b.get("batch_name") or b.get("name") or "").strip()
-                st = str(b.get("start_time") or b.get("startTime") or "").strip()
-                et = str(b.get("end_time") or b.get("endTime") or "").strip()
-                days = b.get("days") if isinstance(b.get("days"), list) else []
-                time_str = f"{st} - {et}" if (st and et) else (st or et)
-                concise_name = bname or f"Batch {idx + 1}"
-                short_label = f"{concise_name} ({time_str})" if time_str else concise_name
-                day_abbr = ", ".join([str(d)[:3] for d in days]) if days else ""
-                full_label = f"{short_label} • {day_abbr}" if day_abbr else short_label
-
-                formatted.append({
-                    "batch_id": bid,
-                    "batch_ref": bid,
-                    "batch_name": bname or None,
-                    "name": bname or None,
-                    "start_time": st or None,
-                    "end_time": et or None,
-                    "days": days,
-                    "short_label": short_label,
-                    "label": short_label,
-                    "full_label": full_label,
-                })
-
-            return {"batches": formatted, "count": len(formatted), "course_id": course_id}
-        except Exception as e:
-            print(f"Error fetching course batches: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to fetch course batches: {str(e)}")
 

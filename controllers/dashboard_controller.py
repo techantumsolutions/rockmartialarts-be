@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.student_status_service import get_managed_branch_ids_for_user
+from utils.partner_tenant import apply_tenant_filter, tenant_match_clause
 from models.user_models import UserRole
 
 
@@ -93,6 +94,10 @@ class DashboardController:
             filter_query["branch_id"] = {"$in": managed_branch_ids}
         elif branch_id:
             filter_query["branch_id"] = branch_id
+
+        # Partner white-label: scope all aggregates to this partner org (Rock SA unchanged)
+        tenant_clause = tenant_match_clause(current_user) or {}
+        filter_query = apply_tenant_filter(filter_query, current_user)
         
         try:
             # Active students count - Handle branch manager filtering correctly
@@ -120,13 +125,18 @@ class DashboardController:
                     active_students = len(
                         await db.enrollments.distinct(
                             "student_id",
-                            {"is_active": True, "branch_id": branch_filter},
+                            {
+                                "is_active": True,
+                                "branch_id": branch_filter,
+                                **tenant_clause,
+                            },
                         )
                     )
                 else:
                     active_students = await db.users.count_documents({
                         "role": "student",
                         "is_active": True,
+                        **tenant_clause,
                     })
 
                 total_users = await db.users.count_documents({
@@ -393,6 +403,7 @@ class DashboardController:
                         "role": "student",
                         "is_active": True,
                         "created_at": {"$gte": period_start, "$lte": period_end},
+                        **tenant_clause,
                     }
                     if filter_query.get("branch_id"):
                         uq["branch_id"] = filter_query["branch_id"]
@@ -403,6 +414,7 @@ class DashboardController:
                             {"created_at": {"$gte": period_start, "$lte": period_end}},
                             {"enrollment_date": {"$gte": period_start, "$lte": period_end}},
                         ],
+                        **tenant_clause,
                     }
                     if filter_query.get("branch_id"):
                         enr_q["branch_id"] = filter_query["branch_id"]
@@ -442,9 +454,9 @@ class DashboardController:
                         stats["total_students"] = 0
                         stats["inactive_students"] = 0
                 else:
-                    aq = {"role": "student", "is_active": True}
-                    iq = {"role": "student", "is_active": False}
-                    tq = {"role": "student"}
+                    aq = {"role": "student", "is_active": True, **tenant_clause}
+                    iq = {"role": "student", "is_active": False, **tenant_clause}
+                    tq = {"role": "student", **tenant_clause}
                     if branch_scope:
                         aq["branch_id"] = branch_scope
                         iq["branch_id"] = branch_scope
@@ -484,6 +496,8 @@ class DashboardController:
                 else:
                     if branch_scope:
                         renew_q["branch_id"] = branch_scope
+                    if tenant_clause:
+                        renew_q.update(tenant_clause)
                     stats["renewals_count"] = await db.payments.count_documents(renew_q)
             except Exception:
                 stats["renewals_count"] = 0
@@ -502,6 +516,8 @@ class DashboardController:
                             return 0
                     elif branch_scope:
                         q["branch_id"] = branch_scope
+                    if tenant_clause:
+                        q.update(tenant_clause)
                     return await coll.count_documents(q)
                 except Exception:
                     return 0
@@ -518,15 +534,22 @@ class DashboardController:
                 "academy_event_registrations", {}
             )
             try:
-                pq: dict = {}
-                if date_match:
-                    pq["created_at"] = date_match
-                stats["partners_count"] = await db.collaboration_partners.count_documents(pq)
+                if tenant_clause:
+                    # Collaboration partners are Rock-level; partners don't share that list
+                    stats["partners_count"] = 0
+                else:
+                    pq: dict = {}
+                    if date_match:
+                        pq["created_at"] = date_match
+                    stats["partners_count"] = await db.collaboration_partners.count_documents(pq)
             except Exception:
                 try:
-                    stats["partners_count"] = await db.branches.count_documents(
-                        {"$or": [{"is_collaboration_partner": True}, {"allows_collaboration": True}]}
-                    )
+                    if tenant_clause:
+                        stats["partners_count"] = 0
+                    else:
+                        stats["partners_count"] = await db.branches.count_documents(
+                            {"$or": [{"is_collaboration_partner": True}, {"allows_collaboration": True}]}
+                        )
                 except Exception:
                     stats["partners_count"] = 0
 
@@ -568,11 +591,14 @@ class DashboardController:
                     "student_id", {"branch_id": branch_id}
                 )
 
+            enr_filter = apply_tenant_filter(enr_filter, current_user)
+
             recent_enrollments = await db.enrollments.find(enr_filter).sort(
                 "created_at", -1
             ).limit(limit).to_list(length=limit)
 
             pay_filter: dict = {"payment_status": {"$in": ["completed", "paid"]}}
+            pay_filter = apply_tenant_filter(pay_filter, current_user)
             if pay_student_ids is not None:
                 if not pay_student_ids:
                     recent_payments = []

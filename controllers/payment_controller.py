@@ -3237,6 +3237,11 @@ class PaymentController:
                 # Filter by branch_id in branch_details
                 base_filter["branch_details.branch_id"] = assigned_branch
 
+        # Partner white-label: only this org's payments (Rock SA unchanged)
+        from utils.partner_tenant import apply_tenant_filter, partner_org_id_of
+
+        base_filter = apply_tenant_filter(base_filter, current_user)
+
         # Optional superadmin branch filter (do not affect other roles)
         branch_filter = None
         if current_user:
@@ -3363,7 +3368,11 @@ class PaymentController:
             else:
                 total_students = 0
         else:
-            total_students = await db.users.count_documents({"role": "student"})
+            student_q = {"role": "student"}
+            partner_org = partner_org_id_of(current_user)
+            if partner_org:
+                student_q["partner_org_id"] = partner_org
+            total_students = await db.users.count_documents(student_q)
 
         if total_students_period is not None:
             display_students_for_period = total_students_period
@@ -3441,6 +3450,23 @@ class PaymentController:
                 filter_query["payment_status"] = status
             if payment_type and payment_type != "all":
                 filter_query["payment_type"] = payment_type
+
+            from utils.partner_tenant import apply_tenant_filter, partner_branch_ids, assert_partner_owns_branch
+
+            filter_query = apply_tenant_filter(filter_query, current_user)
+            p_bids = await partner_branch_ids(db, current_user)
+            if p_bids is not None and "partner_org_id" not in filter_query:
+                # Fallback for older payment rows without partner_org_id stamp
+                filter_query.setdefault("$and", []).append(
+                    {
+                        "$or": [
+                            {"branch_details.branch_id": {"$in": p_bids}},
+                            {"branch_id": {"$in": p_bids}},
+                        ]
+                    }
+                )
+            if branch_id and branch_id not in ("all", "unassigned"):
+                await assert_partner_owns_branch(db, current_user, branch_id)
 
             ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
             if ps and pe:

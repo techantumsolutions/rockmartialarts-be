@@ -1,0 +1,556 @@
+"""Partner organization (white-label tenant) service."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import secrets
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
+
+from fastapi import HTTPException
+
+from models.partner_org_models import (
+    PartnerLogin,
+    PartnerOrgCreate,
+    PartnerOrgStatus,
+    PartnerOrgUpdateStatus,
+    PartnerPaymentMethod,
+    PartnerSetPassword,
+    PartnerOrgVerifyPayment,
+    new_partner_org_id,
+    partner_org_public,
+)
+from models.user_models import UserRole
+from utils.auth import create_access_token, hash_password, verify_password
+from utils.database import get_db
+from utils.helpers import serialize_doc
+from utils.razorpay_client import get_razorpay_client, verify_razorpay_signature
+from utils.resend_email import send_partner_invite_email
+
+logger = logging.getLogger(__name__)
+
+COL = "partner_organizations"
+COL_USERS = "users"
+
+
+def _frontend_url() -> str:
+    return (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_APP_URL") or "http://localhost:3022").rstrip(
+        "/"
+    )
+
+
+def _onboarding_fee_paise() -> int:
+    try:
+        inr = float(os.getenv("PARTNER_ONBOARDING_FEE_INR", "999") or "999")
+    except ValueError:
+        inr = 999.0
+    paise = int(round(inr * 100))
+    if paise < 100:
+        raise HTTPException(status_code=500, detail="PARTNER_ONBOARDING_FEE_INR must be at least ₹1")
+    return paise
+
+
+def slugify_partner_name(name: str) -> str:
+    raw = (name or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug or "partner"
+
+
+async def ensure_unique_partner_slug(db, base: str, *, exclude_id: Optional[str] = None) -> str:
+    slug = slugify_partner_name(base)
+    n = 0
+    while True:
+        candidate = slug if n == 0 else f"{slug}-{n}"
+        q: Dict[str, Any] = {"slug": candidate}
+        if exclude_id:
+            q["id"] = {"$ne": exclude_id}
+        exists = await db[COL].find_one(q, {"id": 1})
+        if not exists:
+            return candidate
+        n += 1
+
+
+async def ensure_partner_org_indexes(db) -> None:
+    try:
+        await db[COL].create_index("id", unique=True)
+        await db[COL].create_index("slug", unique=True)
+        await db[COL].create_index("email", unique=True)
+        await db[COL].create_index("invite_token")
+        await db[COL].create_index([("is_active", 1), ("status", 1)])
+    except Exception:
+        logger.exception("partner_organizations index ensure failed")
+
+
+def partner_org_id_of(user: Optional[dict]) -> Optional[str]:
+    if not user:
+        return None
+    if str(user.get("role") or "").lower() != UserRole.PARTNER_SUPER_ADMIN.value:
+        return None
+    return (user.get("partner_org_id") or "").strip() or None
+
+
+async def assert_partner_org_active(db, partner_org_id: str) -> dict:
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner organization not found")
+    if org.get("is_active") is False or org.get("status") == PartnerOrgStatus.DISABLED.value:
+        raise HTTPException(status_code=403, detail="This partner account is disabled")
+    return org
+
+
+async def _send_invite_email(org: dict, invite_token: str) -> None:
+    slug = org.get("slug") or "partner"
+    set_link = f"{_frontend_url()}/partners/{slug}/set-password?token={invite_token}"
+    login_link = f"{_frontend_url()}/partners/{slug}/login"
+    name = org.get("name") or "Partner"
+    email = org.get("email")
+    if not email:
+        return
+    sent = await send_partner_invite_email(
+        to_email=str(email),
+        partner_name=str(name),
+        phone=str(org.get("phone") or ""),
+        address=str(org.get("address") or ""),
+        payment_method=str(org.get("payment_method") or ""),
+        payment_status=str(org.get("payment_status") or ""),
+        set_password_link=set_link,
+        login_link=login_link,
+    )
+    if not sent:
+        logger.error(
+            "Partner invite email was not delivered to %s (check Resend logs / FROM domain)",
+            email,
+        )
+
+
+async def _finalize_paid_org(
+    db,
+    org: dict,
+    *,
+    payment_method: str,
+    payment_status: str,
+    razorpay_order_id: Optional[str] = None,
+    razorpay_payment_id: Optional[str] = None,
+    razorpay_signature: Optional[str] = None,
+    current_user: Optional[dict] = None,
+) -> dict:
+    now = datetime.utcnow()
+    invite_token = secrets.token_urlsafe(32)
+    invite_expires = now + timedelta(days=7)
+
+    # Create partner super admin user without password (set via invite)
+    existing = await db[COL_USERS].find_one({"email": org["email"].lower()})
+    if existing and existing.get("role") != UserRole.PARTNER_SUPER_ADMIN.value:
+        raise HTTPException(
+            status_code=400,
+            detail="This email is already registered to another account type",
+        )
+
+    admin_id = (existing or {}).get("id") or str(new_partner_org_id())
+    user_doc = {
+        "id": admin_id,
+        "email": org["email"].lower(),
+        "phone": org.get("phone") or "",
+        "first_name": (org.get("name") or "Partner").split(" ")[0],
+        "last_name": "Admin",
+        "full_name": f"{org.get('name') or 'Partner'} Admin",
+        "role": UserRole.PARTNER_SUPER_ADMIN.value,
+        "partner_org_id": org["id"],
+        "is_active": True,
+        "password_hash": (existing or {}).get("password_hash"),  # may be None until set
+        "must_set_password": True,
+        "updated_at": now,
+    }
+    if not existing:
+        user_doc["created_at"] = now
+        if current_user:
+            user_doc["created_by"] = {"user_id": current_user.get("id"), "role": current_user.get("role")}
+        await db[COL_USERS].insert_one(user_doc)
+    else:
+        await db[COL_USERS].update_one(
+            {"id": admin_id},
+            {
+                "$set": {
+                    **{k: v for k, v in user_doc.items() if k != "id"},
+                }
+            },
+        )
+
+    patch = {
+        "payment_method": payment_method,
+        "payment_status": payment_status,
+        "status": PartnerOrgStatus.INVITED.value,
+        "is_active": True,
+        "admin_user_id": admin_id,
+        "invite_token": invite_token,
+        "invite_expires_at": invite_expires,
+        "updated_at": now,
+    }
+    if razorpay_order_id:
+        patch["razorpay_order_id"] = razorpay_order_id
+    if razorpay_payment_id:
+        patch["razorpay_payment_id"] = razorpay_payment_id
+    if razorpay_signature:
+        patch["razorpay_signature"] = razorpay_signature
+
+    await db[COL].update_one({"id": org["id"]}, {"$set": patch})
+    updated = await db[COL].find_one({"id": org["id"]})
+    await _send_invite_email(updated, invite_token)
+    return updated
+
+
+async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    await ensure_partner_org_indexes(db)
+
+    email = str(body.email).lower().strip()
+    if await db[COL].find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="A partner with this email already exists")
+    if await db[COL_USERS].find_one({"email": email, "role": {"$ne": UserRole.PARTNER_SUPER_ADMIN.value}}):
+        raise HTTPException(status_code=400, detail="This email is already registered")
+
+    now = datetime.utcnow()
+    org_id = new_partner_org_id()
+    slug = await ensure_unique_partner_slug(db, body.name)
+    org = {
+        "id": org_id,
+        "name": body.name.strip(),
+        "slug": slug,
+        "email": email,
+        "phone": body.phone.strip(),
+        "address": body.address.strip(),
+        "payment_method": PartnerPaymentMethod.OFFLINE.value,
+        "payment_status": "offline_recorded",
+        "status": PartnerOrgStatus.PENDING_PAYMENT.value,
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": current_user.get("id"),
+    }
+    await db[COL].insert_one(org)
+    updated = await _finalize_paid_org(
+        db,
+        org,
+        payment_method=PartnerPaymentMethod.OFFLINE.value,
+        payment_status="offline_recorded",
+        current_user=current_user,
+    )
+    return {
+        "message": "Partner created. Invitation email sent to set password.",
+        "partner": partner_org_public(updated),
+    }
+
+
+async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    await ensure_partner_org_indexes(db)
+
+    email = str(body.email).lower().strip()
+    if await db[COL].find_one({"email": email, "status": {"$ne": PartnerOrgStatus.PENDING_PAYMENT.value}}):
+        raise HTTPException(status_code=400, detail="A partner with this email already exists")
+
+    amount_paise = _onboarding_fee_paise()
+    now = datetime.utcnow()
+    existing_pending = await db[COL].find_one(
+        {"email": email, "status": PartnerOrgStatus.PENDING_PAYMENT.value}
+    )
+    if existing_pending:
+        org_id = existing_pending["id"]
+        slug = existing_pending.get("slug") or await ensure_unique_partner_slug(db, body.name)
+        await db[COL].update_one(
+            {"id": org_id},
+            {
+                "$set": {
+                    "name": body.name.strip(),
+                    "phone": body.phone.strip(),
+                    "address": body.address.strip(),
+                    "payment_method": PartnerPaymentMethod.ONLINE.value,
+                    "updated_at": now,
+                }
+            },
+        )
+    else:
+        org_id = new_partner_org_id()
+        slug = await ensure_unique_partner_slug(db, body.name)
+        await db[COL].insert_one(
+            {
+                "id": org_id,
+                "name": body.name.strip(),
+                "slug": slug,
+                "email": email,
+                "phone": body.phone.strip(),
+                "address": body.address.strip(),
+                "payment_method": PartnerPaymentMethod.ONLINE.value,
+                "payment_status": "pending",
+                "status": PartnerOrgStatus.PENDING_PAYMENT.value,
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+                "created_by": current_user.get("id"),
+            }
+        )
+
+    client = get_razorpay_client()
+    try:
+        order = client.order.create(
+            {
+                "amount": amount_paise,
+                "currency": "INR",
+                "payment_capture": 1,
+                "notes": {
+                    "type": "partner_onboarding",
+                    "partner_org_id": org_id,
+                    "email": email,
+                },
+            }
+        )
+    except Exception:
+        logger.exception("Razorpay partner onboarding order.create failed")
+        raise HTTPException(
+            status_code=502,
+            detail="We could not reach the payment service. Please try again.",
+        )
+
+    await db[COL].update_one(
+        {"id": org_id},
+        {"$set": {"razorpay_order_id": order["id"], "updated_at": datetime.utcnow()}},
+    )
+    org = await db[COL].find_one({"id": org_id})
+    return {
+        "message": "Complete Razorpay payment to activate the partner",
+        "partner": partner_org_public(org),
+        "order": {"id": order["id"], "amount": amount_paise, "currency": "INR"},
+        "key": os.getenv("RAZORPAY_KEY_ID", "").strip(),
+    }
+
+
+async def verify_partner_online_payment(
+    body: PartnerOrgVerifyPayment, current_user: dict
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    org = await db[COL].find_one({"id": body.partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    if org.get("status") != PartnerOrgStatus.PENDING_PAYMENT.value:
+        return {
+            "message": "Partner already activated",
+            "partner": partner_org_public(org),
+        }
+    if org.get("razorpay_order_id") and org["razorpay_order_id"] != body.razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Order mismatch")
+
+    if not verify_razorpay_signature(
+        body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
+    ):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+    updated = await _finalize_paid_org(
+        db,
+        org,
+        payment_method=PartnerPaymentMethod.ONLINE.value,
+        payment_status="paid",
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
+        current_user=current_user,
+    )
+    return {
+        "message": "Payment verified. Invitation email sent to set password.",
+        "partner": partner_org_public(updated),
+    }
+
+
+async def set_partner_password(body: PartnerSetPassword) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    org = await db[COL].find_one({"invite_token": body.token})
+    if not org:
+        raise HTTPException(status_code=400, detail="Invalid or expired invitation link")
+    expires = org.get("invite_expires_at")
+    if isinstance(expires, datetime) and expires < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Invitation link has expired")
+
+    admin_id = org.get("admin_user_id")
+    user = await db[COL_USERS].find_one({"id": admin_id}) if admin_id else None
+    if not user:
+        raise HTTPException(status_code=404, detail="Partner admin user not found")
+
+    now = datetime.utcnow()
+    await db[COL_USERS].update_one(
+        {"id": admin_id},
+        {
+            "$set": {
+                "password_hash": hash_password(body.new_password),
+                "must_set_password": False,
+                "updated_at": now,
+            }
+        },
+    )
+    await db[COL].update_one(
+        {"id": org["id"]},
+        {
+            "$set": {
+                "status": PartnerOrgStatus.ACTIVE.value,
+                "activated_at": now,
+                "updated_at": now,
+            },
+            "$unset": {"invite_token": "", "invite_expires_at": ""},
+        },
+    )
+    updated = await db[COL].find_one({"id": org["id"]})
+    return {
+        "message": "Password created successfully. You can now log in.",
+        "partner": partner_org_public(updated),
+        "login_path": f"/partners/{updated.get('slug')}/login",
+    }
+
+
+async def login_partner(slug: str, body: PartnerLogin) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    org = await db[COL].find_one({"slug": (slug or "").strip().lower()})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    if org.get("is_active") is False or org.get("status") == PartnerOrgStatus.DISABLED.value:
+        raise HTTPException(
+            status_code=401,
+            detail="This partner account is disabled. Please contact administrator.",
+        )
+
+    email = str(body.email).lower().strip()
+    if email != str(org.get("email") or "").lower():
+        # Allow login with admin user email (same in normal flow)
+        pass
+
+    user = await db[COL_USERS].find_one(
+        {
+            "email": email,
+            "role": UserRole.PARTNER_SUPER_ADMIN.value,
+            "partner_org_id": org["id"],
+        }
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user.get("is_active") is False:
+        raise HTTPException(status_code=401, detail="Account is inactive")
+    if user.get("must_set_password") or not user.get("password_hash"):
+        raise HTTPException(
+            status_code=403,
+            detail="Please create your password using the invitation email link first.",
+        )
+    if not verify_password(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_access_token(
+        data={
+            "sub": user["id"],
+            "email": user["email"],
+            "role": UserRole.PARTNER_SUPER_ADMIN.value,
+            "partner_org_id": org["id"],
+            "partner_slug": org.get("slug"),
+        }
+    )
+    user_out = serialize_doc(user)
+    user_out.pop("password_hash", None)
+    user_out["partner_org_id"] = org["id"]
+    user_out["partner_slug"] = org.get("slug")
+    user_out["partner_name"] = org.get("name")
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 60 * 60 * 24,
+        "user": user_out,
+        "partner": partner_org_public(org),
+        "message": "Login successful",
+    }
+
+
+async def get_partner_public_by_slug(slug: str) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"slug": (slug or "").strip().lower()})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    return {
+        "name": org.get("name"),
+        "slug": org.get("slug"),
+        "is_active": org.get("is_active", True),
+        "status": org.get("status"),
+    }
+
+
+async def list_partner_orgs(
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    include_inactive: bool = True,
+) -> Dict[str, Any]:
+    db = get_db()
+    await ensure_partner_org_indexes(db)
+    q: Dict[str, Any] = {}
+    if not include_inactive:
+        q["is_active"] = True
+    total = await db[COL].count_documents(q)
+    rows = (
+        await db[COL]
+        .find(q)
+        .sort("created_at", -1)
+        .skip(max(0, skip))
+        .limit(max(1, min(limit, 200)))
+        .to_list(limit)
+    )
+    return {
+        "partners": [partner_org_public(r) for r in rows],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+    }
+
+
+async def set_partner_org_active(
+    partner_org_id: str, body: PartnerOrgUpdateStatus, current_user: dict
+) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    now = datetime.utcnow()
+    patch: Dict[str, Any] = {
+        "is_active": bool(body.is_active),
+        "updated_at": now,
+        "updated_by": current_user.get("id"),
+    }
+    if body.is_active:
+        if org.get("status") == PartnerOrgStatus.DISABLED.value:
+            patch["status"] = (
+                PartnerOrgStatus.ACTIVE.value
+                if org.get("activated_at")
+                else PartnerOrgStatus.INVITED.value
+            )
+    else:
+        patch["status"] = PartnerOrgStatus.DISABLED.value
+
+    await db[COL].update_one({"id": partner_org_id}, {"$set": patch})
+    # Mirror onto admin user
+    if org.get("admin_user_id"):
+        await db[COL_USERS].update_one(
+            {"id": org["admin_user_id"]},
+            {"$set": {"is_active": bool(body.is_active), "updated_at": now}},
+        )
+    updated = await db[COL].find_one({"id": partner_org_id})
+    return {
+        "message": "Partner enabled" if body.is_active else "Partner disabled",
+        "partner": partner_org_public(updated),
+    }

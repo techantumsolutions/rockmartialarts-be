@@ -47,9 +47,11 @@ async def get_student_achievements(
 @router.get("/manage/showcase")
 async def list_achievements_for_showcase(
     featured_only: bool = Query(False),
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+    current_user: dict = Depends(
+        require_role_unified([UserRole.SUPER_ADMIN, UserRole.PARTNER_SUPER_ADMIN])
+    ),
 ):
-    """Super admin: list student achievements to feature on the homepage."""
+    """Rock SA: homepage featured pool. Partner SA: own-org student achievements only."""
     return await AchievementController.list_for_showcase_manage(current_user, featured_only=featured_only)
 
 
@@ -57,9 +59,11 @@ async def list_achievements_for_showcase(
 async def set_achievement_featured(
     achievement_id: str,
     data: AchievementFeaturedUpdate,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+    current_user: dict = Depends(
+        require_role_unified([UserRole.SUPER_ADMIN, UserRole.PARTNER_SUPER_ADMIN])
+    ),
 ):
-    """Super admin: toggle homepage featured flag."""
+    """Toggle featured flag (Rock homepage or partner landing, by role scope)."""
     return await AchievementController.set_featured(achievement_id, data.is_featured, current_user)
 
 

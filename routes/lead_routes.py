@@ -19,6 +19,7 @@ _LEAD_ADMIN_ROLES = [
     UserRole.SUPER_ADMIN,
     UserRole.COACH_ADMIN,
     UserRole.BRANCH_MANAGER,
+    UserRole.PARTNER_SUPER_ADMIN,
 ]
 
 

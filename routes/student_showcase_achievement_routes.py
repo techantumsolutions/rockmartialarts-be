@@ -29,10 +29,17 @@ async def get_showcase_achievements_public(
     return {"achievements": items}
 
 
+_SHOWCASE_MANAGE_ROLES = [
+    UserRole.SUPER_ADMIN,
+    UserRole.BRANCH_MANAGER,
+    UserRole.PARTNER_SUPER_ADMIN,
+]
+
+
 @router.get("/manage")
 async def list_showcase_manage(
     status: Optional[str] = Query(None),
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])),
+    current_user: dict = Depends(require_role_unified(_SHOWCASE_MANAGE_ROLES)),
 ):
     items = await ctrl.list_manage(current_user, status=status)
     return {"achievements": items}
@@ -41,7 +48,7 @@ async def list_showcase_manage(
 @router.post("")
 async def create_showcase_achievement(
     data: StudentShowcaseAchievementCreate,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])),
+    current_user: dict = Depends(require_role_unified(_SHOWCASE_MANAGE_ROLES)),
 ):
     return await ctrl.create(data, current_user)
 
@@ -50,7 +57,7 @@ async def create_showcase_achievement(
 async def update_showcase_achievement(
     achievement_id: str,
     data: StudentShowcaseAchievementUpdate,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])),
+    current_user: dict = Depends(require_role_unified(_SHOWCASE_MANAGE_ROLES)),
 ):
     return await ctrl.update(achievement_id, data, current_user)
 
@@ -58,6 +65,6 @@ async def update_showcase_achievement(
 @router.delete("/{achievement_id}")
 async def delete_showcase_achievement(
     achievement_id: str,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])),
+    current_user: dict = Depends(require_role_unified(_SHOWCASE_MANAGE_ROLES)),
 ):
     return await ctrl.delete_showcase(achievement_id, current_user)

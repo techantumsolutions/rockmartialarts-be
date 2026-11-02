@@ -345,16 +345,30 @@ class CourseController:
 
         db = get_db()
 
-        # Check for duplicate course title
-        existing_course = await db.courses.find_one({
+        from utils.partner_tenant import (
+            apply_tenant_filter,
+            stamp_tenant,
+            partner_branch_ids,
+            assert_tenant_doc_access,
+        )
+
+        # Check for duplicate course title (scoped per partner tenant)
+        title_query = {
             "title": {"$regex": f"^{course_data.title.strip()}$", "$options": "i"}
-        })
+        }
+        title_query = apply_tenant_filter(title_query, current_user)
+        existing_course = await db.courses.find_one(title_query)
         if existing_course:
             raise HTTPException(status_code=400, detail=f"A course with the name '{course_data.title}' already exists")
 
         category_id, sub_category = await assert_course_hierarchy(
             db, course_data.category_id, course_data.sub_category
         )
+        cat_doc = await db.categories.find_one({"id": category_id})
+        assert_tenant_doc_access(cat_doc, current_user, entity="category")
+        if sub_category:
+            sub_doc = await db.categories.find_one({"id": sub_category})
+            assert_tenant_doc_access(sub_doc, current_user, entity="category")
         payload = course_data.dict()
         payload["category_id"] = category_id
         payload["sub_category"] = sub_category
@@ -378,6 +392,7 @@ class CourseController:
         course_dict["created_by"] = creator_id
         course_dict["created_by_role"] = str(creator_role) if creator_role else None
         course_dict["created_by_name"] = creator_name or None
+        stamp_tenant(course_dict, current_user)
 
         current_role = current_user.get("role")
         if current_role == UserRole.BRANCH_MANAGER or str(current_role) == "branch_manager":
@@ -399,6 +414,11 @@ class CourseController:
                         logging.getLogger(__name__).error(f"Failed to auto-assign course {course.id} to branch {b_id}: {e}")
 
             return {"message": "Course created successfully", "course_id": course.id}
+
+        # Partner: auto-link to their tenant branches when present
+        p_branch_ids = await partner_branch_ids(db, current_user)
+        if p_branch_ids is not None:
+            course_dict["branch_ids"] = list(p_branch_ids)
 
         await db.courses.insert_one(course_dict)
         return {"message": "Course created successfully", "course_id": course.id}
@@ -440,6 +460,10 @@ class CourseController:
             managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
             if not managed_branch_ids:
                 return {"courses": []}
+
+        from utils.partner_tenant import apply_tenant_filter
+
+        filter_query = apply_tenant_filter(filter_query, current_user)
 
         courses = await db.courses.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
@@ -557,6 +581,10 @@ class CourseController:
         course = await db.courses.find_one({"id": course_id})
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(course, current_user, entity="course")
 
         if current_user.get("role") == UserRole.BRANCH_MANAGER:
             from utils.student_status_service import get_managed_branch_ids_for_user
@@ -696,6 +724,10 @@ class CourseController:
         existing_course = await db.courses.find_one({"id": course_id})
         if not existing_course:
             raise HTTPException(status_code=404, detail="Course not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_course, current_user, entity="course")
         
         # Coach Admin permission check
         if current_user["role"] == UserRole.COACH_ADMIN:
@@ -749,9 +781,16 @@ class CourseController:
                 raise HTTPException(status_code=400, detail=f"A course with the name '{update_data['title']}' already exists")
 
         if "category_id" in update_data or "sub_category" in update_data:
+            from utils.partner_tenant import assert_tenant_doc_access
+
             cat_id = update_data.get("category_id") or existing_course.get("category_id")
             sub_id = update_data["sub_category"] if "sub_category" in update_data else existing_course.get("sub_category")
             cat_id, sub_id = await assert_course_hierarchy(db, cat_id, sub_id)
+            cat_doc = await db.categories.find_one({"id": cat_id})
+            assert_tenant_doc_access(cat_doc, current_user, entity="category")
+            if sub_id:
+                sub_doc = await db.categories.find_one({"id": sub_id})
+                assert_tenant_doc_access(sub_doc, current_user, entity="category")
             update_data["category_id"] = cat_id
             update_data["sub_category"] = sub_id
 

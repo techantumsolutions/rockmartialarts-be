@@ -94,7 +94,13 @@ async def _resolve_user_from_token(db, token: str) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
-    return serialize_doc(user)
+    user_data = serialize_doc(user)
+    # Prefer JWT partner tenant claim when present
+    if payload.get("partner_org_id"):
+        user_data["partner_org_id"] = payload.get("partner_org_id")
+    if payload.get("partner_slug"):
+        user_data["partner_slug"] = payload.get("partner_slug")
+    return user_data
 
 
 async def get_current_user_or_superadmin(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -153,6 +159,24 @@ def require_role_unified(allowed_roles: List[UserRole]):
         elif user_role == "student":
             if UserRole.STUDENT not in allowed_roles:
                 raise HTTPException(status_code=403, detail="Insufficient permissions")
+        elif user_role == "partner_super_admin":
+            if UserRole.PARTNER_SUPER_ADMIN not in allowed_roles:
+                # Partner super admins may use the same APIs as Rock super admins
+                # when SUPER_ADMIN is in the allowed list (tenant-scoped in controllers).
+                if UserRole.SUPER_ADMIN not in allowed_roles:
+                    raise HTTPException(status_code=403, detail="Insufficient permissions")
+            # Block disabled partner orgs
+            org_id = (current_user.get("partner_org_id") or "").strip()
+            if org_id:
+                _db = get_db()
+                org = await _db.partner_organizations.find_one(
+                    {"id": org_id}, {"is_active": 1, "status": 1}
+                )
+                if not org or org.get("is_active") is False or org.get("status") == "disabled":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This partner account is disabled. Please contact administrator.",
+                    )
         else:
             # Fallback for any other roles
             if user_role not in [role.value for role in allowed_roles]:

@@ -57,6 +57,7 @@ KNOWN_SOURCE_TYPES = (
     "event",
     "manual",
     "partner_landing",
+    "partner_org_landing",
     "other",
 )
 
@@ -95,6 +96,9 @@ SOURCE_ALIASES = {
     "collaboration_partner": "partner_landing",
     "partner_page": "partner_landing",
     "partner_contact": "partner_landing",
+    "partner_org_landing": "partner_org_landing",
+    "white_label_partner": "partner_org_landing",
+    "partner_organization": "partner_org_landing",
 }
 
 
@@ -229,6 +233,7 @@ def _build_lead_doc(
     branch_id: Optional[str] = None,
     branch_name: Optional[str] = None,
     message: Optional[str] = None,
+    partner_org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
     email_raw = (email or "").strip().lower()
@@ -252,6 +257,7 @@ def _build_lead_doc(
         "source_ref_type": (source_ref_type or "").strip() or None,
         "branch_id": (branch_id or "").strip() or None,
         "branch_name": (branch_name or "").strip() or None,
+        "partner_org_id": (partner_org_id or "").strip() or None,
         "message": msg,
         "status": "new",
         "priority": "medium",
@@ -276,6 +282,7 @@ async def create_or_merge_lead(
     branch_id: Optional[str] = None,
     branch_name: Optional[str] = None,
     message: Optional[str] = None,
+    partner_org_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """
     Returns (lead_doc_serialized, was_merged).
@@ -297,6 +304,7 @@ async def create_or_merge_lead(
         branch_id=branch_id,
         branch_name=branch_name,
         message=message,
+        partner_org_id=partner_org_id,
     )
     now = datetime.utcnow()
 
@@ -324,6 +332,8 @@ async def create_or_merge_lead(
                 patch["branch_id"] = draft["branch_id"]
             if draft["branch_name"]:
                 patch["branch_name"] = draft["branch_name"]
+            if draft.get("partner_org_id"):
+                patch["partner_org_id"] = draft["partner_org_id"]
             if draft.get("message"):
                 patch["message"] = draft["message"]
             await db[COL].update_one({"id": existing["id"]}, {"$set": patch})
@@ -335,13 +345,17 @@ async def create_or_merge_lead(
     st = draft.get("source_type")
     if phone_c and st:
         since = now - timedelta(hours=_duplicate_window_hours())
+        soft_q: Dict[str, Any] = {
+            "phone_canonical": phone_c,
+            "source_type": st,
+            "created_at": {"$gte": since},
+            "status": {"$nin": ["converted", "lost"]},
+        }
+        # Keep white-label partner leads from merging across orgs
+        if draft.get("partner_org_id"):
+            soft_q["partner_org_id"] = draft["partner_org_id"]
         existing = await db[COL].find_one(
-            {
-                "phone_canonical": phone_c,
-                "source_type": st,
-                "created_at": {"$gte": since},
-                "status": {"$nin": ["converted", "lost"]},
-            },
+            soft_q,
             sort=[("created_at", -1)],
         )
         if existing:
@@ -363,6 +377,8 @@ async def create_or_merge_lead(
                 patch["branch_id"] = draft["branch_id"]
             if draft["branch_name"]:
                 patch["branch_name"] = draft["branch_name"]
+            if draft.get("partner_org_id"):
+                patch["partner_org_id"] = draft["partner_org_id"]
             if draft.get("message"):
                 patch["message"] = draft["message"]
             if ref_id and not existing.get("source_ref_id"):
@@ -463,6 +479,16 @@ async def list_leads_service(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         clauses.append(scope)
+
+    # White-label partner SA: only their org's leads
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            clauses.append({"partner_org_id": partner_org})
+    except Exception:
+        pass
 
     if search and search.strip():
         s = search.strip()
@@ -609,6 +635,15 @@ async def list_lead_source_options(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            tenant_clause = {"partner_org_id": partner_org}
+            match = {**match, **tenant_clause} if match else tenant_clause
+    except Exception:
+        pass
     pipeline: List[Dict[str, Any]] = []
     if match:
         pipeline.append({"$match": match})
@@ -639,15 +674,18 @@ async def list_lead_source_options(
     seen = {s["value"] for s in sources}
     for k in KNOWN_SOURCE_TYPES:
         if k not in seen:
-            label = (
-                "Partner Landing"
-                if k == "partner_landing"
-                else k.replace("_", " ").title()
-            )
+            if k == "partner_landing":
+                label = "Partner Landing"
+            elif k == "partner_org_landing":
+                label = "Partner Org Landing"
+            else:
+                label = k.replace("_", " ").title()
             sources.append({"value": k, "label": label, "count": 0})
     for s in sources:
         if s.get("value") == "partner_landing":
             s["label"] = "Partner Landing"
+        elif s.get("value") == "partner_org_landing":
+            s["label"] = "Partner Org Landing"
     return {"sources": sources, "duplicate_window_hours": _duplicate_window_hours()}
 
 
@@ -661,6 +699,16 @@ async def _assert_lead_access(db, doc: dict, current_user: Optional[dict]) -> No
         return
     role = _role(current_user)
     if role in {"superadmin", "super_admin", "coach_admin", "coachadmin"}:
+        return
+    if role in {"partner_super_admin", "partnersuperadmin"}:
+        from utils.partner_tenant import partner_org_id_of
+
+        org_id = partner_org_id_of(current_user)
+        if not org_id or doc.get("partner_org_id") != org_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only manage leads for your partner organization.",
+            )
         return
     if role not in {"branch_manager", "branch_admin", "branchmanager"}:
         raise HTTPException(status_code=403, detail="Not allowed")
@@ -948,6 +996,15 @@ async def lead_pipeline_summary(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            tenant_clause = {"partner_org_id": partner_org}
+            match = {**match, **tenant_clause} if match else tenant_clause
+    except Exception:
+        pass
 
     pipeline: List[Dict[str, Any]] = []
     if match:

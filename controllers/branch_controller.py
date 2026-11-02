@@ -117,6 +117,12 @@ class BranchController:
         # Store the branch with nested structure exactly as provided
         branch_dict = branch.dict()
         apply_collaboration_flag(branch_dict, flag)
+
+        from utils.partner_tenant import stamp_tenant, require_partner_org_id, is_partner_super_admin
+
+        if is_partner_super_admin(current_user):
+            require_partner_org_id(current_user)
+            stamp_tenant(branch_dict, current_user)
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
@@ -158,6 +164,9 @@ class BranchController:
                     "limit": limit,
                     "message": "No branches assigned to this manager"
                 }
+        from utils.partner_tenant import apply_tenant_filter
+
+        filter_query = apply_tenant_filter(filter_query, current_user)
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
@@ -491,6 +500,10 @@ class BranchController:
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
 
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(branch, current_user, entity="branch")
+
         # Count coaches assigned to this branch
         coach_count = await db.coaches.count_documents({
             "branch_id": branch_id,
@@ -671,8 +684,15 @@ class BranchController:
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid user role")
         
+        existing_branch_for_tenant = await db.branches.find_one({"id": branch_id})
+        if not existing_branch_for_tenant:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_branch_for_tenant, current_user, entity="branch")
+
         # Branch Manager permission check
-        if current_role == "branch_manager":
+        if current_role == "branch_manager" or current_role == UserRole.BRANCH_MANAGER:
             # Branch managers can only update branches they manage
             managed_branches = current_user.get("managed_branches", [])
             if branch_id not in managed_branches:
@@ -681,9 +701,7 @@ class BranchController:
         # Coach Admin permission check
         elif current_role == UserRole.COACH_ADMIN:
             # For nested structure, check if user is admin of this branch
-            existing_branch = await db.branches.find_one({"id": branch_id})
-            if not existing_branch:
-                raise HTTPException(status_code=404, detail="Branch not found")
+            existing_branch = existing_branch_for_tenant
             
             # Check if current user is in the branch_admins list
             branch_admins = existing_branch.get("assignments", {}).get("branch_admins", [])
