@@ -55,9 +55,12 @@ class BranchManagerController:
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
         
+        from utils.partner_tenant import assert_partner_owns_branch, stamp_tenant
+
         # Get branch information if branch_id is provided
         branch_assignment = None
         if manager_data.branch_id:
+            await assert_partner_owns_branch(db, current_admin, manager_data.branch_id)
             branch = await db.branches.find_one({"id": manager_data.branch_id})
             if branch:
                 branch_assignment = BranchAssignment(
@@ -91,6 +94,7 @@ class BranchManagerController:
             "country_code": manager_data.contact_info.country_code,
             "phone": manager_data.contact_info.phone
         }
+        stamp_tenant(manager_dict, current_admin)
         
         # Insert into branch_managers collection
         result = await db.branch_managers.insert_one(manager_dict)
@@ -129,10 +133,13 @@ class BranchManagerController:
         """Get list of branch managers with pagination"""
         db = get_db()
         
+        from utils.partner_tenant import apply_tenant_filter
+
         # Build query filter
         query_filter = {}
         if active_only:
             query_filter["is_active"] = True
+        query_filter = apply_tenant_filter(query_filter, current_user)
         
         # Get total count
         total_count = await db.branch_managers.count_documents(query_filter)
@@ -170,6 +177,10 @@ class BranchManagerController:
         manager = await db.branch_managers.find_one({"id": manager_id})
         if not manager:
             raise HTTPException(status_code=404, detail="Branch manager not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(manager, current_user, entity="branch manager")
         
         # Serialize and clean up response
         manager_data = serialize_doc(manager)
@@ -195,6 +206,10 @@ class BranchManagerController:
         existing_manager = await db.branch_managers.find_one({"id": manager_id})
         if not existing_manager:
             raise HTTPException(status_code=404, detail="Branch manager not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_manager, current_admin, entity="branch manager")
 
         # Prepare update data
         update_data = {"updated_at": datetime.utcnow()}
@@ -296,6 +311,10 @@ class BranchManagerController:
         manager = await db.branch_managers.find_one({"id": manager_id})
         if not manager:
             raise HTTPException(status_code=404, detail="Branch manager not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(manager, current_admin, entity="branch manager")
 
         # Check if manager is assigned to any branches
         assigned_branches = await db.branches.find({"manager_id": manager_id}).to_list(length=100)
@@ -528,8 +547,24 @@ This is an automated message. Please do not reply to this email.
                 )
 
             # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": manager["id"], "is_active": True}).to_list(length=None)
+            all_managed = await db.branches.find({"manager_id": manager["id"]}).to_list(length=None)
+            managed_branches = [b for b in all_managed if b.get("is_active", True)]
             managed_branch_ids = [branch["id"] for branch in managed_branches]
+
+            # Disabled partner/own branches must not allow dashboard login
+            if all_managed and not managed_branch_ids:
+                partner_disabled = any(
+                    b.get("is_collaboration_partner") or b.get("allows_collaboration")
+                    for b in all_managed
+                )
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "This partner account is disabled. Please contact administrator."
+                        if partner_disabled
+                        else "This branch account is disabled. Please contact administrator."
+                    ),
+                )
 
             print(f"Branch manager {manager['id']} manages branches: {managed_branch_ids}")
 

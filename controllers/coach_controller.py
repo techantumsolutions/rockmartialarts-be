@@ -125,6 +125,11 @@ class CoachController:
             coach_dict["service_location_ids"] = [coach_data.branch_id]
         else:
             coach_dict["service_location_ids"] = []
+
+        from utils.partner_tenant import stamp_tenant, assert_partner_owns_branch
+
+        await assert_partner_owns_branch(db, current_admin, coach_data.branch_id)
+        stamp_tenant(coach_dict, current_admin)
         
         # Insert into coaches collection
         result = await db.coaches.insert_one(coach_dict)
@@ -235,6 +240,12 @@ class CoachController:
             and_parts.append(assigned_scope)
             filter_query["$and"] = and_parts
 
+        from utils.partner_tenant import apply_tenant_filter, assert_partner_owns_branch
+
+        if bid:
+            await assert_partner_owns_branch(db, current_user, bid)
+        filter_query = apply_tenant_filter(filter_query, current_user)
+
         coaches = await db.coaches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         
         # Convert to response format (remove sensitive data)
@@ -283,6 +294,10 @@ class CoachController:
         coach = await db.coaches.find_one({"id": coach_id})
         if not coach:
             raise HTTPException(status_code=404, detail="Coach not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(coach, current_user, entity="coach")
         
         # Convert to response format
         coach_response = CoachResponse(
@@ -365,10 +380,15 @@ class CoachController:
         existing_coach = await db.coaches.find_one({"id": coach_id})
         if not existing_coach:
             raise HTTPException(status_code=404, detail="Coach not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_coach, current_admin, entity="coach")
         
         #----------------------------added for branch manager to update cocahes in their branch only----------------------------#
         # Branch Manager permission check (like course instructor check)
-        if current_admin["role"] != UserRole.SUPER_ADMIN:
+        role = str(current_admin.get("role") or "").lower()
+        if role not in ("super_admin", "superadmin", "partner_super_admin"):
             if existing_coach.get("branch_id") != current_admin.get("branch_id"):
                 raise HTTPException(
                     status_code=403,

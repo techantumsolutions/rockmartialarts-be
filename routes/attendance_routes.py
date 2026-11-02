@@ -165,24 +165,34 @@ async def get_unmatched_biometric_punches(
     limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
         )
     ),
 ):
     """M09-S03: list unmatched biometric punches for Admin review."""
-    return await list_unmatched(skip=skip, limit=limit)
+    return await list_unmatched(skip=skip, limit=limit, current_user=current_user)
 
 
 @router.get("/ingest/stats")
 async def get_biometric_ingest_stats(
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
         )
     ),
 ):
     """M09-S03: ingest summary stats."""
-    return await ingest_stats()
+    return await ingest_stats(current_user=current_user)
 
 
 @router.get("/export")

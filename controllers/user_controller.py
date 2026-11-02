@@ -383,6 +383,22 @@ class UserController:
             if user_data.role in [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]:
                 raise HTTPException(status_code=403, detail="Branch Managers cannot create admin users.")
 
+        if current_role == UserRole.PARTNER_SUPER_ADMIN:
+            from utils.partner_tenant import assert_partner_owns_branch
+
+            if user_data.role in [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Partners cannot create super admin accounts.",
+                )
+            branch_for_check = user_data.branch_id or (
+                user_data.branch.branch_id if user_data.branch else None
+            )
+            await assert_partner_owns_branch(get_db(), current_user, branch_for_check)
+
         # Check if user exists
         db = get_db()
         existing_user = await db.users.find_one({
@@ -461,6 +477,10 @@ class UserController:
             user_dict["emergency_contact"] = user_data.emergency_contact
         if user_data.role == UserRole.STUDENT and user_data.student_level:
             user_dict["student_level"] = user_data.student_level
+
+        from utils.partner_tenant import stamp_tenant
+
+        stamp_tenant(user_dict, current_user)
 
         if user_data.role == UserRole.STUDENT and user_data.course and user_data.branch:
             from utils.branch_courses import assert_course_available_at_branch
@@ -588,6 +608,12 @@ class UserController:
                 if current_user.get("branch_id") != branch_id:
                     raise HTTPException(status_code=403, detail="You can only view users from your own branch")
             filter_query["branch_id"] = branch_id
+
+        from utils.partner_tenant import apply_tenant_filter, assert_partner_owns_branch
+
+        if branch_id:
+            await assert_partner_owns_branch(get_db(), current_user, branch_id)
+        filter_query = apply_tenant_filter(filter_query, current_user)
         
         db = get_db()
         users = await (
@@ -626,6 +652,10 @@ class UserController:
 
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(user, current_user, entity="user")
 
         # Get current user role as enum
         current_role = current_user.get("role")

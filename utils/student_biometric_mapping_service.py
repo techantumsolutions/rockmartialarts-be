@@ -262,6 +262,26 @@ async def list_mappings(
         if not allowed:
             return {"students": [], "total": 0, "count": 0, "message": "No students in scope"}
         clauses.append({"id": {"$in": allowed}})
+    elif role == "partner_super_admin":
+        from utils.partner_tenant import assert_partner_owns_branch, partner_branch_ids
+
+        p_bids = await partner_branch_ids(db, current_user) or []
+        if branch_id:
+            await assert_partner_owns_branch(db, current_user, branch_id)
+            scope_branches = [branch_id]
+        else:
+            scope_branches = list(p_bids)
+        if not scope_branches:
+            return {"students": [], "total": 0, "count": 0, "message": "No branches in organization"}
+        scoped_ids = await db.enrollments.distinct("student_id", {"branch_id": {"$in": scope_branches}})
+        direct = await db.users.distinct(
+            "id",
+            {"role": "student", "branch_id": {"$in": scope_branches}},
+        )
+        allowed = list({*(scoped_ids or []), *(direct or [])})
+        if not allowed:
+            return {"students": [], "total": 0, "count": 0, "message": "No students in scope"}
+        clauses.append({"id": {"$in": allowed}})
     elif branch_id:
         scoped_ids = await db.enrollments.distinct("student_id", {"branch_id": branch_id})
         direct = await db.users.distinct("id", {"role": "student", "branch_id": branch_id})

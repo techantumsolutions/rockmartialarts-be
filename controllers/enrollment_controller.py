@@ -24,6 +24,10 @@ class EnrollmentController:
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
 
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
         # Get current user role
         current_role = current_user.get("role")
         if isinstance(current_role, str):
@@ -44,14 +48,24 @@ class EnrollmentController:
             if not current_user.get("branch_id") or enrollment_data.branch_id != current_user["branch_id"]:
                 raise HTTPException(status_code=403, detail="Coach Admins can only create enrollments for their own branch.")
 
+        from utils.partner_tenant import (
+            assert_partner_owns_branch,
+            assert_tenant_doc_access,
+            stamp_tenant,
+        )
+
+        await assert_partner_owns_branch(db, current_user, enrollment_data.branch_id)
+
         # Validate student, course, and branch exist
         student = await db.users.find_one({"id": enrollment_data.student_id, "role": "student"})
         if not student:
             raise HTTPException(status_code=404, detail="Student not found")
+        assert_tenant_doc_access(student, current_user, entity="student")
 
         course = await db.courses.find_one({"id": enrollment_data.course_id})
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
+        assert_tenant_doc_access(course, current_user, entity="course")
 
         branch = await assert_branch_accepts_enrollment(db, enrollment_data.branch_id) 
         await assert_course_available_at_branch(
@@ -65,8 +79,10 @@ class EnrollmentController:
             end_date=end_date,
             next_due_date=enrollment_data.start_date + timedelta(days=30)
         )
+        enrollment_dict = enrollment.dict()
+        stamp_tenant(enrollment_dict, current_user)
         
-        await db.enrollments.insert_one(enrollment.dict())
+        await db.enrollments.insert_one(enrollment_dict)
         
         # Create initial payment records
         admission_payment = Payment(
@@ -88,8 +104,12 @@ class EnrollmentController:
             payment_status=PaymentStatus.PENDING,
             due_date=enrollment_data.start_date
         )
+        adm = admission_payment.dict()
+        crs = course_payment.dict()
+        stamp_tenant(adm, current_user)
+        stamp_tenant(crs, current_user)
         
-        await db.payments.insert_many([admission_payment.dict(), course_payment.dict()])
+        await db.payments.insert_many([adm, crs])
         
         # Send enrollment confirmation
         await send_whatsapp(student["phone"], f"Welcome! You're enrolled in {course['name']}. Start date: {enrollment_data.start_date.date()}")
@@ -133,6 +153,16 @@ class EnrollmentController:
                 raise HTTPException(status_code=403, detail="Access denied for this branch")
             if not req_b:
                 filter_query["branch_id"] = {"$in": managed}
+
+        from utils.partner_tenant import apply_tenant_filter, assert_partner_owns_branch, partner_branch_ids
+
+        if filter_query.get("branch_id") and isinstance(filter_query.get("branch_id"), str):
+            await assert_partner_owns_branch(db, current_user, filter_query["branch_id"])
+        # Prefer partner_org_id stamp; also constrain by partner branches as fallback
+        filter_query = apply_tenant_filter(filter_query, current_user)
+        p_bids = await partner_branch_ids(db, current_user)
+        if p_bids is not None and "partner_org_id" not in filter_query:
+            filter_query["branch_id"] = {"$in": p_bids}
 
         enrollments = await db.enrollments.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         student_ids = list({e.get("student_id") for e in enrollments if e.get("student_id")})
