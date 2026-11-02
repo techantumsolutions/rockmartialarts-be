@@ -462,6 +462,25 @@ class SearchController:
             # For branch managers, we need to filter by enrollments in managed branches
             # We'll handle this filtering after getting the base student list
 
+        partner_branch_ids = None
+        if current_role == UserRole.PARTNER_SUPER_ADMIN:
+            from utils.partner_tenant import partner_branch_ids as _partner_branch_ids
+
+            partner_branch_ids = await _partner_branch_ids(db, current_user)
+            if not partner_branch_ids:
+                return {
+                    "query": query or "",
+                    "students": [],
+                    "total": 0,
+                    "count": 0,
+                    "message": "No branches in your partner organization",
+                }
+            if branch_id and branch_id != "all" and branch_id not in set(partner_branch_ids):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Branch is outside your partner organization",
+                )
+
         # Get students matching the base criteria
         students_cursor = db.users.find(student_filter).skip(skip).limit(limit)
         students = await students_cursor.to_list(length=limit)
@@ -492,6 +511,24 @@ class SearchController:
             # Filter students based on enrollment matches
             enrolled_student_ids = set(enrollment["student_id"] for enrollment in enrollments)
             students = [student for student in students if student["id"] in enrolled_student_ids]
+
+        elif current_role == UserRole.PARTNER_SUPER_ADMIN:
+            student_ids = [student["id"] for student in students]
+            enrollment_filter = {
+                "student_id": {"$in": student_ids},
+                "branch_id": {
+                    "$in": [branch_id]
+                    if branch_id and branch_id != "all"
+                    else list(partner_branch_ids or [])
+                },
+                "is_active": True,
+            }
+            if course_id and course_id != "all":
+                enrollment_filter["course_id"] = course_id
+            enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
+            enrolled_student_ids = set(enrollment["student_id"] for enrollment in enrollments)
+            students = [student for student in students if student["id"] in enrolled_student_ids]
+            total_students = len(students)
 
         elif branch_id or course_id:
             # Regular branch or course filtering for other roles
