@@ -402,8 +402,40 @@ async def approve_coach(
         is_active_before=was_active,
         is_active_after=True,
     )
+    # Send password setup email with configurable expiry hours (default: 24)
+    coach_email = coach.get("email") or coach.get("contact_info", {}).get("email")
+    coach_name = (
+        coach.get("full_name")
+        or f"{coach.get('personal_info', {}).get('first_name', '')} {coach.get('personal_info', {}).get('last_name', '')}".strip()
+        or "Coach"
+    )
+    if coach_email:
+        try:
+            import os
+            from datetime import timedelta
+            from utils.unified_auth import create_access_token
+            from utils.resend_email import send_coach_approval_email
+
+            expiry_hours = int(os.getenv("COACH_PASSWORD_SETUP_EXPIRY_HOURS", "24"))
+            reset_token = create_access_token(
+                data={"sub": coach["id"], "scope": "password_reset", "type": "coach_password_setup"},
+                expires_delta=timedelta(hours=expiry_hours),
+            )
+            frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3022").rstrip("/")
+            setup_link = f"{frontend_url}/coach/reset-password?token={reset_token}"
+
+            await send_coach_approval_email(
+                to_email=coach_email,
+                coach_name=coach_name,
+                setup_link=setup_link,
+                expiry_hours=expiry_hours,
+            )
+            logger.info("Sent approval & setup email to coach %s (%s)", coach_id, coach_email)
+        except Exception as e:
+            logger.exception("Failed sending coach approval email for %s: %s", coach_id, e)
+
     updated = await db[COL].find_one({"id": coach_id})
-    return {"message": "Coach approved successfully", "coach": _public_coach(updated)}
+    return {"message": "Coach approved successfully and setup email sent", "coach": _public_coach(updated)}
 
 
 async def reject_coach(
@@ -435,6 +467,19 @@ async def reject_coach(
             detail=f"Cannot reject coach from status '{current}'",
         )
 
+    # Rejection reason is mandatory
+    rejection_reason = (
+        (body.reason if body and getattr(body, "reason", None) else None)
+        or (body.note if body and getattr(body, "note", None) else None)
+        or ""
+    ).strip()
+
+    if not rejection_reason:
+        raise HTTPException(
+            status_code=400,
+            detail="Rejection reason is required. Please specify a reason to reject this coach application."
+        )
+
     now = datetime.utcnow()
     was_active = bool(coach.get("is_active", False))
     await db[COL].update_one(
@@ -443,13 +488,13 @@ async def reject_coach(
             "$set": {
                 "approval_status": target,
                 "is_active": False,
+                "rejection_reason": rejection_reason,
                 "updated_at": now,
                 "rejected_at": now,
                 "rejected_by": current_user.get("id"),
             }
         },
     )
-    note = (body.note if body else None) or None
     await append_approval_history(
         db,
         coach_id=coach_id,
@@ -457,12 +502,32 @@ async def reject_coach(
         to_status=target,
         action="reject",
         actor=_actor(current_user),
-        note=note,
+        note=rejection_reason,
         is_active_before=was_active,
         is_active_after=False,
     )
+
+    # Send rejection notification email with reason
+    coach_email = coach.get("email") or coach.get("contact_info", {}).get("email")
+    coach_name = (
+        coach.get("full_name")
+        or f"{coach.get('personal_info', {}).get('first_name', '')} {coach.get('personal_info', {}).get('last_name', '')}".strip()
+        or "Coach"
+    )
+    if coach_email:
+        try:
+            from utils.resend_email import send_coach_rejection_email
+            await send_coach_rejection_email(
+                to_email=coach_email,
+                coach_name=coach_name,
+                reason=rejection_reason,
+            )
+            logger.info("Sent rejection email with reason to coach %s (%s)", coach_id, coach_email)
+        except Exception as e:
+            logger.exception("Failed sending coach rejection email for %s: %s", coach_id, e)
+
     updated = await db[COL].find_one({"id": coach_id})
-    return {"message": "Coach registration rejected", "coach": _public_coach(updated)}
+    return {"message": "Coach registration rejected and notification email sent", "coach": _public_coach(updated)}
 
 
 async def set_coach_active_status(
