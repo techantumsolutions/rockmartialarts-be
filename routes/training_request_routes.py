@@ -9,6 +9,7 @@ from models.training_request_models import (
     HomeTrainingRequestCreate,
     ResidentialTrainingRequestCreate,
     SchoolTrainingRequestCreate,
+    CreateTrainingOrderBody,
     CoachTrainingRequestResponse,
     TrainingRequestCoachAssign,
     TrainingRequestPaymentVerify,
@@ -20,6 +21,7 @@ from utils.training_request_service import (
     create_college_training_request,
     create_corporate_training_request,
     create_home_training_request,
+    create_training_payment_order,
     create_residential_payment_order,
     create_residential_training_request,
     create_school_training_request,
@@ -42,6 +44,15 @@ ADMIN_ROLES = [
     UserRole.COACH_ADMIN,
     UserRole.BRANCH_MANAGER,
 ]
+
+
+@router.post("/create-order")
+async def api_create_training_order(
+    body: CreateTrainingOrderBody,
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin),
+):
+    """Public (optional auth) — create Razorpay order for training request based on Super Admin configured fee."""
+    return await create_training_payment_order(body, current_user=current_user)
 
 
 @router.post("/home", status_code=status.HTTP_201_CREATED)

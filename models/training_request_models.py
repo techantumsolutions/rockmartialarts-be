@@ -97,6 +97,9 @@ class HomeTrainingRequestCreate(BaseModel):
     source: Optional[str] = Field(default="website", max_length=80)
     notes: Optional[str] = Field(default=None, max_length=2000)
     details: HomeTrainingDetails
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class SchoolTrainingDetails(BaseModel):
@@ -144,6 +147,9 @@ class SchoolTrainingRequestCreate(BaseModel):
     source: Optional[str] = Field(default="website", max_length=80)
     notes: Optional[str] = Field(default=None, max_length=2000)
     details: SchoolTrainingDetails
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class CollegeTrainingDetails(BaseModel):
@@ -198,6 +204,9 @@ class CollegeTrainingRequestCreate(BaseModel):
     source: Optional[str] = Field(default="website", max_length=80)
     notes: Optional[str] = Field(default=None, max_length=2000)
     details: CollegeTrainingDetails
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class CorporateTrainingDetails(BaseModel):
@@ -252,6 +261,9 @@ class CorporateTrainingRequestCreate(BaseModel):
     source: Optional[str] = Field(default="website", max_length=80)
     notes: Optional[str] = Field(default=None, max_length=2000)
     details: CorporateTrainingDetails
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class ResidentialPackage(BaseModel):
@@ -337,7 +349,7 @@ class ResidentialTrainingDetails(BaseModel):
     gender: Optional[str] = Field(default=None, max_length=40)
     emergency_contact_name: Optional[str] = Field(default=None, max_length=200)
     emergency_contact_phone: Optional[str] = Field(default=None, max_length=32)
-    package_id: str = Field(..., min_length=1, max_length=64)
+    package_id: Optional[str] = Field(default="residential_standard", max_length=64)
     package_name: Optional[str] = Field(default=None, max_length=200)
     duration_days: Optional[int] = Field(default=None, ge=1, le=365)
     duration_label: Optional[str] = Field(default=None, max_length=120)
@@ -380,6 +392,9 @@ class ResidentialTrainingRequestCreate(BaseModel):
         description="If true and package requires payment, payment_status starts as pending",
     )
     details: ResidentialTrainingDetails
+    razorpay_order_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class TrainingRequestPaymentVerify(BaseModel):
@@ -428,4 +443,16 @@ class TrainingRequestDocument(BaseModel):
     coach_responded_at: Optional[datetime] = None
     created_by: Optional[str] = None  # logged-in student id if any
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+
+class CreateTrainingOrderBody(BaseModel):
+    """Payload to create Razorpay order for training requests based on Super Admin settings."""
+    type: str = Field(..., description="home | school | college | corporate | residential")
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+
+

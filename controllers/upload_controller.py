@@ -15,8 +15,11 @@ def _default_upload_root() -> Path:
     """
     be_root = Path(__file__).resolve().parents[1]  # .../rockmartialarts-be
     local_public = be_root.parent / "rockmartialarts-fe" / "public" / "uploads"
-    if local_public.parent.exists():
-        return local_public
+    try:
+        if local_public.parent.exists():
+            return local_public
+    except OSError:
+        pass
     return Path("/var/www/rockmartialarts-fe/public/uploads")
 
 

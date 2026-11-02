@@ -18,6 +18,7 @@ from models.training_request_models import (
     CoachTrainingRequestResponse,
     CollegeTrainingRequestCreate,
     CorporateTrainingRequestCreate,
+    CreateTrainingOrderBody,
     DEFAULT_RESIDENTIAL_PACKAGES,
     HomeTrainingRequestCreate,
     ResidentialTrainingRequestCreate,
@@ -136,6 +137,57 @@ async def _resolve_branch(
     return bid, bname
 
 
+async def _validate_training_payment(
+    db,
+    request_type: str,
+    razorpay_order_id: Optional[str],
+    razorpay_payment_id: Optional[str],
+    razorpay_signature: Optional[str],
+    now: datetime,
+) -> tuple[str, float, int, Optional[datetime]]:
+    fee_key_map = {
+        "home": "home_training_fee",
+        "school": "school_training_fee",
+        "college": "college_training_fee",
+        "corporate": "corporate_training_fee",
+        "residential": "residential_training_fee",
+    }
+    fee_key = fee_key_map.get(request_type)
+    settings_doc = await db.system_settings.find_one({}) or {}
+    configured_fee = 0.0
+    if fee_key and settings_doc.get(fee_key) is not None:
+        try:
+            configured_fee = float(settings_doc[fee_key])
+        except (TypeError, ValueError):
+            configured_fee = 0.0
+
+    payment_status = "not_required"
+    amount_paise = 0
+    paid_at = None
+
+    if configured_fee > 0:
+        if not razorpay_order_id or not razorpay_payment_id or not razorpay_signature:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment of training fee (₹{configured_fee:.2f}) is required to submit this request.",
+            )
+        from utils.razorpay_client import verify_razorpay_signature
+
+        valid_sig = verify_razorpay_signature(
+            razorpay_order_id, razorpay_payment_id, razorpay_signature
+        )
+        if not valid_sig:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Razorpay payment signature.",
+            )
+        payment_status = "paid"
+        amount_paise = int(round(configured_fee * 100))
+        paid_at = now
+
+    return payment_status, configured_fee, amount_paise, paid_at
+
+
 def _details_dict(details) -> dict:
     if hasattr(details, "model_dump"):
         return details.model_dump()
@@ -155,6 +207,9 @@ async def _insert_training_request(
     details: dict,
     current_user: Optional[dict],
     success_message: str,
+    razorpay_order_id: Optional[str] = None,
+    razorpay_payment_id: Optional[str] = None,
+    razorpay_signature: Optional[str] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     db = get_db()
@@ -165,6 +220,21 @@ async def _insert_training_request(
     bid, bname = await _resolve_branch(db, branch_id, branch_name)
     now = datetime.utcnow()
     actor = _actor(current_user)
+
+    (
+        payment_status,
+        configured_fee,
+        amount_paise,
+        paid_at,
+    ) = await _validate_training_payment(
+        db,
+        request_type,
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        now,
+    )
+
     doc_id = str(uuid.uuid4())
     doc = {
         "id": doc_id,
@@ -178,6 +248,14 @@ async def _insert_training_request(
         "source": (source or "website").strip() or "website",
         "notes": (notes or "").strip() or None,
         "details": details,
+        "payment_status": payment_status,
+        "fee_total_inr": configured_fee,
+        "amount_paise": amount_paise,
+        "currency": "INR",
+        "razorpay_order_id": razorpay_order_id,
+        "razorpay_payment_id": razorpay_payment_id,
+        "razorpay_signature": razorpay_signature,
+        "paid_at": paid_at,
         "assigned_coach_id": None,
         "assigned_coach_name": None,
         "assigned_at": None,
@@ -231,6 +309,87 @@ async def _insert_training_request(
     }
 
 
+async def create_training_payment_order(
+    body: CreateTrainingOrderBody,
+    *,
+    current_user: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Public (optional auth) — create Razorpay order for training requests (home, school, college, corporate, residential)."""
+    import os
+    import secrets
+    from utils.razorpay_client import get_razorpay_client
+
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    req_type = (body.type or "").strip().lower()
+    fee_field_map = {
+        "home": "home_training_fee",
+        "school": "school_training_fee",
+        "college": "college_training_fee",
+        "corporate": "corporate_training_fee",
+        "residential": "residential_training_fee",
+    }
+    field_name = fee_field_map.get(req_type)
+    if not field_name:
+        raise HTTPException(status_code=400, detail=f"Invalid training type: {req_type}")
+
+    settings_doc = await db.system_settings.find_one({}) or {}
+    fee = 0.0
+    if settings_doc.get(field_name) is not None:
+        try:
+            fee = float(settings_doc[field_name])
+        except (TypeError, ValueError):
+            fee = 0.0
+
+    if fee <= 0:
+        return {
+            "fee_required": False,
+            "amount_inr": 0.0,
+            "amount_paise": 0,
+            "currency": "INR",
+        }
+
+    client = get_razorpay_client()
+    key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+    amount_paise = int(round(fee * 100))
+    receipt = f"trn_{req_type[:4]}_{secrets.token_hex(4)}"
+
+    name = (body.contact_name or "")[:80]
+    email = (body.contact_email or "")[:80]
+    phone = (body.contact_phone or "")[:32]
+
+    order_payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": {
+            "type": f"training_{req_type}",
+            "contact_name": name,
+            "contact_email": email,
+            "contact_phone": phone,
+        },
+    }
+
+    try:
+        rp_order = client.order.create(data=order_payload)
+        return {
+            "fee_required": True,
+            "order_id": rp_order["id"],
+            "amount_paise": amount_paise,
+            "amount_inr": fee,
+            "currency": "INR",
+            "key_id": key_id,
+        }
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order for training request: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create payment order: {str(e)}",
+        )
+
+
 async def create_home_training_request(
     body: HomeTrainingRequestCreate,
     *,
@@ -248,6 +407,9 @@ async def create_home_training_request(
         details=_details_dict(body.details),
         current_user=current_user,
         success_message="Home training request submitted",
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
     )
 
 
@@ -268,6 +430,9 @@ async def create_school_training_request(
         details=_details_dict(body.details),
         current_user=current_user,
         success_message="School training request submitted",
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
     )
 
 
@@ -288,6 +453,9 @@ async def create_college_training_request(
         details=_details_dict(body.details),
         current_user=current_user,
         success_message="College training request submitted",
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
     )
 
 
@@ -308,6 +476,9 @@ async def create_corporate_training_request(
         details=_details_dict(body.details),
         current_user=current_user,
         success_message="Corporate training request submitted",
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
     )
 
 
@@ -321,7 +492,14 @@ def _get_package(package_id: str) -> dict:
     for p in DEFAULT_RESIDENTIAL_PACKAGES:
         if p.get("id") == pid and p.get("is_active", True):
             return dict(p)
-    raise HTTPException(status_code=400, detail="Invalid residential package_id")
+    return {
+        "id": "residential_standard",
+        "name": "Residential Training Program",
+        "duration_days": 30,
+        "duration_label": "Standard",
+        "fee_total_inr": 0,
+        "fee_pay_now_inr": 0,
+    }
 
 
 async def create_residential_training_request(
@@ -329,31 +507,15 @@ async def create_residential_training_request(
     *,
     current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    pkg = _get_package(body.details.package_id)
     details = _details_dict(body.details)
-    details["package_id"] = pkg["id"]
-    details["package_name"] = pkg.get("name")
-    details["duration_days"] = details.get("duration_days") or pkg.get("duration_days")
-    details["duration_label"] = details.get("duration_label") or pkg.get("duration_label")
-    fee_total = int(pkg.get("fee_total_inr") or 0)
-    fee_pay_now = int(pkg.get("fee_pay_now_inr") or 0)
-    details["fee_total_inr"] = fee_total
-    details["fee_pay_now_inr"] = fee_pay_now
+    details["package_id"] = details.get("package_id") or "residential_standard"
+    details["package_name"] = details.get("package_name") or "Residential Training Program"
     if details.get("participant_phone"):
         details["participant_phone"] = _normalize_phone(str(details["participant_phone"]))
     if details.get("emergency_contact_phone"):
         details["emergency_contact_phone"] = _normalize_phone(
             str(details["emergency_contact_phone"])
         )
-
-    payment_required = bool(pkg.get("payment_required")) and fee_pay_now > 0
-    # Enquiry/custom or zero-fee packages skip payment
-    if not payment_required:
-        payment_status = "not_required"
-        amount_paise = 0
-    else:
-        payment_status = "pending"
-        amount_paise = int(fee_pay_now * 100)
 
     return await _insert_training_request(
         request_type=TrainingRequestType.RESIDENTIAL.value,
@@ -367,17 +529,9 @@ async def create_residential_training_request(
         details=details,
         current_user=current_user,
         success_message="Residential training request submitted",
-        extra_fields={
-            "payment_status": payment_status,
-            "fee_total_inr": fee_total,
-            "fee_pay_now_inr": fee_pay_now,
-            "amount_paise": amount_paise,
-            "currency": "INR",
-            "razorpay_order_id": None,
-            "razorpay_payment_id": None,
-            "razorpay_signature": None,
-            "pay_now_requested": bool(body.pay_now),
-        },
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_signature=body.razorpay_signature,
     )
 
 

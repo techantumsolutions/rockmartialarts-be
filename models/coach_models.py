@@ -219,9 +219,10 @@ class CoachApprovalActionBody(BaseModel):
 
 
 class CoachRejectBody(BaseModel):
-    """M14-S02 reject action — note recommended for audit."""
+    """M14-S02 reject action — reason required for audit and notification."""
 
     note: Optional[str] = Field(default=None, max_length=1000)
+    reason: Optional[str] = Field(default=None, max_length=1000)
 
 
 class CoachActiveStatusBody(BaseModel):

@@ -131,6 +131,12 @@ class SystemSettingsFlatCreate(BaseModel):
     # Pricing (public registration / admission default when branch has no override)
     registration_fee: float = Field(default=500.0, ge=0, description="Default registration fee (INR)")
     coach_registration_fee: float = Field(default=0.0, ge=0, description="Coach registration fee (INR)")
+    coach_registration_fee_note: Optional[str] = Field(default="", description="Subtext note for coach registration fee card")
+    home_training_fee: float = Field(default=0.0, ge=0, description="Home training fee (INR)")
+    school_training_fee: float = Field(default=0.0, ge=0, description="School training fee (INR)")
+    college_training_fee: float = Field(default=0.0, ge=0, description="College training fee (INR)")
+    corporate_training_fee: float = Field(default=0.0, ge=0, description="Corporate training fee (INR)")
+    residential_training_fee: float = Field(default=0.0, ge=0, description="Residential training fee (INR)")
 
     @validator('smtp_port')
     def validate_smtp_port(cls, v):
@@ -189,6 +195,12 @@ class SystemSettingsFlatResponse(BaseModel):
 
     registration_fee: float
     coach_registration_fee: float = 0.0
+    coach_registration_fee_note: Optional[str] = ""
+    home_training_fee: float = 0.0
+    school_training_fee: float = 0.0
+    college_training_fee: float = 0.0
+    corporate_training_fee: float = 0.0
+    residential_training_fee: float = 0.0
 
     created_at: datetime
     updated_at: datetime
