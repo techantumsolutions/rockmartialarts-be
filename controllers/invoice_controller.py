@@ -27,6 +27,28 @@ async def _managed_branch_ids(user: dict) -> List[str]:
     return await get_managed_branch_ids_for_user(get_db(), user)
 
 
+_OFFLINE_PAYMENT_METHODS = ("physical_cash", "cash", "hand_cash", "offline")
+_RAZORPAY_PAYMENT_METHODS = (
+    "razorpay",
+    "online",
+    "digital_wallet",
+    "net_banking",
+    "card",
+    "upi",
+    "wallet",
+)
+_COACH_SOURCES = ("coach_subscription", "coach_registration", "coach")
+
+
+def _and_clause(query: Dict[str, Any], clause: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine an extra filter into query without dropping existing $or scopes."""
+    if not clause:
+        return query
+    if not query:
+        return dict(clause)
+    return {"$and": [query, clause]}
+
+
 class InvoiceController:
     @staticmethod
     async def list_invoices(
@@ -36,6 +58,10 @@ class InvoiceController:
         limit: int = 50,
         search: Optional[str] = None,
         payment_id: Optional[str] = None,
+        payer_type: Optional[str] = None,
+        course_id: Optional[str] = None,
+        plan_id: Optional[str] = None,
+        payment_method: Optional[str] = None,
     ) -> Dict[str, Any]:
         db = get_db()
         if db is None:
@@ -74,6 +100,70 @@ class InvoiceController:
         if payment_id:
             query["payment_id"] = payment_id
 
+        payer = (payer_type or "").strip().lower()
+        if payer in ("student", "coach"):
+            coach_match = {
+                "$or": [
+                    {"payer_type": "coach"},
+                    {"coach_id": {"$exists": True, "$nin": [None, ""]}},
+                    {"source": {"$in": list(_COACH_SOURCES)}},
+                    {"plan_id": {"$exists": True, "$nin": [None, ""]}},
+                ]
+            }
+            if payer == "coach":
+                query = _and_clause(query, coach_match)
+            else:
+                query = _and_clause(query, {"$nor": [coach_match]})
+
+        cid = (course_id or "").strip()
+        if cid:
+            query = _and_clause(query, {"line_items.course_id": cid})
+
+        pid = (plan_id or "").strip()
+        if pid:
+            query = _and_clause(
+                query,
+                {
+                    "$or": [
+                        {"plan_id": pid},
+                        {"line_items.plan_id": pid},
+                        {"line_items.metadata.plan_id": pid},
+                    ]
+                },
+            )
+
+        pm = (payment_method or "").strip().lower()
+        if pm in ("razorpay", "online"):
+            query = _and_clause(
+                query,
+                {
+                    "$or": [
+                        {"payment_method": {"$in": list(_RAZORPAY_PAYMENT_METHODS)}},
+                        {
+                            "payment_gateway_label": {
+                                "$regex": r"razorpay|online",
+                                "$options": "i",
+                            }
+                        },
+                    ]
+                },
+            )
+        elif pm in ("offline", "hand_cash", "cash", "physical_cash"):
+            query = _and_clause(
+                query,
+                {
+                    "$or": [
+                        {"payment_method": {"$in": list(_OFFLINE_PAYMENT_METHODS)}},
+                        {
+                            "payment_gateway_label": {
+                                "$regex": r"hand\s*cash|physical|offline|cash",
+                                "$options": "i",
+                            }
+                        },
+                    ]
+                },
+            )
+
         if search and search.strip():
             s = re.escape(search.strip())
             search_clause = {
@@ -87,10 +177,7 @@ class InvoiceController:
                     {"customer_name": {"$regex": s, "$options": "i"}},
                 ]
             }
-            if "$or" in query:
-                query = {"$and": [{"$or": query["$or"]}, search_clause]}
-            else:
-                query.update(search_clause)
+            query = _and_clause(query, search_clause)
 
         total = await db.invoices.count_documents(query)
         cursor = db.invoices.find(query).sort("created_at", -1).skip(skip).limit(limit)
@@ -98,6 +185,22 @@ class InvoiceController:
         items = []
         for row in rows:
             ser = serialize_doc(row)
+            lines = ser.get("line_items") or []
+            course_ids = []
+            course_names = []
+            for li in lines:
+                if not isinstance(li, dict):
+                    continue
+                if li.get("course_id"):
+                    course_ids.append(str(li.get("course_id")))
+                if li.get("course_name"):
+                    course_names.append(str(li.get("course_name")))
+            is_coach = bool(
+                ser.get("payer_type") == "coach"
+                or ser.get("coach_id")
+                or ser.get("plan_id")
+                or str(ser.get("source") or "").lower() in _COACH_SOURCES
+            )
             items.append(
                 {
                     "id": ser.get("id"),
@@ -110,7 +213,13 @@ class InvoiceController:
                     "payment_id": ser.get("payment_id"),
                     "cart_checkout_id": ser.get("cart_checkout_id"),
                     "payment_reference": ser.get("payment_reference"),
-                    "line_count": len(ser.get("line_items") or []),
+                    "payment_method": ser.get("payment_method"),
+                    "payment_gateway_label": ser.get("payment_gateway_label"),
+                    "payer_type": "coach" if is_coach else "student",
+                    "plan_id": ser.get("plan_id"),
+                    "course_ids": list(dict.fromkeys(course_ids)),
+                    "course_names": list(dict.fromkeys(course_names)),
+                    "line_count": len(lines),
                     "created_at": ser.get("created_at"),
                     "source": ser.get("source"),
                 }
