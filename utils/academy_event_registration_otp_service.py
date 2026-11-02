@@ -41,7 +41,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "student_management_secret_key_2025_se
 JWT_ALG = "HS256"
 SCOPE = "academy_event_registration"
 
-OTP_TTL_MIN = max(5, min(15, int(os.getenv("ACADEMY_EVENT_OTP_TTL_MIN", "10"))))
+OTP_TTL_SECONDS = 60
 RESEND_COOLDOWN_SEC = int(os.getenv("ACADEMY_EVENT_OTP_RESEND_COOLDOWN_SEC", "30"))
 VERIFICATION_JWT_HOURS = int(os.getenv("ACADEMY_EVENT_VERIFY_JWT_HOURS", "24"))
 JWT_DECODE_LEEWAY_SEC = int(os.getenv("ACADEMY_EVENT_JWT_LEEWAY_SEC", "120"))
@@ -88,7 +88,8 @@ def _otp_sms_message(otp: str) -> str:
         return body.replace("{otp}", otp)
     return (
         "ROCK MARTIAL ARTS ACADEMY: Your OTP is "
-        f"{otp}. Use this to view your event registrations. Do not share this code with anyone."
+        f"{otp}. It expires in 60 seconds. Use this to view your event registrations. "
+        "Do not share this code with anyone."
     )
 
 
@@ -165,7 +166,7 @@ async def send_event_registration_otp(phone: str) -> Dict[str, Any]:
 
     otp = "".join(random.choices(string.digits, k=6))
     code_hash = _pwd.hash(otp)
-    expires = now + timedelta(minutes=OTP_TTL_MIN)
+    expires = now + timedelta(seconds=OTP_TTL_SECONDS)
     otp_doc = {
         "phone": canonical,
         "code_hash": code_hash,
@@ -200,7 +201,7 @@ async def send_event_registration_otp(phone: str) -> Dict[str, Any]:
     elif expects_sms and ok:
         logger.info("Event registration OTP sent for phone ending ...%s", canonical[-4:])
 
-    return {"message": "OTP sent", "expires_in_seconds": OTP_TTL_MIN * 60}
+    return {"message": "OTP sent", "expires_in_seconds": OTP_TTL_SECONDS}
 
 
 async def verify_event_registration_otp(phone: str, otp: str) -> Dict[str, Any]:
