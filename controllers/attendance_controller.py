@@ -984,24 +984,43 @@ class AttendanceController:
             # For superadmin without branch filter, show all students regardless of enrollment status
 
             all_students = await db.users.find(student_filter).to_list(length=None)
-            total_students = len(all_students)
+            # Unique roster (guard against duplicate user docs)
+            student_by_id = {}
+            for s in all_students:
+                sid = s.get("id")
+                if sid and sid not in student_by_id:
+                    student_by_id[sid] = s
+            all_student_ids = set(student_by_id.keys())
+            total_students = len(all_student_ids)
 
             # Get attendance records for the specified date
             attendance_filter = {**filter_query, "attendance_date": {"$gte": attendance_date, "$lt": next_day}}
             attendance_records = await db.attendance.find(attendance_filter).to_list(length=None)
 
-            # Calculate student attendance statistics for the specified date
-            student_present_today = len([a for a in attendance_records if a.get("status") == "present" or (a.get("is_present") and not a.get("status"))])
-            student_absent_today = len([a for a in attendance_records if a.get("status") == "absent" or (not a.get("is_present") and a.get("status") != "late")])
-            student_late_today = len([a for a in attendance_records if a.get("status") == "late"])
+            def _normalize_att_status(record: dict) -> str:
+                stored = record.get("status")
+                if stored:
+                    return str(stored).strip().lower()
+                return "present" if record.get("is_present") else "absent"
 
-            # Calculate students with no attendance record (considered absent)
-            students_with_records = set(a.get("student_id") for a in attendance_records if a.get("student_id"))
-            all_student_ids = set(s.get("id") for s in all_students if s.get("id"))
-            students_without_records = all_student_ids - students_with_records
+            # One status per student (present > late > absent). Do NOT treat unmarked as absent —
+            # unmarked students stay outside present/absent so cards match the students page.
+            student_status_by_id = {}
+            _status_rank = {"present": 3, "late": 2, "absent": 1}
+            for record in attendance_records:
+                sid = record.get("student_id")
+                if not sid or sid not in all_student_ids:
+                    continue
+                st = _normalize_att_status(record)
+                if st not in _status_rank:
+                    continue
+                prev = student_status_by_id.get(sid)
+                if prev is None or _status_rank[st] > _status_rank.get(prev, 0):
+                    student_status_by_id[sid] = st
 
-            # Add students without records to absent count
-            student_absent_today += len(students_without_records)
+            student_present_today = sum(1 for st in student_status_by_id.values() if st == "present")
+            student_late_today = sum(1 for st in student_status_by_id.values() if st == "late")
+            student_absent_today = sum(1 for st in student_status_by_id.values() if st == "absent")
 
             # Get coach statistics - try coaches collection first, then users collection
             coach_filter = {"is_active": True}
@@ -1022,24 +1041,33 @@ class AttendanceController:
                     user_coach_filter["branch_id"] = branch_id
                 all_coaches = await db.users.find(user_coach_filter).to_list(length=None)
 
-            total_coaches = len(all_coaches)
+            coach_by_id = {}
+            for c in all_coaches:
+                cid = c.get("id")
+                if cid and cid not in coach_by_id:
+                    coach_by_id[cid] = c
+            all_coach_ids = set(coach_by_id.keys())
+            total_coaches = len(all_coach_ids)
 
             # Get coach attendance records for the specified date
             coach_attendance_filter = {**filter_query, "attendance_date": {"$gte": attendance_date, "$lt": next_day}}
             coach_attendance_records = await db.coach_attendance.find(coach_attendance_filter).to_list(length=None)
 
-            # Calculate coach attendance statistics
-            coach_present_today = len([a for a in coach_attendance_records if a.get("status") == "present" or (a.get("is_present") and not a.get("status"))])
-            coach_absent_today = len([a for a in coach_attendance_records if a.get("status") == "absent" or (not a.get("is_present") and a.get("status") != "late")])
-            coach_late_today = len([a for a in coach_attendance_records if a.get("status") == "late"])
+            coach_status_by_id = {}
+            for record in coach_attendance_records:
+                cid = record.get("coach_id")
+                if not cid or cid not in all_coach_ids:
+                    continue
+                st = _normalize_att_status(record)
+                if st not in _status_rank:
+                    continue
+                prev = coach_status_by_id.get(cid)
+                if prev is None or _status_rank[st] > _status_rank.get(prev, 0):
+                    coach_status_by_id[cid] = st
 
-            # Calculate coaches with no attendance record (considered absent)
-            coaches_with_records = set(a.get("coach_id") for a in coach_attendance_records if a.get("coach_id"))
-            all_coach_ids = set(c.get("id") for c in all_coaches if c.get("id"))
-            coaches_without_records = all_coach_ids - coaches_with_records
-
-            # Add coaches without records to absent count
-            coach_absent_today += len(coaches_without_records)
+            coach_present_today = sum(1 for st in coach_status_by_id.values() if st == "present")
+            coach_late_today = sum(1 for st in coach_status_by_id.values() if st == "late")
+            coach_absent_today = sum(1 for st in coach_status_by_id.values() if st == "absent")
 
             # Calculate attendance rates
             student_attendance_rate = 0
