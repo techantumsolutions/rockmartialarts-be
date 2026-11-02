@@ -24,7 +24,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'student_management_secret_key_2025_se
 ALGORITHM = "HS256"
 
 # Debug: Print the SECRET_KEY being used (first 20 chars only for security)
-print(f"🔑 auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
+print(f"[AUTH] auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 

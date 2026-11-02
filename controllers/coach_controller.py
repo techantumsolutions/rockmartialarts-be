@@ -1332,16 +1332,41 @@ class CoachController:
         try:
             db = get_db()
             
-            # Find coach by email
-            coach = await db.coaches.find_one({"contact_info.email": login_data.email})
+            # Find coach by email (case-insensitive, whitespace-trimmed, check both email fields)
+            email_clean = (login_data.email or "").strip().lower()
+            coach = await db.coaches.find_one({
+                "$or": [
+                    {"email": email_clean},
+                    {"contact_info.email": email_clean},
+                    {"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+                    {"contact_info.email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+                ]
+            })
             if not coach:
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid email or password"
                 )
             
-            # Verify password
-            if not verify_password(login_data.password, coach["password_hash"]):
+            # Verify password against password_hash or password (set by reset_password)
+            password_valid = False
+            primary_hash = coach.get("password_hash")
+            legacy_hash = coach.get("password")
+
+            if primary_hash and verify_password(login_data.password, primary_hash):
+                password_valid = True
+            elif legacy_hash and verify_password(login_data.password, legacy_hash):
+                password_valid = True
+                # Auto-heal: sync password_hash in DB if it was only set in password
+                try:
+                    await db.coaches.update_one(
+                        {"id": coach["id"]},
+                        {"$set": {"password_hash": legacy_hash}}
+                    )
+                except Exception:
+                    pass
+
+            if not password_valid:
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid email or password"
@@ -1360,40 +1385,41 @@ class CoachController:
                     detail="Your coach registration was rejected. Please contact administrator.",
                 )
 
-            # M14-S04: expired subscription past grace (only if they have a sub record)
-            try:
-                from utils.coach_subscription_service import (
-                    assert_coach_subscription_allows_login,
-                )
+            # Check coach registration source & subscription status
+            reg_source = coach.get("registration_source") or "admin"
+            sub_status = coach.get("subscription_status") or "none"
 
-                await assert_coach_subscription_allows_login(coach)
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-            
             # Check if coach is active
-            if not coach.get("is_active", True):
+            # Admin-created coaches: blocked if deactivated by an administrator
+            # Self-registered coaches: allowed to log in even if inactive/expired so they can renew via dashboard
+            if not coach.get("is_active", True) and reg_source != "self":
                 raise HTTPException(
                     status_code=401,
                     detail="Account is inactive. Please contact administrator."
                 )
             
+            coach_email = coach.get("email") or (coach.get("contact_info") or {}).get("email") or email_clean
+
             # Create access token
             access_token_expires = 60 * 24  # 24 hours in minutes
             access_token = create_access_token(
                 data={
                     "sub": coach["id"],
-                    "email": coach["contact_info"]["email"],
+                    "email": coach_email,
                     "role": "coach",
-                    "coach_id": coach["id"]
+                    "coach_id": coach["id"],
+                    "registration_source": reg_source,
                 }
             )
             
             # Prepare coach data for response (without sensitive info)
             coach_data = serialize_doc(coach)
-            if "password_hash" in coach_data:
-                del coach_data["password_hash"]
+            coach_data.pop("password_hash", None)
+            coach_data.pop("password", None)
+            if not coach_data.get("email"):
+                coach_data["email"] = coach_email
+            coach_data["registration_source"] = reg_source
+            coach_data["subscription_status"] = sub_status
             
             return {
                 "access_token": access_token,
@@ -1414,7 +1440,15 @@ class CoachController:
     async def forgot_password(email: str):
         """Initiate password reset process for coach"""
         db = get_db()
-        coach = await db.coaches.find_one({"contact_info.email": email})
+        email_clean = (email or "").strip().lower()
+        coach = await db.coaches.find_one({
+            "$or": [
+                {"email": email_clean},
+                {"contact_info.email": email_clean},
+                {"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+                {"contact_info.email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+            ]
+        })
 
         if not coach:
             # Don't reveal that the coach does not exist
@@ -1429,17 +1463,17 @@ class CoachController:
         # Send password reset email with coach branding using webhook (same as /api/email/send-webhook-email)
         coach_name = coach.get("full_name", "Coach")
         from utils.email_service import send_password_reset_email_webhook
-        email_sent = await send_password_reset_email_webhook(email, reset_token, coach_name, "coach")
+        email_sent = await send_password_reset_email_webhook(email_clean, reset_token, coach_name, "coach")
 
         # Log the password reset attempt (same as student implementation)
         import logging
-        logging.info(f"Password reset requested for coach {email}. Email sent: {email_sent}")
+        logging.info(f"Password reset requested for coach {email_clean}. Email sent: {email_sent}")
 
         # Also send SMS as backup (if phone number exists) - same as student implementation
         coach_phone = coach.get("phone") or coach.get("contact_info", {}).get("phone")
         if coach_phone:
             from utils.helpers import send_sms
-            sms_message = f"Coach password reset requested for your account. Check your email ({email}) for reset instructions. If you didn't request this, please ignore."
+            sms_message = f"Coach password reset requested for your account. Check your email ({email_clean}) for reset instructions. If you didn't request this, please ignore."
             await send_sms(coach_phone, sms_message)
 
         response = {"message": "If a coach account with that email exists, a password reset link has been sent."}
@@ -1471,7 +1505,13 @@ class CoachController:
         db = get_db()
         result = await db.coaches.update_one(
             {"id": coach_id},
-            {"$set": {"password": new_hashed_password, "updated_at": datetime.utcnow()}}
+            {
+                "$set": {
+                    "password_hash": new_hashed_password,
+                    "password": new_hashed_password,
+                    "updated_at": datetime.utcnow()
+                }
+            }
         )
 
         if result.matched_count == 0:
@@ -1509,8 +1549,9 @@ class CoachController:
             expires_delta=timedelta(minutes=15)
         )
 
-        # Create password reset link
-        reset_link = f"http://localhost:3022/coach/reset-password?token={reset_token}"
+        import os
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3022").rstrip("/")
+        reset_link = f"{frontend_url}/coach/reset-password?token={reset_token}"
 
         # Prepare email content
         subject = "Your Coach Login Credentials - Marshalarts Academy"

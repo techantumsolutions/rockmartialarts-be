@@ -43,7 +43,7 @@ _ALL = [
 @router.get("/plans")
 async def api_list_plans(
     active_only: bool = Query(False),
-    current_user: dict = Depends(require_role_unified(_ALL)),
+    current_user: dict = Depends(require_role_unified(_ALL, allow_inactive_coach=True)),
 ):
     """List subscription plans (coaches see active only)."""
     force_active = current_user.get("role") == UserRole.COACH.value or active_only
@@ -69,7 +69,7 @@ async def api_update_plan(
 
 @router.get("/me")
 async def api_my_subscription(
-    current_user: dict = Depends(require_role_unified(_COACH)),
+    current_user: dict = Depends(require_role_unified(_COACH, allow_inactive_coach=True)),
 ):
     return await get_current_subscription(
         coach_id=current_user["id"], current_user=current_user
@@ -80,7 +80,7 @@ async def api_my_subscription(
 async def api_my_history(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    current_user: dict = Depends(require_role_unified(_COACH)),
+    current_user: dict = Depends(require_role_unified(_COACH, allow_inactive_coach=True)),
 ):
     return await list_payment_history(
         coach_id=current_user["id"],
@@ -93,7 +93,7 @@ async def api_my_history(
 @router.post("/me/checkout")
 async def api_my_checkout(
     body: CoachSubscriptionCheckoutBody,
-    current_user: dict = Depends(require_role_unified(_COACH)),
+    current_user: dict = Depends(require_role_unified(_COACH, allow_inactive_coach=True)),
 ):
     return await checkout(
         coach_id=current_user["id"], body=body, current_user=current_user
@@ -103,7 +103,7 @@ async def api_my_checkout(
 @router.post("/me/verify-payment")
 async def api_my_verify(
     body: CoachSubscriptionPaymentVerify,
-    current_user: dict = Depends(require_role_unified(_COACH)),
+    current_user: dict = Depends(require_role_unified(_COACH, allow_inactive_coach=True)),
 ):
     return await verify_payment(
         coach_id=current_user["id"], body=body, current_user=current_user
@@ -130,7 +130,7 @@ async def api_list_subscriptions(
 @router.get("/coach/{coach_id}")
 async def api_coach_subscription(
     coach_id: str,
-    current_user: dict = Depends(require_role_unified(_ALL)),
+    current_user: dict = Depends(require_role_unified(_ALL, allow_inactive_coach=True)),
 ):
     return await get_current_subscription(coach_id=coach_id, current_user=current_user)
 
