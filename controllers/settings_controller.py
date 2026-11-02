@@ -157,6 +157,7 @@ class SettingsController:
 
             # Pricing
             "registration_fee": 500.0,
+            "coach_registration_fee": 0.0,
         }
     
     @staticmethod
@@ -205,6 +206,7 @@ class SettingsController:
             "backup_retention": flat_data.backup_retention,
 
             "registration_fee": float(flat_data.registration_fee),
+            "coach_registration_fee": float(flat_data.coach_registration_fee or 0.0),
         }
     
     @staticmethod
@@ -243,6 +245,7 @@ class SettingsController:
             backup_retention=serialized_doc.get("backup_retention", "30"),
 
             registration_fee=float(serialized_doc.get("registration_fee", 500.0)),
+            coach_registration_fee=float(serialized_doc.get("coach_registration_fee", 0.0)),
             
             created_at=serialized_doc.get("created_at", datetime.utcnow()),
             updated_at=serialized_doc.get("updated_at", datetime.utcnow())
@@ -255,14 +258,42 @@ class SettingsController:
             db = get_db()
             doc = await db.system_settings.find_one({})
             fee = 500.0
+            coach_fee = 0.0
             if doc and doc.get("registration_fee") is not None:
                 try:
                     fee = float(doc["registration_fee"])
                 except (TypeError, ValueError):
                     fee = 500.0
-            return {"registrationFee": fee}
+            if doc and doc.get("coach_registration_fee") is not None:
+                try:
+                    coach_fee = float(doc["coach_registration_fee"])
+                except (TypeError, ValueError):
+                    coach_fee = 0.0
+            return {
+                "registrationFee": fee,
+                "coachRegistrationFee": coach_fee,
+                "registration_fee": fee,
+                "coach_registration_fee": coach_fee,
+            }
         except Exception:
-            return {"registrationFee": 500.0}
+            return {
+                "registrationFee": 500.0,
+                "coachRegistrationFee": 0.0,
+                "registration_fee": 500.0,
+                "coach_registration_fee": 0.0,
+            }
+
+    @staticmethod
+    async def get_default_coach_registration_fee() -> float:
+        """Read coach_registration_fee from system_settings (single document)."""
+        try:
+            db = get_db()
+            doc = await db.system_settings.find_one({})
+            if doc and doc.get("coach_registration_fee") is not None:
+                return float(doc["coach_registration_fee"])
+        except Exception:
+            pass
+        return 0.0
 
     @staticmethod
     async def get_default_registration_fee() -> float:

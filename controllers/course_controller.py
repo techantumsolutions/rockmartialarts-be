@@ -2,6 +2,7 @@ from fastapi import HTTPException, Depends
 from typing import Optional, Dict, Any, Set
 from datetime import datetime
 import logging
+import re
 
 from models.course_models import CourseCreate, CourseUpdate, Course
 from models.user_models import UserRole
@@ -197,6 +198,31 @@ DAY_INDEX_PY = {
 }
 
 
+def _format_time_with_am_pm(t_str: Any) -> str:
+    """Format time string like '06:00', '6:00', '18:30' into '06:00 AM', '06:30 PM'."""
+    if not t_str:
+        return ""
+    s = str(t_str).strip()
+    if not s:
+        return ""
+    m_12h = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm)$", s, re.I)
+    if m_12h:
+        h = int(m_12h.group(1))
+        m = m_12h.group(2) or "00"
+        p = m_12h.group(3).upper()
+        return f"{h:02d}:{m} {p}"
+    m_24h = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
+    if m_24h:
+        h = int(m_24h.group(1))
+        m = m_24h.group(2)
+        p = "AM" if h < 12 else "PM"
+        h12 = h % 12
+        if h12 == 0:
+            h12 = 12
+        return f"{h12:02d}:{m} {p}"
+    return s
+
+
 def _format_weekday_ranges(days: Any) -> str:
     """Format days into Mon - Sat or Mon, Wed, Fri with breakers."""
     if not days or not isinstance(days, (list, tuple)):
@@ -218,13 +244,13 @@ def _format_weekday_ranges(days: Any) -> str:
             run_end = idx
         else:
             parts.append(
-                f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+                f"{SHORT_DAYS_PY[run_start]}–{SHORT_DAYS_PY[run_end]}"
                 if run_start != run_end
                 else SHORT_DAYS_PY[run_start]
             )
             run_start = run_end = idx
     parts.append(
-        f"{SHORT_DAYS_PY[run_start]} - {SHORT_DAYS_PY[run_end]}"
+        f"{SHORT_DAYS_PY[run_start]}–{SHORT_DAYS_PY[run_end]}"
         if run_start != run_end
         else SHORT_DAYS_PY[run_start]
     )
@@ -239,8 +265,8 @@ def format_branch_timings_display(timings_list: Any) -> str:
     for t in timings_list[:24]:
         if not isinstance(t, dict):
             continue
-        open_t = _timing_field(t, "open", "open_time", "start", "from")
-        close_t = _timing_field(t, "close", "close_time", "end", "to")
+        open_t = _format_time_with_am_pm(_timing_field(t, "open", "open_time", "start", "from"))
+        close_t = _format_time_with_am_pm(_timing_field(t, "close", "close_time", "end", "to"))
         day = _timing_field(t, "day", "weekday")
         day_short = (
             SHORT_DAYS_PY[DAY_INDEX_PY[day.strip().lower()]]
@@ -248,7 +274,7 @@ def format_branch_timings_display(timings_list: Any) -> str:
             else day
         )
         if open_t and close_t:
-            parts.append(f"{day_short}: {open_t} to {close_t}" if day_short else f"{open_t} to {close_t}")
+            parts.append(f"{day_short}: {open_t}–{close_t}" if day_short else f"{open_t}–{close_t}")
         elif open_t or close_t:
             slot = f"{open_t} – {close_t}".strip(" –") if (open_t and close_t) else (open_t or close_t)
             parts.append(f"{day_short}: {slot}" if day_short else slot)
@@ -283,9 +309,9 @@ def _format_course_batches_timings(course_id: str, schedule: Any) -> str:
             continue
         days = b.get("days") or []
         ds = _format_weekday_ranges(days) if days else ""
-        st = str(b.get("start_time") or "").strip()
-        en = str(b.get("end_time") or "").strip()
-        ts = f"{st} – {en}" if st and en else (st or en)
+        st = _format_time_with_am_pm(b.get("start_time"))
+        en = _format_time_with_am_pm(b.get("end_time"))
+        ts = f"{st}–{en}" if st and en else (st or en)
         if ds and ts:
             parts.append(f"{ds} · {ts}")
         elif ds:

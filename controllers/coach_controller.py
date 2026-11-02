@@ -961,9 +961,33 @@ class CoachController:
 
                 course_batches = batches_by_course.get(course["id"], [])
                 enhanced_course = serialize_doc(course)
+
+                # Derive assigned_date from earliest batch timestamp or course/coach creation
+                assigned_date_val = None
+                for b in course_batches:
+                    b_id = str(b.get("batch_id") or b.get("id") or "")
+                    if "batch-" in b_id:
+                        digits = b_id.split("batch-")[-1]
+                        if digits.isdigit() and len(digits) >= 10:
+                            try:
+                                ms = int(digits)
+                                if len(digits) == 10:
+                                    ms *= 1000
+                                assigned_date_val = datetime.fromtimestamp(ms / 1000.0).isoformat()
+                                break
+                            except Exception:
+                                pass
+                if not assigned_date_val:
+                    assigned_date_val = course.get("assigned_date") or course.get("created_at") or (coach.get("assignment_details") or {}).get("join_date") or coach.get("created_at")
+
                 enhanced_course.update({
                     "name": course.get("title", course.get("name", "Unknown Course")),
+                    "course_name": course.get("title", course.get("name", "Unknown Course")),
+                    "course_code": course.get("code", ""),
                     "enrolled_students": enrollment_count,
+                    "active_students": enrollment_count,
+                    "total_students": enrollment_count,
+                    "assigned_date": str(assigned_date_val) if assigned_date_val else None,
                     "difficulty_level": course.get("difficulty_level", "Beginner"),
                     "batches": course_batches,
                     "branch_assignments": [

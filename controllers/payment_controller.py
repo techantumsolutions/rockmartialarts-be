@@ -20,6 +20,8 @@ from models.payment_models import (
     RegistrationPaymentResponse,
     AdminPaymentRecoveryBody,
     FamilyStudentEnrollment,
+    PhysicalHandCash,
+    CreateRegistrationOrderBody,
 )
 from models.enrollment_models import Enrollment as EnrollmentModel, PaymentStatus as EnrollmentPaymentStatus
 from models.student_models import (
@@ -1941,10 +1943,19 @@ class PaymentController:
             category = await db.categories.find_one({"id": course.get("category_id")}) if course.get("category_id") else None
 
             # Get duration details for pricing multiplier
-            # Try to find by ID first, then by code
+            # Try to find by ID first, then by code, then by name or month count fallback
             duration_info = await db.durations.find_one({"id": duration})
             if not duration_info:
                 duration_info = await db.durations.find_one({"code": duration})
+            if not duration_info and duration:
+                import re
+                duration_info = await db.durations.find_one({"name": {"$regex": f"^{re.escape(str(duration))}$", "$options": "i"}})
+            if not duration_info and duration:
+                import re
+                m = re.search(r'(\d+)', str(duration))
+                if m:
+                    months_val = int(m.group(1))
+                    duration_info = await db.durations.find_one({"duration_months": months_val, "is_active": True})
 
             pricing_multiplier = 1.0
             months_int = 0
@@ -2498,7 +2509,54 @@ class PaymentController:
         )
 
     @staticmethod
-    async def process_registration_payment(payment_data: RegistrationPaymentCreate):
+    async def create_registration_order(order_data: CreateRegistrationOrderBody) -> Dict[str, Any]:
+        """Create a Razorpay order for student registration checkout."""
+        db = get_db()
+        payment_info = await PaymentController.get_course_payment_info(
+            order_data.course_id,
+            order_data.branch_id,
+            order_data.duration,
+            batch_ref=order_data.batch_ref,
+        )
+        total_amount_inr = payment_info.pricing.total_amount
+        amount_paise = int(round(total_amount_inr * 100))
+
+        client = get_razorpay_client()
+        key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+
+        receipt = f"reg_{secrets.token_hex(6)}"
+        order_payload = {
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": receipt,
+            "notes": {
+                "type": "student_registration",
+                "course_id": order_data.course_id,
+                "branch_id": order_data.branch_id,
+                "student_name": order_data.student_name or "",
+                "student_email": order_data.student_email or "",
+            },
+        }
+
+        try:
+            rp_order = client.order.create(data=order_payload)
+            return {
+                "order_id": rp_order["id"],
+                "amount_paise": amount_paise,
+                "amount_inr": total_amount_inr,
+                "currency": "INR",
+                "key_id": key_id,
+                "course_name": payment_info.course_name,
+                "branch_name": payment_info.branch_name,
+                "admission_fee": payment_info.pricing.admission_fee,
+                "course_fee": payment_info.pricing.course_fee,
+            }
+        except Exception as e:
+            logger.exception("Failed to create Razorpay registration order: %s", e)
+            raise HTTPException(status_code=400, detail=f"Failed to create Razorpay order: {str(e)}")
+
+    @staticmethod
+    async def process_registration_payment(payment_data: RegistrationPaymentCreate, current_user: Optional[dict] = None):
         """Process payment for student registration"""
         if payment_data.family_students:
             try:
@@ -2513,13 +2571,74 @@ class PaymentController:
 
         db = get_db()
 
+        # Extract creator information (Super Admin / Branch Manager / Coach)
+        creator_dict = None
+        if current_user and current_user.get("id"):
+            creator_dict = {
+                "user_id": str(current_user["id"]),
+                "name": current_user.get("full_name") or current_user.get("name") or current_user.get("first_name", ""),
+                "role": str(current_user.get("role", "")),
+                "email": current_user.get("email", ""),
+            }
+        elif payment_data.created_by:
+            creator_dict = dict(payment_data.created_by)
+
+        active_batch_ref = payment_data.batch_ref or payment_data.batch_id
+
+        # Enforce role-based restrictions
+        if creator_dict and creator_dict.get("role"):
+            role_lower = str(creator_dict.get("role", "")).lower()
+            creator_id = str(creator_dict.get("user_id", ""))
+
+            if role_lower == "coach":
+                coach = await db.coaches.find_one({"$or": [{"id": creator_id}, {"user_id": creator_id}]})
+                if not coach:
+                    raise HTTPException(status_code=403, detail="Coach profile not found")
+                # 1. Branch check
+                coach_branch = coach.get("branch_id")
+                if coach_branch and str(coach_branch) != str(payment_data.branch_id):
+                    raise HTTPException(status_code=403, detail="Coach can only assign students to their allocated branch")
+                # 2. Course check
+                assigned_courses = coach.get("assignment_details", {}).get("courses", [])
+                instructor_courses = await db.courses.distinct("id", {"instructor_id": coach["id"]})
+                allowed_courses = set(assigned_courses + instructor_courses)
+                if allowed_courses and payment_data.course_id not in allowed_courses:
+                    raise HTTPException(status_code=403, detail="Coach can only assign students to courses allocated to them")
+                # 3. Batch check (if batch_ref provided)
+                if active_batch_ref:
+                    branch_doc = await db.branches.find_one({"id": payment_data.branch_id})
+                    if branch_doc:
+                        course_schedules = branch_doc.get("assignments", {}).get("course_schedule", [])
+                        found_batch = None
+                        for cs in course_schedules:
+                            if cs.get("course_id") == payment_data.course_id:
+                                for b in cs.get("batches", []):
+                                    if b.get("batch_id") == active_batch_ref or b.get("id") == active_batch_ref or b.get("batch_name") == active_batch_ref:
+                                        found_batch = b
+                                        break
+                        if found_batch:
+                            batch_coach = str(found_batch.get("coach_id") or "")
+                            if batch_coach and batch_coach not in (str(coach["id"]), str(coach.get("user_id", ""))):
+                                raise HTTPException(status_code=403, detail="Coach can only assign students to batches allocated to them")
+
+            elif role_lower in ("branch_manager", "branch_admin"):
+                from utils.student_status_service import get_managed_branch_ids_for_user
+                allowed_branches = await get_managed_branch_ids_for_user(db, {"id": creator_id, "role": role_lower})
+                if allowed_branches and payment_data.branch_id not in allowed_branches:
+                    raise HTTPException(status_code=403, detail="Branch manager can only assign students to their allocated branch")
+                branch_doc = await db.branches.find_one({"id": payment_data.branch_id})
+                if branch_doc:
+                    branch_courses = branch_doc.get("assignments", {}).get("courses", [])
+                    if branch_courses and payment_data.course_id not in branch_courses:
+                        raise HTTPException(status_code=400, detail="Course is not offered at this branch")
+
         try:
             # Get payment information
             payment_info = await PaymentController.get_course_payment_info(
                 payment_data.course_id,
                 payment_data.branch_id,
                 payment_data.duration,
-                batch_ref=payment_data.batch_ref,
+                batch_ref=active_batch_ref,
             )
 
             # Generate transaction ID
@@ -2527,6 +2646,12 @@ class PaymentController:
 
             # Create user first
             from controllers.auth_controller import AuthController
+
+            # Clean empty date_of_birth or biometric_id
+            if payment_data.student_data.get("date_of_birth") == "":
+                payment_data.student_data["date_of_birth"] = None
+            if payment_data.student_data.get("biometric_id") == "":
+                payment_data.student_data["biometric_id"] = None
 
             # Generate password if not provided
             if not payment_data.student_data.get("password"):
@@ -2597,15 +2722,24 @@ class PaymentController:
                         },
                     )
 
+            # Update user with creator audit if present
+            if creator_dict:
+                await db.users.update_one({"id": student_id}, {"$set": {"created_by": creator_dict}})
+
             # Create payment record with proper enrollment linking
+            raw_pm = payment_data.payment_method.value if hasattr(payment_data.payment_method, "value") else str(payment_data.payment_method)
+            is_hand_cash = raw_pm in ("cash", "physical_cash", "hand_cash")
+            normalized_pm = "physical_cash" if is_hand_cash else ("razorpay" if raw_pm in ("razorpay", "online") else raw_pm)
+
+            effective_pm = PaymentMethod.PHYSICAL_CASH if is_hand_cash else (PaymentMethod.RAZORPAY if normalized_pm == "razorpay" else PaymentMethod.CASH)
             payment = Payment(
                 student_id=student_id,
                 enrollment_id=enrollment_id,  # Link payment to enrollment
                 amount=payment_info.pricing.total_amount,
                 payment_type=PaymentType.REGISTRATION_FEE,
-                payment_method=payment_data.payment_method,
-                payment_status=PaymentStatus.PAID,  # Simulate successful payment
-                transaction_id=transaction_id,
+                payment_method=effective_pm,
+                payment_status=PaymentStatus.PAID,  # Successful payment
+                transaction_id=payment_data.razorpay_payment_id or transaction_id,
                 payment_date=datetime.utcnow(),
                 due_date=datetime.utcnow() + timedelta(days=7),
                 registration_data=payment_data.student_data,
@@ -2621,14 +2755,29 @@ class PaymentController:
                 }
             )
 
-            await db.payments.insert_one(payment.dict())
+            payment_dict = payment.dict()
+            payment_dict["payment_status"] = "paid"
+            payment_dict["payment_type"] = "registration_fee"
+            payment_dict["payment_method"] = normalized_pm
+            if is_hand_cash:
+                payment_dict["gateway_payment_label"] = "Physical Hand Cash"
+                payment_dict["notes"] = payment_data.cash_notes or "Physical Hand Cash"
+            if payment_data.razorpay_payment_id:
+                payment_dict["razorpay_payment_id"] = payment_data.razorpay_payment_id
+            if payment_data.razorpay_order_id:
+                payment_dict["razorpay_order_id"] = payment_data.razorpay_order_id
+            if creator_dict:
+                payment_dict["created_by"] = creator_dict
+
+            await db.payments.insert_one(payment_dict)
 
             # M07-S01: automatic invoice (non-blocking)
+            inv_doc = None
             try:
                 from utils.invoice_service import safe_generate_invoice_for_payment
 
-                await safe_generate_invoice_for_payment(
-                    payment_doc=payment.dict(),
+                inv_doc = await safe_generate_invoice_for_payment(
+                    payment_doc=payment_dict,
                     source_hint="registration",
                 )
             except Exception:
@@ -2636,9 +2785,81 @@ class PaymentController:
             try:
                 from utils.billing_cycle_service import safe_upsert_billing_cycles_for_payment
 
-                await safe_upsert_billing_cycles_for_payment(payment_doc=payment.dict())
+                await safe_upsert_billing_cycles_for_payment(payment_doc=payment_dict)
             except Exception:
                 pass
+
+            inv_id = None
+            inv_number = None
+            if isinstance(inv_doc, dict):
+                inv_id = inv_doc.get("id")
+                inv_number = inv_doc.get("invoice_number")
+            if not inv_id:
+                existing_inv = await db.invoices.find_one({"payment_id": payment.id})
+                if existing_inv:
+                    inv_id = existing_inv.get("id")
+                    inv_number = existing_inv.get("invoice_number")
+
+            if inv_id and inv_number:
+                await db.payments.update_one(
+                    {"id": payment.id},
+                    {"$set": {"invoice_id": inv_id, "invoice_number": inv_number}}
+                )
+
+            # Record in dedicated physical_hand_cash collection if paid via hand cash
+            if is_hand_cash:
+
+                hand_cash_record = {
+                    "id": str(uuid.uuid4()),
+                    "student_id": student_id,
+                    "student_name": payment_data.student_data.get("full_name") or f"{payment_data.student_data.get('first_name', '')} {payment_data.student_data.get('last_name', '')}".strip(),
+                    "student_email": payment_data.student_data.get("email"),
+                    "student_phone": payment_data.student_data.get("phone"),
+                    "branch_id": payment_data.branch_id,
+                    "branch_name": payment_info.branch_name,
+                    "course_id": payment_data.course_id,
+                    "course_name": payment_info.course_name,
+                    "batch_ref": payment_data.batch_ref,
+                    "amount": payment_info.pricing.total_amount,
+                    "currency": "INR",
+                    "payment_type": "registration_fee",
+                    "payment_method": "physical_cash",
+                    "collected_by": creator_dict,
+                    "payment_date": datetime.utcnow(),
+                    "payment_status": "collected",
+                    "payment_id": payment.id,
+                    "transaction_id": transaction_id,
+                    "invoice_id": inv_id,
+                    "invoice_number": inv_number,
+                    "notes": payment_data.cash_notes or "Physical hand cash registration",
+                    "created_at": datetime.utcnow(),
+                }
+                await db.physical_hand_cash.insert_one(hand_cash_record)
+
+            # Send 24-hour student password setup link via Resend
+            try:
+                from utils.auth import create_access_token
+                setup_token = create_access_token(
+                    data={
+                        "sub": student_id,
+                        "email": payment_data.student_data.get("email", ""),
+                        "scope": "password_reset",
+                        "action": "student_setup",
+                    },
+                    expires_delta=timedelta(hours=24),
+                )
+                frontend_url = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_SITE_URL") or "http://localhost:3000").rstrip("/")
+                setup_link = f"{frontend_url}/reset-password?token={setup_token}&setup=true"
+                from utils.resend_email import send_student_welcome_setup_email
+                await send_student_welcome_setup_email(
+                    to_email=payment_data.student_data.get("email", ""),
+                    student_name=payment_data.student_data.get("full_name") or payment_data.student_data.get("first_name", ""),
+                    setup_link=setup_link,
+                    creator_name=creator_dict.get("name") if creator_dict else None,
+                    creator_role=creator_dict.get("role") if creator_dict else None,
+                )
+            except Exception as mail_err:
+                logger.warning("Could not dispatch student setup email: %s", mail_err)
 
             # Create notification for superadmin
             student_data = {
@@ -2663,7 +2884,9 @@ class PaymentController:
                 transaction_id=transaction_id,
                 amount=payment_info.pricing.total_amount,
                 status=PaymentStatus.PAID,
-                message="Registration and payment completed successfully"
+                message="Registration and payment completed successfully",
+                invoice_id=inv_id,
+                invoice_number=inv_number,
             )
 
         except Exception as e:
@@ -3151,6 +3374,29 @@ class PaymentController:
             (this_month_collection / period_payment_count) if period_payment_count else 0
         )
 
+        # Physical hand cash revenue stats
+        hc_match_filter = {"payment_method": {"$in": ["physical_cash", "cash", "hand_cash"]}}
+        hc_total_pipeline = (
+            _branch_resolution_pipeline({**total_match, **hc_match_filter})
+            + PaymentController._pipeline_add_net_revenue_inr()
+            + [{"$group": {"_id": None, "total": {"$sum": "$_net_inr"}, "cnt": {"$sum": 1}}}]
+        )
+        hc_total_res = await db.payments.aggregate(hc_total_pipeline).to_list(1)
+        hand_cash_revenue = float(hc_total_res[0]["total"]) if hc_total_res else 0.0
+        hand_cash_count = int(hc_total_res[0]["cnt"]) if hc_total_res else 0
+
+        active_period_match = period_match if (period_start and period_end) else month_match
+        hc_period_pipeline = (
+            _branch_resolution_pipeline({**active_period_match, **hc_match_filter})
+            + PaymentController._pipeline_add_net_revenue_inr()
+            + [{"$group": {"_id": None, "total": {"$sum": "$_net_inr"}}}]
+        )
+        hc_period_res = await db.payments.aggregate(hc_period_pipeline).to_list(1)
+        period_hand_cash_revenue = float(hc_period_res[0]["total"]) if hc_period_res else 0.0
+
+        online_revenue = max(0.0, total_collected - hand_cash_revenue)
+        period_online_revenue = max(0.0, this_month_collection - period_hand_cash_revenue)
+
         last_sync = await get_last_reconciled_at(db)
         return {
             "total_collected": total_collected,
@@ -3162,6 +3408,11 @@ class PaymentController:
             "monthly_revenue": this_month_collection,
             "payment_count": period_payment_count,
             "average_payment": avg_pay,
+            "hand_cash_revenue": hand_cash_revenue,
+            "period_hand_cash_revenue": period_hand_cash_revenue,
+            "online_revenue": online_revenue,
+            "period_online_revenue": period_online_revenue,
+            "hand_cash_count": hand_cash_count,
             "last_razorpay_sync_at": last_sync.isoformat() if last_sync else None,
         }
 

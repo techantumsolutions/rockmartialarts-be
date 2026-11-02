@@ -18,6 +18,7 @@ from fastapi import HTTPException, UploadFile
 from models.coach_models import (
     CoachApprovalStatus,
     CoachRegistrationCreate,
+    CreateCoachRegistrationOrderBody,
 )
 from utils.auth import hash_password
 from utils.database import get_db
@@ -121,6 +122,72 @@ async def get_coach_registration_options() -> Dict[str, Any]:
     }
 
 
+async def create_coach_registration_order(
+    body: Optional[CreateCoachRegistrationOrderBody] = None,
+) -> Dict[str, Any]:
+    """Create Razorpay order for coach registration checkout."""
+    import os
+    from utils.razorpay_client import get_razorpay_client
+
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    settings_doc = await db.system_settings.find_one({}) or {}
+    fee = 0.0
+    if settings_doc.get("coach_registration_fee") is not None:
+        try:
+            fee = float(settings_doc["coach_registration_fee"])
+        except (TypeError, ValueError):
+            fee = 0.0
+
+    if fee <= 0:
+        return {
+            "fee_required": False,
+            "amount_inr": 0.0,
+            "amount_paise": 0,
+            "currency": "INR",
+        }
+
+    client = get_razorpay_client()
+    key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+    amount_paise = int(round(fee * 100))
+    receipt = f"coach_reg_{secrets.token_hex(6)}"
+
+    name = (body.name if body else "") or ""
+    email = (body.email if body else "") or ""
+    phone = (body.phone if body else "") or ""
+
+    order_payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": {
+            "type": "coach_registration",
+            "name": name,
+            "email": email,
+            "phone": phone,
+        },
+    }
+
+    try:
+        rp_order = client.order.create(data=order_payload)
+        return {
+            "fee_required": True,
+            "order_id": rp_order["id"],
+            "amount_paise": amount_paise,
+            "amount_inr": fee,
+            "currency": "INR",
+            "key_id": key_id,
+        }
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order for coach registration: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create payment order: {str(e)}",
+        )
+
+
 async def register_coach(
     body: CoachRegistrationCreate,
     *,
@@ -164,6 +231,33 @@ async def register_coach(
         raise HTTPException(
             status_code=400, detail="Coach with this email or phone already exists"
         )
+
+    coach_fee = 0.0
+    settings_doc = await db.system_settings.find_one({}) or {}
+    if settings_doc.get("coach_registration_fee") is not None:
+        try:
+            coach_fee = float(settings_doc["coach_registration_fee"])
+        except (TypeError, ValueError):
+            coach_fee = 0.0
+
+    if coach_fee > 0:
+        if not body.razorpay_order_id or not body.razorpay_payment_id or not body.razorpay_signature:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment of registration fee (₹{coach_fee:.2f}) is required to submit registration.",
+            )
+        from utils.razorpay_client import verify_razorpay_signature
+        valid_sig = verify_razorpay_signature(
+            body.razorpay_order_id,
+            body.razorpay_payment_id,
+            body.razorpay_signature,
+        )
+        if not valid_sig:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment signature verification failed. Please contact support.",
+            )
+
 
     user_id = (body.user_id or "").strip() or None
     if current_user and current_user.get("id") and not user_id:
@@ -227,6 +321,15 @@ async def register_coach(
         "homepage_rating": None,
         "display_order": None,
         # M14 registration gate
+        "registration_payment": {
+            "fee_amount": coach_fee,
+            "currency": "INR",
+            "razorpay_order_id": body.razorpay_order_id if coach_fee > 0 else None,
+            "razorpay_payment_id": body.razorpay_payment_id if coach_fee > 0 else None,
+            "razorpay_signature": body.razorpay_signature if coach_fee > 0 else None,
+            "payment_status": "paid" if coach_fee > 0 else "free",
+            "paid_at": now if coach_fee > 0 else None,
+        },
         "approval_status": CoachApprovalStatus.PENDING.value,
         "is_active": False,
         "user_id": user_id,
@@ -235,6 +338,29 @@ async def register_coach(
         "updated_at": now,
     }
     await db[COL].insert_one(doc)
+    if coach_fee > 0:
+        try:
+            payment_doc = {
+                "id": str(uuid.uuid4()),
+                "payment_type": "coach_registration",
+                "coach_id": coach_id,
+                "student_id": None,
+                "amount": coach_fee,
+                "currency": "INR",
+                "payment_method": "razorpay",
+                "payment_status": "paid",
+                "transaction_id": body.razorpay_payment_id,
+                "razorpay_order_id": body.razorpay_order_id,
+                "razorpay_payment_id": body.razorpay_payment_id,
+                "payment_date": now,
+                "notes": f"Coach registration fee for {full_name}",
+                "created_at": now,
+                "updated_at": now,
+            }
+            await db.payments.insert_one(payment_doc)
+        except Exception:
+            logger.exception("Failed inserting coach registration payment record for %s", coach_id)
+
 
     # M14-S02: seed approval history (best-effort)
     try:
@@ -249,6 +375,15 @@ async def register_coach(
     return {
         "message": "Coach registration submitted. Awaiting admin approval.",
         "coach_id": coach_id,
+        "registration_payment": {
+            "fee_amount": coach_fee,
+            "currency": "INR",
+            "razorpay_order_id": body.razorpay_order_id if coach_fee > 0 else None,
+            "razorpay_payment_id": body.razorpay_payment_id if coach_fee > 0 else None,
+            "razorpay_signature": body.razorpay_signature if coach_fee > 0 else None,
+            "payment_status": "paid" if coach_fee > 0 else "free",
+            "paid_at": now if coach_fee > 0 else None,
+        },
         "approval_status": CoachApprovalStatus.PENDING.value,
         "coach": safe,
     }

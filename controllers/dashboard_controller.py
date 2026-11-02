@@ -320,6 +320,28 @@ class DashboardController:
             stats["total_revenue"] = total_revenue
             stats["monthly_revenue"] = monthly_revenue
             stats["pending_payments"] = pending_payments
+
+            # Hand cash vs online revenue stats
+            hc_filter = {"payment_method": {"$in": ["physical_cash", "cash", "hand_cash"]}}
+            try:
+                if current_user["role"] == "branch_manager" and 'all_student_ids' in locals() and all_student_ids:
+                    hc_pipeline = [
+                        {"$match": {"student_id": {"$in": all_student_ids}, "payment_status": {"$in": ["completed", "paid"]}, **hc_filter}},
+                        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}}
+                    ]
+                else:
+                    hc_pipeline = [
+                        {"$match": {"payment_status": {"$in": ["completed", "paid"]}, **filter_query, **hc_filter}},
+                        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "cnt": {"$sum": 1}}}
+                    ]
+                hc_res = await db.payments.aggregate(hc_pipeline).to_list(length=1)
+                stats["hand_cash_revenue"] = hc_res[0]["total"] if hc_res else 0
+                stats["hand_cash_count"] = hc_res[0]["cnt"] if hc_res else 0
+                stats["online_revenue"] = max(0, total_revenue - stats["hand_cash_revenue"])
+            except Exception:
+                stats["hand_cash_revenue"] = 0
+                stats["hand_cash_count"] = 0
+                stats["online_revenue"] = total_revenue
             
             # Today's attendance - Handle branch manager filtering correctly
             today = datetime.utcnow().date()

@@ -132,3 +132,30 @@ def require_role(allowed_roles: List[UserRole]):
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return current_user
     return role_checker
+
+
+security_optional = HTTPBearer(auto_error=False)
+
+async def get_optional_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional)):
+    if not credentials or not credentials.credentials:
+        return None
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get('sub')
+        if not user_id:
+            return None
+        user = await db.users.find_one({'id': user_id})
+        if user:
+            return serialize_doc(user)
+        coach = await db.coaches.find_one({'': [{'id': user_id}, {'user_id': user_id}]})
+        if coach:
+            return serialize_doc(coach)
+        bm = await db.branch_managers.find_one({'': [{'id': user_id}, {'user_id': user_id}]})
+        if bm:
+            return serialize_doc(bm)
+        return None
+    except Exception:
+        return None

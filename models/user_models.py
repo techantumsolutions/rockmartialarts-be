@@ -39,6 +39,7 @@ class BaseUser(BaseModel):
     gender: Optional[str] = None
     # Branch assignment for staff members (coaches, admins)
     branch_id: Optional[str] = None
+    created_by: Optional[dict] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -56,6 +57,7 @@ class UserCreate(BaseModel):
     address: Optional[dict] = None  # { line1, area, city, state, pincode, country }
     emergency_contact: Optional[dict] = None  # { name, phone, relationship }
     branch_id: Optional[str] = None
+    created_by: Optional[dict] = None
     course: Optional[CourseInfo] = None
     branch: Optional[BranchInfo] = None
     # Master Data key student_levels (e.g. Beginner, Intermediate, Expert)
@@ -63,6 +65,7 @@ class UserCreate(BaseModel):
     # Family account: relation of this student to the account holder
     relationship: Optional[str] = None
     account_id: Optional[str] = None
+    created_by: Optional[dict] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -91,6 +94,7 @@ class UserUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     branch_id: Optional[str] = None
+    created_by: Optional[dict] = None
     biometric_id: Optional[str] = None
     essl_user_id: Optional[str] = None
     is_active: Optional[bool] = None
