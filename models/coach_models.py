@@ -59,6 +59,12 @@ class CoachApprovalStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class CreateCoachRegistrationOrderBody(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+
 class CoachRegistrationCreate(BaseModel):
     """
     M14-S01 public self-registration payload.
@@ -96,6 +102,9 @@ class CoachRegistrationCreate(BaseModel):
     user_id: Optional[str] = Field(
         default=None, max_length=64, description="Optional linked user id"
     )
+    razorpay_payment_id: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class CoachCreate(BaseModel):

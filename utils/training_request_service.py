@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from models.training_request_models import (
     ALLOWED_STATUS_TRANSITIONS,
+    CoachTrainingRequestResponse,
     CollegeTrainingRequestCreate,
     CorporateTrainingRequestCreate,
     DEFAULT_RESIDENTIAL_PACKAGES,
@@ -878,6 +879,10 @@ async def assign_coach(
                 "assigned_at": now,
                 "assigned_by": actor.get("id"),
                 "status": new_status,
+                "coach_assignment_status": "pending",
+                "coach_rejection_reason": None,
+                "coach_response_note": None,
+                "coach_responded_at": None,
                 "updated_at": now,
             }
         },
@@ -912,3 +917,158 @@ async def list_status_history(
         .to_list(length=200)
     )
     return {"history": serialize_doc(rows), "total": len(rows)}
+
+
+async def list_coach_training_requests(
+    *,
+    current_user: dict,
+    status_filter: Optional[str] = None,
+    type_filter: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """M12 List training requests assigned to the logged-in coach with tab counts."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    coach_id = current_user.get("id")
+    if not coach_id:
+        raise HTTPException(status_code=401, detail="Coach authentication required")
+
+    base_query: Dict[str, Any] = {"assigned_coach_id": coach_id}
+
+    # Tab counts (all, pending, accepted, rejected)
+    all_cnt = await db[COL].count_documents(base_query)
+    pending_cnt = await db[COL].count_documents({
+        **base_query,
+        "coach_assignment_status": {"$in": ["pending", None, ""]}
+    })
+    accepted_cnt = await db[COL].count_documents({
+        **base_query,
+        "coach_assignment_status": "accepted"
+    })
+    rejected_cnt = await db[COL].count_documents({
+        **base_query,
+        "coach_assignment_status": "rejected"
+    })
+
+    counts = {
+        "all": all_cnt,
+        "pending": pending_cnt,
+        "accepted": accepted_cnt,
+        "rejected": rejected_cnt,
+    }
+
+    query = dict(base_query)
+
+    # Apply status filter
+    if status_filter:
+        sf = status_filter.lower().strip()
+        if sf == "pending":
+            query["coach_assignment_status"] = {"$in": ["pending", None, ""]}
+        elif sf in {"accepted", "rejected"}:
+            query["coach_assignment_status"] = sf
+
+    # Apply type filter
+    if type_filter and type_filter != "all":
+        query["type"] = type_filter.lower().strip()
+
+    # Search filter
+    if search and search.strip():
+        s = search.strip()
+        pattern = re.compile(re.escape(s), re.IGNORECASE)
+        query["$or"] = [
+            {"contact_name": pattern},
+            {"contact_phone": pattern},
+            {"contact_email": pattern},
+            {"id": pattern},
+            {"notes": pattern},
+            {"details.city": pattern},
+            {"details.address_line1": pattern},
+            {"details.school_name": pattern},
+            {"details.college_name": pattern},
+            {"details.organization_name": pattern},
+            {"details.training_type": pattern},
+            {"details.training_goals": pattern},
+        ]
+
+    total = await db[COL].count_documents(query)
+    cursor = (
+        db[COL]
+        .find(query)
+        .sort([("assigned_at", -1), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    rows = await cursor.to_list(length=limit)
+    return {
+        "requests": serialize_doc(rows),
+        "total": total,
+        "counts": counts,
+    }
+
+
+async def coach_respond_to_request(
+    request_id: str,
+    body: CoachTrainingRequestResponse,
+    *,
+    current_user: dict,
+) -> Dict[str, Any]:
+    """Coach accepts or rejects an assigned training request. Rejection requires a reason."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    doc = await db[COL].find_one({"id": request_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Training request not found")
+
+    coach_id = current_user.get("id")
+    if str(doc.get("assigned_coach_id") or "") != str(coach_id):
+        raise HTTPException(status_code=403, detail="You are not assigned to this training request")
+
+    if body.action == "reject" and not (body.reason or "").strip():
+        raise HTTPException(status_code=400, detail="Rejection reason is required")
+
+    now = datetime.utcnow()
+    actor = _actor(current_user)
+    prev_status = str(doc.get("status") or "")
+
+    if body.action == "accept":
+        update_data = {
+            "coach_assignment_status": "accepted",
+            "coach_responded_at": now,
+            "coach_response_note": body.note,
+            "updated_at": now,
+        }
+        action_name = "coach_accepted"
+        note_text = body.note or f"Coach {actor.get('name')} accepted the training request"
+    else:
+        reason_text = body.reason.strip()
+        update_data = {
+            "coach_assignment_status": "rejected",
+            "coach_rejection_reason": reason_text,
+            "coach_response_note": body.note,
+            "coach_responded_at": now,
+            "updated_at": now,
+        }
+        action_name = "coach_rejected"
+        note_text = f"Coach {actor.get('name')} rejected: {reason_text}" + (f" (Note: {body.note})" if body.note else "")
+
+    await db[COL].update_one({"id": request_id}, {"$set": update_data})
+    await _append_history(
+        db,
+        request_id=request_id,
+        from_status=prev_status,
+        to_status=prev_status,
+        actor=actor,
+        note=note_text,
+        action=action_name,
+    )
+    updated = await db[COL].find_one({"id": request_id})
+    return {
+        "message": f"Training request {body.action}ed successfully",
+        "request": serialize_doc(updated),
+    }

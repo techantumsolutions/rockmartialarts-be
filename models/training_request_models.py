@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Literal
 import uuid
 
 from pydantic import BaseModel, Field
@@ -395,6 +395,12 @@ class TrainingRequestStatusUpdate(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2000)
 
 
+class CoachTrainingRequestResponse(BaseModel):
+    action: Literal["accept", "reject"]
+    reason: Optional[str] = Field(default=None, max_length=2000)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
 class TrainingRequestCoachAssign(BaseModel):
     coach_id: str = Field(..., min_length=1, max_length=64)
     note: Optional[str] = Field(default=None, max_length=2000)
@@ -416,6 +422,10 @@ class TrainingRequestDocument(BaseModel):
     assigned_coach_name: Optional[str] = None
     assigned_at: Optional[datetime] = None
     assigned_by: Optional[str] = None
+    coach_assignment_status: Optional[str] = None
+    coach_rejection_reason: Optional[str] = None
+    coach_response_note: Optional[str] = None
+    coach_responded_at: Optional[datetime] = None
     created_by: Optional[str] = None  # logged-in student id if any
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

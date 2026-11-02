@@ -130,6 +130,7 @@ class SystemSettingsFlatCreate(BaseModel):
 
     # Pricing (public registration / admission default when branch has no override)
     registration_fee: float = Field(default=500.0, ge=0, description="Default registration fee (INR)")
+    coach_registration_fee: float = Field(default=0.0, ge=0, description="Coach registration fee (INR)")
 
     @validator('smtp_port')
     def validate_smtp_port(cls, v):
@@ -187,6 +188,7 @@ class SystemSettingsFlatResponse(BaseModel):
     backup_retention: str
 
     registration_fee: float
+    coach_registration_fee: float = 0.0
 
     created_at: datetime
     updated_at: datetime
