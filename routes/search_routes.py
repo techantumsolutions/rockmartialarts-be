@@ -43,12 +43,22 @@ async def search_students(
     end_date: Optional[str] = Query(None, description="Filter by end date (ISO format)"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(50, ge=1, le=1000, description="Maximum results"),
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+    current_user: dict = Depends(
+        require_role_unified(
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.COACH,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
+        )
+    ),
 ):
     """
     Comprehensive student search with enrollment data
     Supports filtering by branch, course, activity status, and date range
-    Accessible by Super Admin, Coach Admin, Coach, and Branch Manager with role-based filtering
+    Accessible by Super Admin, Coach Admin, Coach, Branch Manager, and Partner SA
     """
     return await SearchController.search_students(q, branch_id, course_id, is_active, start_date, end_date, skip, limit, current_user)
 
