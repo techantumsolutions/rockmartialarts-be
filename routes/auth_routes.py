@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, Request, status, File, UploadFile
 from controllers.auth_controller import AuthController
 from models.user_models import (
@@ -24,6 +25,11 @@ class CheckUserRequest(BaseModel):
 class CheckPhoneRequest(BaseModel):
     phone: str
 
+
+class CheckStudentAvailabilityRequest(BaseModel):
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
 @router.post("/check-user")
 async def check_user(check_user_data: CheckUserRequest):
     """Check if a user exists with the given email address"""
@@ -34,6 +40,12 @@ async def check_user(check_user_data: CheckUserRequest):
 async def check_phone(body: CheckPhoneRequest):
     """Check if a user exists with this phone (registration / public)."""
     return await AuthController.check_phone_exists(body.phone)
+
+
+@router.post("/check-student-availability")
+async def check_student_availability(body: CheckStudentAvailabilityRequest):
+    """Pre-payment validation: verify if email or phone is already registered for a student/user."""
+    return await AuthController.check_student_availability(body.email, body.phone)
 
 @router.post("/register")
 async def register_user(user_data: UserCreate, request: Request):

@@ -830,6 +830,7 @@ class AuthController:
         digits = "".join(c for c in raw if c.isdigit())
         if len(digits) < 10:
             return {"exists": False}
+
         norm = digits[-10:]
         variants = [
             norm,
@@ -858,9 +859,87 @@ class AuthController:
                 if len(stored) >= 10 and stored[-10:] == norm:
                     return {"exists": True}
             return {"exists": False}
+
         except Exception as e:
             logger.error("Error checking phone existence: %s", e)
             return {"exists": False}
+
+
+    @staticmethod
+    async def check_student_availability(email: Optional[str] = None, phone: Optional[str] = None):
+        """
+        Verify if email or phone is already registered in db.users or accounts before initiating payments.
+        """
+        db = get_db()
+        email_clean = (email or "").strip().lower()
+        phone_clean = (phone or "").strip()
+
+        email_exists = False
+        phone_exists = False
+
+        if email_clean:
+            try:
+                acc = await get_account_by_email(db, email_clean)
+                if acc:
+                    email_exists = True
+                else:
+                    user = await db.users.find_one({"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}})
+                    if user:
+                        email_exists = True
+            except Exception as e:
+                logger.error("Error checking email availability: %s", e)
+
+        if phone_clean:
+            digits = "".join(c for c in phone_clean if c.isdigit())
+            if len(digits) >= 10:
+                norm = digits[-10:]
+                variants = [
+                    norm,
+                    f"91{norm}",
+                    f"+91{norm}",
+                    f"+91-{norm}",
+                    f"0{norm}",
+                    f"91-{norm}",
+                    f"+91 {norm}",
+                ]
+                try:
+                    acc = await get_account_by_phone(db, norm)
+                    if acc:
+                        phone_exists = True
+                    else:
+                        u = await db.users.find_one({"phone": {"$in": variants}})
+                        if not u:
+                            u = await db.users.find_one({"phone": {"$regex": re.escape(norm) + r"\s*$"}})
+                        if not u:
+                            async for doc in db.users.find(
+                                {"phone": {"$exists": True, "$nin": [None, ""]}},
+                                {"phone": 1},
+                            ).limit(5000):
+                                stored = "".join(c for c in str(doc.get("phone", "")) if c.isdigit())
+                                if len(stored) >= 10 and stored[-10:] == norm:
+                                    u = doc
+                                    break
+                        if u:
+                            phone_exists = True
+                except Exception as e:
+                    logger.error("Error checking phone availability: %s", e)
+
+        available = not (email_exists or phone_exists)
+        message = None
+        if email_exists and phone_exists:
+            message = "Both this email address and mobile number are already registered."
+        elif email_exists:
+            message = "This email address is already registered."
+        elif phone_exists:
+            message = "This mobile number is already registered."
+
+        return {
+            "available": available,
+            "email_exists": email_exists,
+            "phone_exists": phone_exists,
+            "message": message,
+        }
+
 
     @staticmethod
     async def get_student_profile(current_user: dict):
