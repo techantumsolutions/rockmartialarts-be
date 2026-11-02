@@ -125,7 +125,7 @@ async def get_optional_current_user_or_superadmin(
     except (jwt.PyJWTError, HTTPException):
         return None
 
-def require_role_unified(allowed_roles: List[UserRole]):
+def require_role_unified(allowed_roles: List[UserRole], allow_inactive_coach: bool = False):
     """
     Role checker that works with regular users, superadmins, coaches, and branch managers
     """
@@ -133,7 +133,10 @@ def require_role_unified(allowed_roles: List[UserRole]):
         # Only block when explicitly inactive. Missing/None must not become 400
         # (superadmin docs often omit is_active; .get("is_active", True) still returns None if key exists).
         if current_user.get("is_active") is False:
-            raise HTTPException(status_code=400, detail="Inactive user")
+            is_coach = current_user.get("role") == "coach"
+            is_expired_sub = current_user.get("subscription_status") == "expired"
+            if not (is_coach and (allow_inactive_coach or is_expired_sub)):
+                raise HTTPException(status_code=400, detail="Inactive user")
 
         user_role = current_user["role"]
 

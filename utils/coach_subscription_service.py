@@ -239,7 +239,12 @@ def _compute_period(
 
 
 async def refresh_subscription_status(db, sub: dict) -> dict:
-    """Move active→grace→expired and optionally deactivate coach."""
+    """Move active→grace→expired and optionally update coach subscription status."""
+    coach = await db[COL_COACHES].find_one({"id": sub.get("coach_id")})
+    # If coach was created by admin (or not self-registered), they are exempt from subscription degradation
+    if coach and coach.get("registration_source") != "self":
+        return sub
+
     status = str(sub.get("status") or "")
     if status in {
         CoachSubscriptionStatus.PENDING_PAYMENT.value,
@@ -277,18 +282,27 @@ async def refresh_subscription_status(db, sub: dict) -> dict:
         sub = {**sub, "status": new_status, "updated_at": now}
 
         if new_status == CoachSubscriptionStatus.EXPIRED.value:
-            plan = sub.get("plan_snapshot") or {}
-            if plan.get("deactivate_on_grace_expiry", True):
-                await db[COL_COACHES].update_one(
-                    {"id": sub["coach_id"]},
-                    {
-                        "$set": {
-                            "is_active": False,
-                            "subscription_status": "expired",
-                            "updated_at": now,
-                        }
-                    },
-                )
+            # For self-registered coaches, mark subscription_status as expired.
+            # Do NOT set is_active = False so they can still log in and access checkout/renewal.
+            await db[COL_COACHES].update_one(
+                {"id": sub["coach_id"]},
+                {
+                    "$set": {
+                        "subscription_status": "expired",
+                        "updated_at": now,
+                    }
+                },
+            )
+        elif new_status == CoachSubscriptionStatus.GRACE.value:
+            await db[COL_COACHES].update_one(
+                {"id": sub["coach_id"]},
+                {
+                    "$set": {
+                        "subscription_status": CoachSubscriptionStatus.GRACE.value,
+                        "updated_at": now,
+                    }
+                },
+            )
     return sub
 
 
@@ -324,12 +338,27 @@ async def get_current_subscription(
                 CoachSubscriptionStatus.PENDING_PAYMENT.value,
             }:
                 break
+    reg_source = coach.get("registration_source") or "admin"
+    has_active_sub = (
+        reg_source != "self"
+        or (
+            current is not None
+            and current.get("status")
+            in {
+                CoachSubscriptionStatus.ACTIVE.value,
+                CoachSubscriptionStatus.GRACE.value,
+            }
+        )
+    )
 
     return {
         "coach_id": coach_id,
         "subscription": serialize_doc(current) if current else None,
         "coach_is_active": bool(coach.get("is_active", True)),
         "approval_status": coach.get("approval_status") or "approved",
+        "registration_source": reg_source,
+        "requires_subscription": (reg_source == "self"),
+        "has_active_subscription": has_active_sub,
     }
 
 
@@ -835,55 +864,12 @@ async def refresh_all_statuses(*, current_user: dict) -> Dict[str, Any]:
     return {"message": "Statuses refreshed", "checked": len(rows), "changed": changed}
 
 
+
+async def is_coach_allowed_to_login(coach: dict) -> bool:
+    """Return True: all coaches can log in regardless of subscription status."""
+    return True
+
+
 async def assert_coach_subscription_allows_login(coach: dict) -> None:
-    """
-    Soft gate used by coach login.
-    Only blocks coaches who have a subscription record that is expired past grace.
-    Coaches with no subscription history remain unaffected (legacy / admin-created).
-    """
-    db = get_db()
-    if db is None:
-        return
-    coach_id = coach.get("id")
-    if not coach_id:
-        return
-
-    # Fast path from denormalized coach fields
-    sub_status = str(coach.get("subscription_status") or "").lower()
-    if sub_status == CoachSubscriptionStatus.EXPIRED.value:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Your coach subscription has expired. "
-                "Please renew to continue accessing the coach dashboard."
-            ),
-        )
-
-    latest = (
-        await db[COL_SUBS]
-        .find(
-            {
-                "coach_id": coach_id,
-                "status": {
-                    "$in": [
-                        CoachSubscriptionStatus.ACTIVE.value,
-                        CoachSubscriptionStatus.GRACE.value,
-                        CoachSubscriptionStatus.EXPIRED.value,
-                    ]
-                },
-            }
-        )
-        .sort([("created_at", -1)])
-        .to_list(length=1)
-    )
-    if not latest:
-        return
-    refreshed = await refresh_subscription_status(db, latest[0])
-    if refreshed.get("status") == CoachSubscriptionStatus.EXPIRED.value:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Your coach subscription has expired. "
-                "Please renew to continue accessing the coach dashboard."
-            ),
-        )
+    """Soft gate placeholder. Coaches are allowed to log in regardless of subscription status."""
+    return

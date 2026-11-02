@@ -1360,20 +1360,14 @@ class CoachController:
                     detail="Your coach registration was rejected. Please contact administrator.",
                 )
 
-            # M14-S04: expired subscription past grace (only if they have a sub record)
-            try:
-                from utils.coach_subscription_service import (
-                    assert_coach_subscription_allows_login,
-                )
+            # Check coach registration source & subscription status
+            reg_source = coach.get("registration_source") or "admin"
+            sub_status = coach.get("subscription_status") or "none"
 
-                await assert_coach_subscription_allows_login(coach)
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-            
             # Check if coach is active
-            if not coach.get("is_active", True):
+            # Admin-created coaches: blocked if deactivated by an administrator
+            # Self-registered coaches: allowed to log in even if inactive/expired so they can renew via dashboard
+            if not coach.get("is_active", True) and reg_source != "self":
                 raise HTTPException(
                     status_code=401,
                     detail="Account is inactive. Please contact administrator."
@@ -1386,7 +1380,8 @@ class CoachController:
                     "sub": coach["id"],
                     "email": coach["contact_info"]["email"],
                     "role": "coach",
-                    "coach_id": coach["id"]
+                    "coach_id": coach["id"],
+                    "registration_source": reg_source,
                 }
             )
             
@@ -1394,6 +1389,8 @@ class CoachController:
             coach_data = serialize_doc(coach)
             if "password_hash" in coach_data:
                 del coach_data["password_hash"]
+            coach_data["registration_source"] = reg_source
+            coach_data["subscription_status"] = sub_status
             
             return {
                 "access_token": access_token,
