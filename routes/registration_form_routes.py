@@ -24,12 +24,17 @@ async def list_registration_forms_for_student(
     return {"registration_forms": items}
 
 
+_REG_FORM_MANAGE_ROLES = [
+    UserRole.SUPER_ADMIN,
+    UserRole.PARTNER_SUPER_ADMIN,
+    UserRole.BRANCH_MANAGER,
+]
+
+
 @router.get("/manage")
 async def list_registration_forms_manage(
     status: Optional[str] = Query(None, description="active or inactive"),
-    current_user: dict = Depends(
-        require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])
-    ),
+    current_user: dict = Depends(require_role_unified(_REG_FORM_MANAGE_ROLES)),
 ):
     items = await ctrl.list_manage(current_user, status=status)
     return {"registration_forms": items}
@@ -38,9 +43,7 @@ async def list_registration_forms_manage(
 @router.post("")
 async def create_registration_form(
     data: RegistrationFormCreate,
-    current_user: dict = Depends(
-        require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])
-    ),
+    current_user: dict = Depends(require_role_unified(_REG_FORM_MANAGE_ROLES)),
 ):
     return await ctrl.create(data, current_user)
 
@@ -49,9 +52,7 @@ async def create_registration_form(
 async def update_registration_form(
     form_id: str,
     data: RegistrationFormUpdate,
-    current_user: dict = Depends(
-        require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])
-    ),
+    current_user: dict = Depends(require_role_unified(_REG_FORM_MANAGE_ROLES)),
 ):
     return await ctrl.update(form_id, data, current_user)
 
@@ -59,8 +60,6 @@ async def update_registration_form(
 @router.delete("/{form_id}")
 async def delete_registration_form(
     form_id: str,
-    current_user: dict = Depends(
-        require_role_unified([UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER])
-    ),
+    current_user: dict = Depends(require_role_unified(_REG_FORM_MANAGE_ROLES)),
 ):
     return await ctrl.delete_form(form_id, current_user)
