@@ -3357,14 +3357,28 @@ class PaymentController:
         # - falls back to created_at when payment_date is missing/null
         period_start, period_end = PaymentController._payment_stats_parse_period(start_date, end_date)
 
+        from utils.partner_tenant import merge_and_clause
+
         all_time_match_base: dict = {**base_filter}
         period_match_base: dict = {**base_filter}
         if period_start and period_end:
-            period_match_base["$or"] = [
-                {"payment_date": {"$gte": period_start, "$lte": period_end}},
-                {"payment_date": {"$exists": False}, "created_at": {"$gte": period_start, "$lte": period_end}},
-                {"payment_date": None, "created_at": {"$gte": period_start, "$lte": period_end}},
-            ]
+            # AND date window — never overwrite tenant $or on base_filter (Partner SA leak fix)
+            period_match_base = merge_and_clause(
+                period_match_base,
+                {
+                    "$or": [
+                        {"payment_date": {"$gte": period_start, "$lte": period_end}},
+                        {
+                            "payment_date": {"$exists": False},
+                            "created_at": {"$gte": period_start, "$lte": period_end},
+                        },
+                        {
+                            "payment_date": None,
+                            "created_at": {"$gte": period_start, "$lte": period_end},
+                        },
+                    ]
+                },
+            )
 
         # If branch_filter is requested, resolve branch via payment.branch_details OR enrollment.branch_id
         # using an aggregation pipeline (keeps totals consistent with branch-wise revenue endpoint).
@@ -3441,14 +3455,22 @@ class PaymentController:
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
             month_match = PaymentController._merge_collected_revenue_filters(
-                {
-                    **base_filter,
-                    "$or": [
-                        {"payment_date": {"$gte": current_month_start}},
-                        {"payment_date": {"$exists": False}, "created_at": {"$gte": current_month_start}},
-                        {"payment_date": None, "created_at": {"$gte": current_month_start}},
-                    ],
-                }
+                merge_and_clause(
+                    base_filter,
+                    {
+                        "$or": [
+                            {"payment_date": {"$gte": current_month_start}},
+                            {
+                                "payment_date": {"$exists": False},
+                                "created_at": {"$gte": current_month_start},
+                            },
+                            {
+                                "payment_date": None,
+                                "created_at": {"$gte": current_month_start},
+                            },
+                        ]
+                    },
+                )
             )
             this_month_pipeline = (
                 _branch_resolution_pipeline(month_match)
@@ -3570,13 +3592,27 @@ class PaymentController:
             if branch_id and branch_id not in ("all", "unassigned"):
                 await assert_partner_owns_branch(db, current_user, branch_id)
 
+            from utils.partner_tenant import merge_and_clause as _merge_and_clause
+
             ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
             if ps and pe:
-                filter_query["$or"] = [
-                    {"payment_date": {"$gte": ps, "$lte": pe}},
-                    {"payment_date": {"$exists": False}, "created_at": {"$gte": ps, "$lte": pe}},
-                    {"payment_date": None, "created_at": {"$gte": ps, "$lte": pe}},
-                ]
+                # AND date window — do not clobber partner tenant $or on filter_query
+                filter_query = _merge_and_clause(
+                    filter_query,
+                    {
+                        "$or": [
+                            {"payment_date": {"$gte": ps, "$lte": pe}},
+                            {
+                                "payment_date": {"$exists": False},
+                                "created_at": {"$gte": ps, "$lte": pe},
+                            },
+                            {
+                                "payment_date": None,
+                                "created_at": {"$gte": ps, "$lte": pe},
+                            },
+                        ]
+                    },
+                )
 
             # Optional branch filter (requested by UI).
             # For real branch IDs we must resolve from payment.branch_details OR enrollment.branch_id
