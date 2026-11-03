@@ -1437,6 +1437,25 @@ class PaymentController:
             return out
 
         is_renewal_enr = bool(enrollment.get("is_renewal") or enrollment.get("renewed_from_enrollment_id"))
+        from utils.partner_tenant import (
+            apply_partner_org_stamp,
+            resolve_partner_org_id_for_branch,
+        )
+
+        enr_branch_id = enrollment.get("branch_id")
+        partner_org_for_payment = await resolve_partner_org_id_for_branch(db, enr_branch_id)
+        branch_details = {}
+        if enr_branch_id:
+            branch_details["branch_id"] = enr_branch_id
+        if data.branch_name:
+            branch_details["branch_name"] = data.branch_name
+        elif enr_branch_id:
+            br = await db.branches.find_one({"id": enr_branch_id}, {"name": 1, "branch.name": 1})
+            if br:
+                branch_details["branch_name"] = (
+                    (br.get("branch") or {}).get("name") if isinstance(br.get("branch"), dict) else None
+                ) or br.get("name")
+
         payment_doc = {
             "id": str(uuid.uuid4()),
             "user_id": student_id,  # alias for reporting compatibility
@@ -1456,11 +1475,22 @@ class PaymentController:
             "payment_date": now,
             "due_date": due_date,
             "notes": f"Razorpay order: {data.razorpay_order_id or 'N/A'}",
-            "course_details": {"course_name": course_name} if course_name else None,
-            "branch_details": {"branch_name": data.branch_name} if data.branch_name else None,
+            "course_details": {
+                "course_id": enrollment.get("course_id"),
+                "course_name": course_name,
+            }
+            if (course_name or enrollment.get("course_id"))
+            else None,
+            "branch_details": branch_details or None,
             "created_at": now,
             "updated_at": now,
         }
+        apply_partner_org_stamp(payment_doc, partner_org_for_payment)
+        if partner_org_for_payment and not enrollment.get("partner_org_id"):
+            await db.enrollments.update_one(
+                {"id": enrollment["id"]},
+                {"$set": {"partner_org_id": partner_org_for_payment}},
+            )
         if is_renewal_enr:
             payment_doc["is_renewal"] = True
             payment_doc["renewed_from_enrollment_id"] = enrollment.get("renewed_from_enrollment_id")
@@ -1712,6 +1742,11 @@ class PaymentController:
             {"student_id": student_id, "enrollment_id": body.enrollment_id, "razorpay_order_id": order["id"]}
         )
         if not existing_order_payment:
+            from utils.partner_tenant import (
+                apply_partner_org_stamp,
+                resolve_partner_org_id_for_branch,
+            )
+
             pending_doc = {
                 "id": str(uuid.uuid4()),
                 "user_id": student_id,
@@ -1729,9 +1764,21 @@ class PaymentController:
                 "payment_date": None,
                 "due_date": now + timedelta(days=30),
                 "notes": f"Razorpay order created: {order['id']}",
+                "course_details": {
+                    "course_id": enrollment.get("course_id"),
+                },
+                "branch_details": {
+                    "branch_id": enrollment.get("branch_id"),
+                }
+                if enrollment.get("branch_id")
+                else None,
                 "created_at": now,
                 "updated_at": now,
             }
+            apply_partner_org_stamp(
+                pending_doc,
+                await resolve_partner_org_id_for_branch(db, enrollment.get("branch_id")),
+            )
             await db.payments.insert_one(pending_doc)
 
         key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
@@ -2370,7 +2417,20 @@ class PaymentController:
                 "branch_name": payment_info.branch_name,
             },
         )
-        await db.payments.insert_one(payment.dict())
+        from utils.partner_tenant import (
+            apply_partner_org_stamp,
+            resolve_partner_org_id_for_branch,
+        )
+
+        family_payment_doc = payment.dict()
+        partner_org_for_payment = await resolve_partner_org_id_for_branch(db, branch_id)
+        apply_partner_org_stamp(family_payment_doc, partner_org_for_payment)
+        if partner_org_for_payment:
+            await db.enrollments.update_one(
+                {"id": enrollment_id},
+                {"$set": {"partner_org_id": partner_org_for_payment}},
+            )
+        await db.payments.insert_one(family_payment_doc)
         return enrollment_id, payment_info.pricing.total_amount, payment_info, payment.id
 
     @staticmethod
@@ -2788,6 +2848,21 @@ class PaymentController:
             if creator_dict:
                 payment_dict["created_by"] = creator_dict
 
+            from utils.partner_tenant import (
+                apply_partner_org_stamp,
+                resolve_partner_org_id_for_branch,
+            )
+
+            partner_org_for_payment = await resolve_partner_org_id_for_branch(
+                db, payment_data.branch_id
+            )
+            apply_partner_org_stamp(payment_dict, partner_org_for_payment)
+            if partner_org_for_payment:
+                await db.enrollments.update_one(
+                    {"id": enrollment_id},
+                    {"$set": {"partner_org_id": partner_org_for_payment}},
+                )
+
             await db.payments.insert_one(payment_dict)
 
             # M07-S01: automatic invoice (non-blocking)
@@ -3186,6 +3261,8 @@ class PaymentController:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         branch_id: Optional[str] = None,
+        partner_org_id: Optional[str] = None,
+        partner_scope: Optional[str] = None,
     ):
         """Get payment statistics for dashboard"""
         db = get_db()
@@ -3256,10 +3333,16 @@ class PaymentController:
                 # Filter by branch_id in branch_details
                 base_filter["branch_details.branch_id"] = assigned_branch
 
-        # Partner white-label: only this org's payments (Rock SA unchanged)
-        from utils.partner_tenant import apply_tenant_filter, partner_org_id_of
+        # Partner SA: own org. Rock SA: optional partner_org_id / partner_scope.
+        from utils.partner_tenant import apply_payment_list_partner_scope, partner_org_id_of
 
-        base_filter = apply_tenant_filter(base_filter, current_user)
+        base_filter = await apply_payment_list_partner_scope(
+            db,
+            base_filter,
+            current_user,
+            partner_org_id=partner_org_id,
+            partner_scope=partner_scope,
+        )
 
         # Optional superadmin branch filter (do not affect other roles)
         branch_filter = None
@@ -3455,6 +3538,8 @@ class PaymentController:
         end_date: Optional[str] = None,
         search: Optional[str] = None,
         branch_id: Optional[str] = None,
+        partner_org_id: Optional[str] = None,
+        partner_scope: Optional[str] = None,
     ):
         """Get payments with filtering and student information"""
         try:
@@ -3470,20 +3555,18 @@ class PaymentController:
             if payment_type and payment_type != "all":
                 filter_query["payment_type"] = payment_type
 
-            from utils.partner_tenant import apply_tenant_filter, partner_branch_ids, assert_partner_owns_branch
+            from utils.partner_tenant import (
+                apply_payment_list_partner_scope,
+                assert_partner_owns_branch,
+            )
 
-            filter_query = apply_tenant_filter(filter_query, current_user)
-            p_bids = await partner_branch_ids(db, current_user)
-            if p_bids is not None and "partner_org_id" not in filter_query:
-                # Fallback for older payment rows without partner_org_id stamp
-                filter_query.setdefault("$and", []).append(
-                    {
-                        "$or": [
-                            {"branch_details.branch_id": {"$in": p_bids}},
-                            {"branch_id": {"$in": p_bids}},
-                        ]
-                    }
-                )
+            filter_query = await apply_payment_list_partner_scope(
+                db,
+                filter_query,
+                current_user,
+                partner_org_id=partner_org_id,
+                partner_scope=partner_scope,
+            )
             if branch_id and branch_id not in ("all", "unassigned"):
                 await assert_partner_owns_branch(db, current_user, branch_id)
 
@@ -3656,6 +3739,7 @@ class PaymentController:
                         "course_name": {"$ifNull": ["$course_details.course_name", None]},
                         "branch_name": {"$ifNull": ["$branch_details.branch_name", None]},
                         "branch_id": {"$ifNull": ["$branch_details.branch_id", "$resolved_branch_id"]},
+                        "partner_org_id": 1,
                         "created_at": 1,
                     }
                 },
@@ -3666,6 +3750,7 @@ class PaymentController:
 
             # Convert MongoDB documents to JSON-serializable format
             serialized_payments = []
+            partner_name_cache: Dict[str, str] = {}
             for payment in payments:
                 # Convert ObjectId and datetime objects to strings
                 serialized_payment = {}
@@ -3676,6 +3761,18 @@ class PaymentController:
                         serialized_payment[key] = value.isoformat()
                     else:
                         serialized_payment[key] = value
+                org_id = str(serialized_payment.get("partner_org_id") or "").strip()
+                if org_id:
+                    if org_id not in partner_name_cache:
+                        org_doc = await db.partner_organizations.find_one(
+                            {"id": org_id}, {"name": 1}
+                        )
+                        partner_name_cache[org_id] = (
+                            (org_doc or {}).get("name") or org_id
+                        )
+                    serialized_payment["partner_org_name"] = partner_name_cache[org_id]
+                else:
+                    serialized_payment["partner_org_name"] = None
                 serialized_payments.append(serialized_payment)
 
             # Strong deduplication by logical payment attempt key.

@@ -119,6 +119,80 @@ async def partner_branch_ids(db, user: Optional[dict]):
     return await db.branches.distinct("id", {"partner_org_id": org_id})
 
 
+async def resolve_partner_org_id_for_branch(db, branch_id: Optional[str]) -> Optional[str]:
+    """Return partner_org_id stamped on a branch, or None for Rock-owned / unknown branches."""
+    bid = str(branch_id or "").strip()
+    if not bid:
+        return None
+    branch = await db.branches.find_one({"id": bid}, {"partner_org_id": 1})
+    if not branch:
+        return None
+    org = str(branch.get("partner_org_id") or "").strip()
+    return org or None
+
+
+def apply_partner_org_stamp(doc: Dict[str, Any], partner_org_id: Optional[str]) -> Dict[str, Any]:
+    """Stamp partner_org_id onto a payment/enrollment doc when known."""
+    org = str(partner_org_id or "").strip()
+    if org:
+        doc["partner_org_id"] = org
+    return doc
+
+
+def partner_payments_match_clause(org_id: str, branch_ids: Optional[list] = None) -> Dict[str, Any]:
+    """Match payments for one partner: stamped rows OR branch ownership (legacy rows)."""
+    org = str(org_id or "").strip()
+    clauses: list = [{"partner_org_id": org}]
+    bids = [str(b) for b in (branch_ids or []) if b]
+    if bids:
+        clauses.append({"branch_details.branch_id": {"$in": bids}})
+        clauses.append({"branch_id": {"$in": bids}})
+    return {"$or": clauses}
+
+
+async def apply_payment_list_partner_scope(
+    db,
+    query: Dict[str, Any],
+    user: Optional[dict],
+    *,
+    partner_org_id: Optional[str] = None,
+    partner_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Scope payment list/stats.
+
+    - Partner SA: always restricted to their org (stamp or owned branches).
+    - Rock SA: optional partner_org_id / partner_scope=rock|partners|all.
+    """
+    q = dict(query or {})
+
+    # Partner SA — always tenant-scoped (stamp OR legacy branch ownership).
+    caller_org = partner_org_id_of(user)
+    if caller_org:
+        p_bids = await partner_branch_ids(db, user) or []
+        return merge_and_clause(q, partner_payments_match_clause(caller_org, list(p_bids)))
+
+    # Rock / other roles — optional partner filters for Rock SA UIs.
+    scope = str(partner_scope or "").strip().lower()
+    filter_org = str(partner_org_id or "").strip()
+
+    if filter_org:
+        bids = await db.branches.distinct("id", {"partner_org_id": filter_org})
+        return merge_and_clause(q, partner_payments_match_clause(filter_org, list(bids or [])))
+
+    if scope in ("rock", "rock_only", "non_partner"):
+        return merge_and_clause(q, rock_owned_clause())
+
+    if scope in ("partners", "partner", "partner_only"):
+        return merge_and_clause(
+            q,
+            {
+                "partner_org_id": {"$exists": True, "$nin": [None, ""]},
+            },
+        )
+
+    return q
+
+
 async def assert_partner_owns_branch(db, user: Optional[dict], branch_id: Optional[str]) -> None:
     """Partners may only attach resources to their own branches."""
     org_id = partner_org_id_of(user)
