@@ -2,11 +2,14 @@
 M16-S01 Online Learning course catalogue service.
 
 Collection: learning_courses — additive; does not touch physical `courses`.
+Collection: online_learning_enrollments — records public student enrollments & payments.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
+import secrets
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -15,7 +18,9 @@ from fastapi import HTTPException
 
 from models.learning_course_models import (
     LEARNING_COURSE_STATUSES,
+    CreateLearningEnrollmentOrderBody,
     LearningCourseCreate,
+    LearningCourseEnrollmentCreate,
     LearningCourseStatus,
     LearningCourseUpdate,
     slugify,
@@ -26,6 +31,7 @@ from utils.helpers import serialize_doc
 logger = logging.getLogger(__name__)
 
 COL = "learning_courses"
+COL_ENROLLMENTS = "online_learning_enrollments"
 
 
 def _public(doc: Optional[dict]) -> Dict[str, Any]:
@@ -38,6 +44,7 @@ def _catalogue_view(doc: dict) -> Dict[str, Any]:
         "id": doc.get("id"),
         "title": doc.get("title"),
         "slug": doc.get("slug"),
+        "price": float(doc.get("price") or 0.0),
         "short_description": doc.get("short_description"),
         "description": doc.get("description"),
         "thumbnail_url": doc.get("thumbnail_url"),
@@ -64,6 +71,9 @@ async def ensure_learning_course_indexes(db=None) -> None:
         await database[COL].create_index("slug", unique=True)
         await database[COL].create_index([("status", 1), ("sort_order", 1)])
         await database[COL].create_index([("created_at", -1)])
+        await database[COL_ENROLLMENTS].create_index("id", unique=True)
+        await database[COL_ENROLLMENTS].create_index([("course_id", 1), ("created_at", -1)])
+        await database[COL_ENROLLMENTS].create_index([("email", 1)])
     except Exception:
         logger.exception("Failed ensuring learning course indexes")
 
@@ -94,10 +104,12 @@ async def create_learning_course(
     now = datetime.utcnow()
     status = body.status.value if isinstance(body.status, LearningCourseStatus) else str(body.status)
     slug = await _unique_slug(db, body.slug or body.title)
+    price = float(body.price or 0.0) if body.price is not None else 0.0
     doc = {
         "id": str(uuid.uuid4()),
         "title": body.title.strip(),
         "slug": slug,
+        "price": price,
         "short_description": body.short_description,
         "description": body.description,
         "thumbnail_url": body.thumbnail_url,
@@ -140,6 +152,9 @@ async def update_learning_course(
         patch["title"] = data["title"]
     if "slug" in data and data["slug"] is not None:
         patch["slug"] = await _unique_slug(db, data["slug"], exclude_id=course_id)
+    if "price" in data and data["price"] is not None:
+        patch["price"] = float(data["price"])
+
     for key in (
         "short_description",
         "description",
@@ -331,3 +346,227 @@ async def get_learning_catalogue_detail(slug_or_id: str) -> Dict[str, Any]:
     except Exception:
         course["curriculum"] = []
     return {"course": course}
+
+
+# ==============================================================================
+# Online Course Enrollments (Razorpay payment & admin listing)
+# ==============================================================================
+
+
+async def create_learning_enrollment_order(
+    body: CreateLearningEnrollmentOrderBody,
+    *,
+    current_user: Optional[dict] = None,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    course = await db[COL].find_one({"$or": [{"id": body.course_id}, {"slug": body.course_id}]})
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    price = float(course.get("price") or 0.0)
+    if price <= 0:
+        return {
+            "fee_required": False,
+            "amount_inr": 0.0,
+            "amount_paise": 0,
+            "currency": "INR",
+        }
+
+    from utils.razorpay_client import get_razorpay_client
+
+    client = get_razorpay_client()
+    key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+    amount_paise = int(round(price * 100))
+    receipt = f"ole_{course['id'][:4]}_{secrets.token_hex(4)}"
+
+    name = (body.student_name or "")[:80]
+    email = (body.email or "")[:80]
+    phone = (body.phone or "")[:32]
+
+    order_payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": {
+            "type": "online_learning_enrollment",
+            "course_id": course["id"],
+            "course_title": str(course.get("title", ""))[:80],
+            "student_name": name,
+            "email": email,
+            "phone": phone,
+        },
+    }
+
+    try:
+        rp_order = client.order.create(data=order_payload)
+        return {
+            "fee_required": True,
+            "order_id": rp_order["id"],
+            "amount_paise": amount_paise,
+            "amount_inr": price,
+            "currency": "INR",
+            "key_id": key_id,
+        }
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order for online learning enrollment: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create payment order: {str(e)}",
+        )
+
+
+async def create_learning_enrollment(
+    body: LearningCourseEnrollmentCreate,
+    *,
+    current_user: Optional[dict] = None,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    await ensure_learning_course_indexes(db)
+
+    course = await db[COL].find_one({"$or": [{"id": body.course_id}, {"slug": body.course_id}]})
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    course_id = course["id"]
+    course_title = course.get("title", "Online Course")
+    course_slug = course.get("slug", "")
+    price = float(course.get("price") or 0.0)
+
+    now = datetime.utcnow()
+    payment_status = "not_required"
+    amount_paise = 0
+    paid_at = None
+
+    if price > 0:
+        if not body.razorpay_order_id or not body.razorpay_payment_id or not body.razorpay_signature:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment of course fee (₹{price:.2f}) is required to complete enrollment.",
+            )
+        from utils.razorpay_client import verify_razorpay_signature
+
+        valid_sig = verify_razorpay_signature(
+            body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
+        )
+        if not valid_sig:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Razorpay payment signature.",
+            )
+        payment_status = "paid"
+        amount_paise = int(round(price * 100))
+        paid_at = now
+    else:
+        payment_status = "free"
+
+    doc_id = str(uuid.uuid4())
+    enrollment_doc = {
+        "id": doc_id,
+        "course_id": course_id,
+        "course_title": course_title,
+        "course_slug": course_slug,
+        "student_name": body.student_name.strip(),
+        "email": body.email.strip().lower(),
+        "phone": body.phone.strip(),
+        "city": (body.city or "").strip() or None,
+        "state": (body.state or "").strip() or None,
+        "address": (body.address or "").strip() or None,
+        "pincode": (body.pincode or "").strip() or None,
+        "skill_level": (body.skill_level or "").strip() or None,
+        "learning_goals": (body.learning_goals or "").strip() or None,
+        "notes": (body.notes or "").strip() or None,
+        "amount_paid": price,
+        "amount_paise": amount_paise,
+        "currency": "INR",
+        "payment_status": payment_status,
+        "razorpay_order_id": body.razorpay_order_id,
+        "razorpay_payment_id": body.razorpay_payment_id,
+        "razorpay_signature": body.razorpay_signature,
+        "paid_at": paid_at,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    await db[COL_ENROLLMENTS].insert_one(enrollment_doc)
+    return {
+        "message": "Enrollment submitted successfully",
+        "enrollment": serialize_doc(enrollment_doc),
+    }
+
+
+async def list_learning_enrollments_admin(
+    *,
+    course_id: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    clauses: List[Dict[str, Any]] = []
+    if course_id and course_id != "all":
+        clauses.append({"course_id": course_id})
+
+    q_search = (search or "").strip()
+    if q_search:
+        rx = {"$regex": re.escape(q_search), "$options": "i"}
+        clauses.append(
+            {
+                "$or": [
+                    {"student_name": rx},
+                    {"email": rx},
+                    {"phone": rx},
+                    {"city": rx},
+                    {"course_title": rx},
+                    {"razorpay_payment_id": rx},
+                ]
+            }
+        )
+
+    q: Dict[str, Any] = {"$and": clauses} if clauses else {}
+    limit = min(max(limit, 1), 200)
+    skip = max(skip, 0)
+    total = await db[COL_ENROLLMENTS].count_documents(q)
+    rows = (
+        await db[COL_ENROLLMENTS]
+        .find(q)
+        .sort([("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+        .to_list(length=limit)
+    )
+    return {
+        "enrollments": [serialize_doc(r) for r in rows],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+    }
+
+
+async def get_learning_enrollment_stats() -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    total_count = await db[COL_ENROLLMENTS].count_documents({})
+    paid_count = await db[COL_ENROLLMENTS].count_documents({"payment_status": "paid"})
+
+    pipeline = [
+        {"$match": {"payment_status": "paid"}},
+        {"$group": {"_id": None, "total_revenue": {"$sum": "$amount_paid"}}},
+    ]
+    rev_res = await db[COL_ENROLLMENTS].aggregate(pipeline).to_list(length=1)
+    total_revenue = float(rev_res[0]["total_revenue"]) if rev_res else 0.0
+
+    return {
+        "total_enrollments": total_count,
+        "paid_enrollments": paid_count,
+        "total_revenue": total_revenue,
+    }
