@@ -2478,6 +2478,8 @@ class AttendanceController:
                 }
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"❌ Error fetching student attendance: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to get student attendance: {str(e)}")
