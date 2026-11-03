@@ -165,6 +165,10 @@ async def apply_payment_list_partner_scope(
     """
     q = dict(query or {})
 
+    # Partner SA without org id must never see Rock-wide revenue.
+    if is_partner_super_admin(user) and not partner_org_id_of(user):
+        return merge_and_clause(q, {"_id": {"$exists": False}})
+
     # Partner SA — always tenant-scoped (stamp OR legacy branch ownership).
     caller_org = partner_org_id_of(user)
     if caller_org:
