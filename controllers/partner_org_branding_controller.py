@@ -173,6 +173,8 @@ def _serialize_branding(doc: dict, org: Optional[dict] = None) -> Dict[str, Any]
         "content": doc.get("content") or {},
         "facilities": doc.get("facilities") or {},
         "social_links": doc.get("social_links") or {},
+        "contact_page": doc.get("contact_page") or {},
+        "footer": doc.get("footer") or {},
         "org_snapshot": {
             "id": doc.get("partner_org_id"),
             "name": (org or {}).get("name"),
@@ -254,6 +256,10 @@ class PartnerOrgBrandingController:
             patch["facilities"] = _dump(body.facilities)
         if body.social_links is not None:
             patch["social_links"] = _dump(body.social_links)
+        if body.contact_page is not None:
+            patch["contact_page"] = _dump(body.contact_page)
+        if body.footer is not None:
+            patch["footer"] = _dump(body.footer)
 
         if existing:
             await db[COL].update_one({"id": existing["id"]}, {"$set": patch})
@@ -344,7 +350,14 @@ class PartnerOrgBrandingController:
         content = (doc or {}).get("content") or {}
         facilities = (doc or {}).get("facilities") or {}
         social = (doc or {}).get("social_links") or {}
+        contact_page = (doc or {}).get("contact_page") or {}
+        footer = (doc or {}).get("footer") or {}
         sections = await _site_sections_for_org(db, org["id"])
+
+        # Contact page CMS overrides org snapshot when set.
+        contact_phone = contact_page.get("phone") or org.get("phone")
+        contact_email = contact_page.get("email") or org.get("email")
+        contact_address = contact_page.get("address") or org.get("address")
 
         return {
             "partner_org_id": org["id"],
@@ -366,9 +379,25 @@ class PartnerOrgBrandingController:
                 "why_choose_us_points": content.get("why_choose_us_points") or [],
             },
             "contact": {
-                "phone": org.get("phone"),
-                "email": org.get("email"),
-                "address": org.get("address"),
+                "phone": contact_phone,
+                "email": contact_email,
+                "address": contact_address,
+            },
+            "contact_page": {
+                "headline": contact_page.get("headline") or f"Contact {org.get('name') or 'us'}",
+                "intro": contact_page.get("intro"),
+                "address": contact_address,
+                "phone": contact_phone,
+                "email": contact_email,
+                "map_embed_url": contact_page.get("map_embed_url")
+                or facilities.get("map_embed_url"),
+            },
+            "footer": {
+                "logo_url": footer.get("logo_url") or media.get("logo_url"),
+                "logo_alt": footer.get("logo_alt") or media.get("logo_alt") or org.get("name"),
+                "description": footer.get("description")
+                or content.get("short_description")
+                or content.get("tagline"),
             },
             "facilities": facilities,
             "social_links": social,

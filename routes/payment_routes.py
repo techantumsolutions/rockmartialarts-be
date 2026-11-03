@@ -152,11 +152,23 @@ async def get_payment_stats(
     start_date: Optional[str] = Query(None, description="Period start YYYY-MM-DD (inclusive)"),
     end_date: Optional[str] = Query(None, description="Period end YYYY-MM-DD (inclusive)"),
     branch_id: Optional[str] = Query(None, description="Filter by branch id (super admin)"),
+    partner_org_id: Optional[str] = Query(
+        None, description="Rock SA: filter stats to one partner organization"
+    ),
+    partner_scope: Optional[str] = Query(
+        None,
+        description="Rock SA: all | rock | partners — separate Rock vs partner revenue",
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
 ):
     """Get payment statistics for dashboard - Students get their own payment stats"""
     return await PaymentController.get_payment_stats(
-        current_user, start_date=start_date, end_date=end_date, branch_id=branch_id
+        current_user,
+        start_date=start_date,
+        end_date=end_date,
+        branch_id=branch_id,
+        partner_org_id=partner_org_id,
+        partner_scope=partner_scope,
     )
 
 @router.get("")
@@ -166,6 +178,13 @@ async def get_payments(
     status: Optional[str] = Query(None),
     payment_type: Optional[str] = Query(None),
     branch_id: Optional[str] = Query(None, description="Filter by branch id"),
+    partner_org_id: Optional[str] = Query(
+        None, description="Rock SA: filter payments to one partner organization"
+    ),
+    partner_scope: Optional[str] = Query(
+        None,
+        description="Rock SA: all | rock | partners — separate Rock vs partner transactions",
+    ),
     search: Optional[str] = Query(None, description="Search by student name/email/phone or transaction id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -182,6 +201,8 @@ async def get_payments(
         end_date=end_date,
         search=search,
         branch_id=branch_id,
+        partner_org_id=partner_org_id,
+        partner_scope=partner_scope,
     )
 
 @router.put("/{payment_id}/cancel")

@@ -44,6 +44,25 @@ class PartnerOrgBrandingFacilities(BaseModel):
     map_embed_url: Optional[str] = None
 
 
+class PartnerOrgContactPage(BaseModel):
+    """CMS fields for the partner public Contact page."""
+
+    headline: Optional[str] = None
+    intro: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    map_embed_url: Optional[str] = None
+
+
+class PartnerOrgFooterCms(BaseModel):
+    """CMS fields for the partner-isolated public footer."""
+
+    logo_url: Optional[str] = None
+    logo_alt: Optional[str] = None
+    description: Optional[str] = None
+
+
 class PartnerOrgBranding(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     partner_org_id: str
@@ -51,6 +70,8 @@ class PartnerOrgBranding(BaseModel):
     content: PartnerOrgBrandingContent = Field(default_factory=PartnerOrgBrandingContent)
     facilities: PartnerOrgBrandingFacilities = Field(default_factory=PartnerOrgBrandingFacilities)
     social_links: PartnerOrgSocialLinks = Field(default_factory=PartnerOrgSocialLinks)
+    contact_page: PartnerOrgContactPage = Field(default_factory=PartnerOrgContactPage)
+    footer: PartnerOrgFooterCms = Field(default_factory=PartnerOrgFooterCms)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -60,6 +81,8 @@ class PartnerOrgBrandingUpsert(BaseModel):
     content: Optional[PartnerOrgBrandingContent] = None
     facilities: Optional[PartnerOrgBrandingFacilities] = None
     social_links: Optional[PartnerOrgSocialLinks] = None
+    contact_page: Optional[PartnerOrgContactPage] = None
+    footer: Optional[PartnerOrgFooterCms] = None
 
 
 def _dump(model: BaseModel) -> Dict[str, Any]:
@@ -77,6 +100,8 @@ def empty_branding_response(partner_org_id: str, org: Optional[dict] = None) -> 
         "content": _dump(PartnerOrgBrandingContent()),
         "facilities": _dump(PartnerOrgBrandingFacilities()),
         "social_links": _dump(PartnerOrgSocialLinks()),
+        "contact_page": _dump(PartnerOrgContactPage()),
+        "footer": _dump(PartnerOrgFooterCms()),
         "org_snapshot": {
             "id": partner_org_id,
             "name": (org or {}).get("name"),
