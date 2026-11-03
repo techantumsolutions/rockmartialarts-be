@@ -483,10 +483,15 @@ class UserController:
         stamp_tenant(user_dict, current_user)
 
         if user_data.role == UserRole.STUDENT and user_data.course and user_data.branch:
-            from utils.branch_courses import assert_course_available_at_branch
+            from utils.branch_courses import assert_course_available_at_branch, assert_batch_has_capacity
             await assert_course_available_at_branch(
                 db, user_data.branch.branch_id, user_data.course.course_id
             )
+            batch_ref = getattr(user_data.course, "batch_ref", None) or getattr(user_data.course, "batch_id", None)
+            if batch_ref:
+                await assert_batch_has_capacity(
+                    db, user_data.branch.branch_id, user_data.course.course_id, batch_ref
+                )
 
         await db.users.insert_one(user_dict)
 

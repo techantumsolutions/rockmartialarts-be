@@ -94,6 +94,11 @@ class AssignmentBatch(BaseModel):
         validation_alias=AliasChoices("enabled_per_duration", "enabledPerDuration"),
         description="Per-duration enable/disable map: { duration_id: true|false }.",
     )
+    max_students: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("max_students", "maxStudents", "capacity"),
+        description="Maximum student capacity for this batch.",
+    )
 
 
 class CourseAssignmentDetail(BaseModel):

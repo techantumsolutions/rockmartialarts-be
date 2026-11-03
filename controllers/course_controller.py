@@ -110,10 +110,11 @@ async def _user_display_names_by_ids(db, user_ids: Set[str]) -> Dict[str, str]:
     return out
 
 
-def _public_branch_batches_for_course(
+async def _public_branch_batches_for_course(
     branch: dict,
     course_id: str,
     coach_names: Optional[Dict[str, str]] = None,
+    db: Any = None,
 ) -> list:
     """Batches from branch course_schedule for registration (batch_ref matches payment-info)."""
     sched = (branch.get("assignments") or {}).get("course_schedule") or []
@@ -154,6 +155,32 @@ def _public_branch_batches_for_course(
             if coach_names and coach_id:
                 trainer_name = coach_names.get(coach_id)
             fpd = b.get("fee_per_duration") if isinstance(b.get("fee_per_duration"), dict) else None
+            max_stu = b.get("max_students")
+            if max_stu is not None:
+                try:
+                    max_stu = int(max_stu)
+                except (ValueError, TypeError):
+                    max_stu = None
+
+            branch_id_str = str(branch.get("id") or "").strip()
+            active_count = 0
+            if db is not None and branch_id_str and course_id and (bid or ref):
+                batch_filters = []
+                if bid:
+                    batch_filters.extend([{"batch_id": bid}, {"slot_id": bid}])
+                if ref and ref != bid:
+                    batch_filters.append({"batch_ref": ref})
+                q = {
+                    "branch_id": branch_id_str,
+                    "course_id": str(course_id),
+                    "is_active": True,
+                }
+                if batch_filters:
+                    q["$or"] = batch_filters
+                active_count = await db.enrollments.count_documents(q)
+
+            is_full = bool(max_stu is not None and max_stu > 0 and active_count >= max_stu)
+
             row = {
                 "batch_ref": ref,
                 "name": bname or None,
@@ -163,6 +190,9 @@ def _public_branch_batches_for_course(
                 "days": days,
                 "start_time": st,
                 "end_time": et,
+                "max_students": max_stu,
+                "enrolled_students": active_count,
+                "is_full": is_full,
             }
             if coach_id:
                 row["coach_id"] = coach_id
@@ -1376,8 +1406,8 @@ class CourseController:
                     "fee_per_duration": pricing.get("fee_per_duration"),
                 }
             # Live prices come from super-admin batch setup, not leftover course catalog amounts.
-            branch_batches = _public_branch_batches_for_course(
-                branch, serialized.get("id"), coach_names
+            branch_batches = await _public_branch_batches_for_course(
+                branch, serialized.get("id"), coach_names, db=db
             )
             live_fpd: dict = {}
             live_amounts = []
