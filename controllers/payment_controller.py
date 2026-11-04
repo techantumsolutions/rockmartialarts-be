@@ -2672,7 +2672,7 @@ class PaymentController:
 
         db = get_db()
 
-        # Extract creator information (Super Admin / Branch Manager / Coach)
+        # Extract creator information (Super Admin / Partner Super Admin / Branch Manager / Coach)
         creator_dict = None
         if current_user and current_user.get("id"):
             creator_dict = {
@@ -2681,6 +2681,8 @@ class PaymentController:
                 "role": str(current_user.get("role", "")),
                 "email": current_user.get("email", ""),
             }
+            if current_user.get("partner_org_id"):
+                creator_dict["partner_org_id"] = current_user.get("partner_org_id")
         elif payment_data.created_by:
             creator_dict = dict(payment_data.created_by)
 
@@ -2695,7 +2697,17 @@ class PaymentController:
             role_lower = str(creator_dict.get("role", "")).lower()
             creator_id = str(creator_dict.get("user_id", ""))
 
-            if role_lower == "coach":
+            if role_lower == "partner_super_admin":
+                from utils.partner_tenant import assert_partner_owns_branch
+                user_check = current_user if current_user else {"role": role_lower, "id": creator_id, "partner_org_id": creator_dict.get("partner_org_id")}
+                await assert_partner_owns_branch(db, user_check, payment_data.branch_id)
+                branch_doc = await db.branches.find_one({"id": payment_data.branch_id})
+                if branch_doc:
+                    branch_courses = branch_doc.get("assignments", {}).get("courses", [])
+                    if branch_courses and payment_data.course_id not in branch_courses:
+                        raise HTTPException(status_code=400, detail="Course is not offered at this branch")
+
+            elif role_lower == "coach":
                 coach = await db.coaches.find_one({"$or": [{"id": creator_id}, {"user_id": creator_id}]})
                 if not coach:
                     raise HTTPException(status_code=403, detail="Coach profile not found")
@@ -2877,8 +2889,10 @@ class PaymentController:
             from utils.partner_tenant import (
                 apply_partner_org_stamp,
                 resolve_partner_org_id_for_branch,
+                resolve_staff_partner_org_id,
             )
 
+            # Payment/enrollment follow the branch (partner branch revenue).
             partner_org_for_payment = await resolve_partner_org_id_for_branch(
                 db, payment_data.branch_id
             )
@@ -2887,6 +2901,29 @@ class PaymentController:
                 await db.enrollments.update_one(
                     {"id": enrollment_id},
                     {"$set": {"partner_org_id": partner_org_for_payment}},
+                )
+
+            # Student ownership follows the creator (partner staff only), so Rock
+            # dashboards hide partner-created students while partner dashboards
+            # still see Rock-created students enrolled at partner branches.
+            creator_for_org = current_user
+            if not creator_for_org and creator_dict:
+                creator_for_org = {
+                    "id": creator_dict.get("user_id"),
+                    "role": creator_dict.get("role"),
+                    "partner_org_id": creator_dict.get("partner_org_id"),
+                }
+            creator_partner_org = await resolve_staff_partner_org_id(db, creator_for_org)
+            if creator_partner_org:
+                if creator_dict is not None and not creator_dict.get("partner_org_id"):
+                    creator_dict["partner_org_id"] = creator_partner_org
+                    await db.users.update_one(
+                        {"id": student_id},
+                        {"$set": {"created_by": creator_dict}},
+                    )
+                await db.users.update_one(
+                    {"id": student_id},
+                    {"$set": {"partner_org_id": creator_partner_org}},
                 )
 
             await db.payments.insert_one(payment_dict)
