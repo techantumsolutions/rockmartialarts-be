@@ -463,11 +463,26 @@ class SearchController:
             # We'll handle this filtering after getting the base student list
 
         partner_branch_ids = None
-        if current_role == UserRole.PARTNER_SUPER_ADMIN:
-            from utils.partner_tenant import partner_branch_ids as _partner_branch_ids
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_branch_ids as _partner_branch_ids,
+            partner_org_id_of,
+            partner_student_visibility_clause,
+            resolve_staff_partner_org_id,
+            rock_owned_clause,
+        )
 
+        staff_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+            db, current_user
+        )
+        if current_role == UserRole.PARTNER_SUPER_ADMIN or staff_org:
+            p_org = partner_org_id_of(current_user) or staff_org
             partner_branch_ids = await _partner_branch_ids(db, current_user)
-            if not partner_branch_ids:
+            if partner_branch_ids is None and p_org:
+                partner_branch_ids = list(
+                    await db.branches.distinct("id", {"partner_org_id": p_org}) or []
+                )
+            if not partner_branch_ids and current_role == UserRole.PARTNER_SUPER_ADMIN:
                 return {
                     "query": query or "",
                     "students": [],
@@ -475,11 +490,31 @@ class SearchController:
                     "count": 0,
                     "message": "No branches in your partner organization",
                 }
-            if branch_id and branch_id != "all" and branch_id not in set(partner_branch_ids):
+            if branch_id and branch_id != "all" and partner_branch_ids and branch_id not in set(partner_branch_ids):
                 raise HTTPException(
                     status_code=403,
                     detail="Branch is outside your partner organization",
                 )
+            enrolled_ids = await db.enrollments.distinct(
+                "student_id",
+                {
+                    "$or": [
+                        {"partner_org_id": p_org},
+                        {"branch_id": {"$in": list(partner_branch_ids or [])}},
+                    ]
+                },
+            )
+            student_filter = merge_and_clause(
+                student_filter,
+                partner_student_visibility_clause(
+                    p_org,
+                    partner_branch_ids=list(partner_branch_ids or []),
+                    enrolled_student_ids=list(enrolled_ids or []),
+                ),
+            )
+        else:
+            # Rock roles: exclude partner-owned students
+            student_filter = merge_and_clause(student_filter, rock_owned_clause())
 
         # Get students matching the base criteria
         students_cursor = db.users.find(student_filter).skip(skip).limit(limit)

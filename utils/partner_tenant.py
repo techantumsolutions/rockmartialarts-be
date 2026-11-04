@@ -1,8 +1,8 @@
 """White-label partner tenant scoping helpers.
 
-Rock Super Admin: sees all data (including partner-owned rows).
-Partner Super Admin: only rows stamped with their partner_org_id;
-creates always stamp partner_org_id.
+Rock roles see rock-owned rows (no partner_org_id).
+Partner Super Admin / partner staff see their tenant rows.
+Student ownership is stamped from the *creator* (partner staff), not from the branch.
 """
 
 from __future__ import annotations
@@ -19,10 +19,56 @@ def is_partner_super_admin(user: Optional[dict]) -> bool:
 
 
 def partner_org_id_of(user: Optional[dict]) -> Optional[str]:
+    """Partner Super Admin org from the JWT/session only."""
     if not is_partner_super_admin(user):
         return None
     org_id = str((user or {}).get("partner_org_id") or "").strip()
     return org_id or None
+
+
+async def resolve_staff_partner_org_id(db, user: Optional[dict]) -> Optional[str]:
+    """Partner org for Partner SA, or for BM/coach docs stamped with partner_org_id.
+
+    Used when creating students so ownership follows the creator, not the branch.
+    """
+    if not user:
+        return None
+    direct = str(user.get("partner_org_id") or "").strip()
+    if direct and is_partner_super_admin(user):
+        return direct
+    if direct and str(user.get("role") or "").lower() in {
+        "branch_manager",
+        "branch_admin",
+        "branchmanager",
+        "coach",
+        "coach_admin",
+    }:
+        return direct
+
+    uid = str(user.get("id") or "").strip()
+    if not uid:
+        return None
+
+    role = str(user.get("role") or "").lower()
+    if role in {"branch_manager", "branch_admin", "branchmanager"}:
+        manager = await db.branch_managers.find_one(
+            {"id": uid},
+            {"partner_org_id": 1},
+        )
+        org = str((manager or {}).get("partner_org_id") or "").strip()
+        return org or None
+
+    if role in {"coach", "coach_admin"}:
+        coach = await db.coaches.find_one(
+            {"$or": [{"id": uid}, {"user_id": uid}]},
+            {"partner_org_id": 1},
+        )
+        org = str((coach or {}).get("partner_org_id") or "").strip()
+        return org or None
+
+    if is_partner_super_admin(user):
+        return direct or None
+    return None
 
 
 def require_partner_org_id(user: Optional[dict]) -> str:
@@ -81,6 +127,30 @@ def rock_owned_clause() -> Dict[str, Any]:
             {"partner_org_id": ""},
         ]
     }
+
+
+def student_rock_owned_clause() -> Dict[str, Any]:
+    """Students not owned by a partner tenant (visible to Rock dashboards)."""
+    return rock_owned_clause()
+
+
+def partner_student_visibility_clause(
+    org_id: str,
+    *,
+    partner_branch_ids: Optional[list] = None,
+    enrolled_student_ids: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Partner dashboard students: own stamped students OR Rock students at partner branches."""
+    org = str(org_id or "").strip()
+    clauses: list = [{"partner_org_id": org}]
+    bids = [str(b) for b in (partner_branch_ids or []) if b]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+        clauses.append({"branch.branch_id": {"$in": bids}})
+    sids = [str(s) for s in (enrolled_student_ids or []) if s]
+    if sids:
+        clauses.append({"id": {"$in": sids}})
+    return {"$or": clauses}
 
 
 def merge_and_clause(query: Dict[str, Any], clause: Dict[str, Any]) -> Dict[str, Any]:

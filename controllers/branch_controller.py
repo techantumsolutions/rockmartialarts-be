@@ -205,6 +205,13 @@ class BranchController:
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
+        for b in branches:
+            b_info = b.get("branch") if isinstance(b.get("branch"), dict) else {}
+            if not b.get("name") and b_info.get("name"):
+                b["name"] = b_info.get("name")
+            if not b.get("code") and b_info.get("code"):
+                b["code"] = b_info.get("code")
+
         if not include_stats:
             for branch in branches:
                 await _enrich_course_schedule_trainers(db, branch)
@@ -580,6 +587,12 @@ class BranchController:
                 "active_courses": len(branch.get("assignments", {}).get("courses", []))
             }
         }
+
+        b_info = branch_with_stats.get("branch") if isinstance(branch_with_stats.get("branch"), dict) else {}
+        if not branch_with_stats.get("name") and b_info.get("name"):
+            branch_with_stats["name"] = b_info.get("name")
+        if not branch_with_stats.get("code") and b_info.get("code"):
+            branch_with_stats["code"] = b_info.get("code")
 
         await _enrich_course_schedule_trainers(db, branch_with_stats)
         enrich_collaboration_flag(branch_with_stats)

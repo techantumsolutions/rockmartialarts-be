@@ -687,6 +687,9 @@ class CourseController:
             if not branch:
                 raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
 
+            from utils.partner_tenant import assert_tenant_doc_access
+            assert_tenant_doc_access(branch, current_user, entity="branch")
+
             # Get course IDs assigned and available at this branch
             course_ids = await available_course_ids_for_branch(db, branch)
 
