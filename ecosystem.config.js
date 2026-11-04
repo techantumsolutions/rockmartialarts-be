@@ -13,7 +13,9 @@ module.exports = {
       max_memory_restart: '512M',
       env: {
         NODE_ENV: 'production',
-        UPLOAD_ROOT: '/root/rockmartialarts-fe/public/uploads'
+        UPLOAD_ROOT: '/root/rockmartialarts-fe/public/uploads',
+        NO_PROXY: '127.0.0.1,::1,localhost',
+        no_proxy: '127.0.0.1,::1,localhost'
       },
       error_file: '/root/rockmartialarts-be/logs/err.log',
       out_file: '/root/rockmartialarts-be/logs/out.log',

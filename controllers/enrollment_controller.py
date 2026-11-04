@@ -357,7 +357,7 @@ class EnrollmentController:
         current_user: dict
     ):
         """Create a branch change request for an enrollment. Request is sent to branch admin for approval."""
-        if not db:
+        if db is None:
             raise HTTPException(status_code=500, detail="Database connection not available")
 
         enrollment = await db.enrollments.find_one({

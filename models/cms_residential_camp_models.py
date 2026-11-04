@@ -51,6 +51,8 @@ class ResidentialCampNav(_CampModel):
     link_schedule: str = "Masters"
     link_levels: str = "Levels"
     link_journey: str = "Journey"
+    link_daily: str = "Schedule"
+    link_gallery: str = "Gallery"
     link_rules: str = "Rules"
     link_register: str = "Register Now"
     mobile_register_label: str = "Register Now"
@@ -146,6 +148,63 @@ class ResidentialCampRulesSection(_CampModel):
     kicker: str = "Camp discipline"
     h2: str = "Discipline is part of the training"
     rules: List[str] = Field(default_factory=list)
+
+
+class CampDailySession(_CampModel):
+    time_label: str = ""
+    title: str = ""
+    image: Optional[str] = None
+    bullets: List[str] = Field(default_factory=list)
+    footer_label: str = ""
+    enabled: bool = True
+
+
+class CampPackingGroup(_CampModel):
+    title: str = ""
+    items: List[str] = Field(default_factory=list)
+
+
+class CampGalleryItem(_CampModel):
+    type: str = "image"
+    url: str = ""
+    caption: str = ""
+    enabled: bool = True
+
+
+class ResidentialCampDailyLife(_CampModel):
+    enabled: bool = True
+    kicker: str = "RESIDENTIAL SHAOLIN KUNGFU CAMP"
+    h2: str = "Daily Training Schedule"
+    hours_label: str = "5 Hours Per Day"
+    quote: str = "Discipline today\nA stronger tomorrow"
+    sessions: List[CampDailySession] = Field(default_factory=list)
+    principle_title: str = "Camp Training Principle"
+    principle_steps: List[str] = Field(default_factory=list)
+    principle_text: str = ""
+    principle_image: Optional[str] = None
+    total_title: str = "Total Training"
+    total_value: str = "5 Hours Per Day"
+    rules_title: str = "Camp Rules & Discipline"
+    rules: List[str] = Field(default_factory=list)
+    rules_image: Optional[str] = "/campaign/camp-rules-bg.jpg"
+    rules_principle_title: str = "Shaolin Camp Principle"
+    rules_principle_words: List[str] = Field(default_factory=list)
+    rules_tagline: str = "Train the Body. Discipline the Mind. Build the Skill."
+    food_title: str = "Food & Cleanliness"
+    food_lead: str = ""
+    food_items: List[str] = Field(default_factory=list)
+    food_image: Optional[str] = "/campaign/camp-food-plate.jpg"
+    packing_title: str = "Things to Carry"
+    packing_groups: List[CampPackingGroup] = Field(default_factory=list)
+    packing_important_title: str = "Important"
+    packing_important: List[str] = Field(default_factory=list)
+
+
+class ResidentialCampGallery(_CampModel):
+    enabled: bool = True
+    kicker: str = "Camp moments"
+    h2: str = "Training Gallery"
+    items: List[CampGalleryItem] = Field(default_factory=list)
 
 
 class ResidentialCampRegisterSection(_CampModel):
@@ -268,6 +327,8 @@ class ResidentialCampContent(_CampModel):
     training: ResidentialCampTrainingSection = Field(default_factory=ResidentialCampTrainingSection)
     schedule: ResidentialCampScheduleSection = Field(default_factory=ResidentialCampScheduleSection)
     rules: ResidentialCampRulesSection = Field(default_factory=ResidentialCampRulesSection)
+    daily_life: ResidentialCampDailyLife = Field(default_factory=ResidentialCampDailyLife)
+    gallery: ResidentialCampGallery = Field(default_factory=ResidentialCampGallery)
     levels: ResidentialCampLevelsSection = Field(default_factory=ResidentialCampLevelsSection)
     journey_cta: ResidentialCampJourneyCta = Field(default_factory=ResidentialCampJourneyCta)
     register: ResidentialCampRegisterSection = Field(default_factory=ResidentialCampRegisterSection)
@@ -388,6 +449,127 @@ def default_residential_camp_dict() -> dict:
                 ),
             ]
         ),
+        daily_life=ResidentialCampDailyLife(
+            sessions=[
+                CampDailySession(
+                    time_label="6:30 AM – 8:00 AM",
+                    title="Physical Preparation",
+                    image="/campaign/camp-session-morning.jpg",
+                    bullets=[
+                        "Warm-up",
+                        "Mobility training",
+                        "Flexibility",
+                        "Stance conditioning",
+                        "Basic body conditioning",
+                    ],
+                    footer_label="Morning\nBuild the body",
+                ),
+                CampDailySession(
+                    time_label="11:00 AM – 12:00 PM",
+                    title="Form Training",
+                    image="/campaign/camp-session-midday.jpg",
+                    bullets=[
+                        "Shaolin basic forms",
+                        "Wubu practice",
+                        "Chai combinations",
+                        "Form movements and techniques",
+                        "Form correction and refinement",
+                    ],
+                    footer_label="Midday\nLearn the skill",
+                ),
+                CampDailySession(
+                    time_label="5:00 PM – 6:30 PM",
+                    title="Form & Basic Foundation",
+                    image="/campaign/camp-session-evening.jpg",
+                    bullets=[
+                        "Shaolin basic foundation",
+                        "Stances & footwork",
+                        "Basic hand techniques",
+                        "Basic kicks",
+                        "Wubu footwork",
+                        "Chai form practice",
+                        "Form applications",
+                        "Repetition & technique correction",
+                    ],
+                    footer_label="Evening\nRefine and apply",
+                ),
+            ],
+            principle_steps=["Foundation", "Technique", "Form", "Application", "Discipline"],
+            principle_text=(
+                "Every student will train according to their level and ability, with emphasis on "
+                "correct technique, discipline, flexibility, conditioning and consistent practice."
+            ),
+            principle_image="/campaign/camp-principle.jpg",
+            rules_image="/campaign/camp-rules-bg.jpg",
+            food_image="/campaign/camp-food-plate.jpg",
+            rules=[
+                "Punctuality is compulsory — Students must report to every training session on time.",
+                "Training Schedule must be followed — All students must attend the complete daily training program.",
+                "Proper Uniform is Mandatory — Students must wear the prescribed academy/camp training uniform during training.",
+                "Respect & Discipline — Students must respect the Master, coaches, staff and fellow students at all times.",
+                "No Mobile Phones & Gadgets — Mobile phones, gaming devices and unnecessary gadgets are not permitted during the camp.",
+                "No Fighting or Bullying — Fighting, bullying, teasing, abusive language or disrespectful behaviour will not be tolerated.",
+                "Training Instructions Must Be Followed — Students must follow the instructions given by the Master and coaches during all training sessions.",
+                "Residential Discipline — Students must maintain cleanliness, order and discipline in dormitory and common areas.",
+                "No Leaving the Camp Premises — Students are not permitted to leave the camp premises without permission from the camp management.",
+                "Food & Hydration — Students must follow the camp meal schedule and maintain proper hydration.",
+                "Equipment Safety — Training equipment, including weapons where applicable, must be handled only under coach supervision.",
+                "Health & Safety — Any injury, illness, discomfort or medical concern must be immediately reported to the coach or camp staff.",
+                "Respect the Training Environment — Students must maintain silence and discipline during meditation, demonstrations and technical instruction.",
+                "No Damage to Property — Any intentional damage to academy or camp property will be the responsibility of the student/parent.",
+                "Level-Based Training — Students must complete the required foundation and demonstrate proper technique before progressing to the next level.",
+                "No Unauthorised Recording — Photography or video recording during training is permitted only with camp management approval.",
+                "Serious Misconduct — Repeated or serious violation of camp rules may result in removal from the training program, subject to the camp management’s decision.",
+            ],
+            rules_principle_words=["Discipline", "Respect", "Consistency", "Hard Work"],
+            food_lead=(
+                "After every meal, each student must clean their own plate, glass and eating area "
+                "and place them in the designated washing area."
+            ),
+            food_items=[
+                "Do not leave used plates or food behind.",
+                "Do not waste food.",
+                "Keep the dining area clean and organized.",
+                "Follow the meal timings strictly.",
+                "Maintain proper table manners and discipline.",
+            ],
+            packing_groups=[
+                CampPackingGroup(
+                    title="Essential Items",
+                    items=[
+                        "3–5 sets of comfortable training clothes",
+                        "Academy/Camp uniform",
+                        "Sports shoes",
+                        "Slippers",
+                        "Towel",
+                        "Personal toiletries",
+                        "Toothbrush & toothpaste",
+                        "Soap & shampoo",
+                        "Water bottle",
+                        "Personal medicines, if required",
+                        "Small backpack for daily training",
+                        "Extra innerwear and socks",
+                        "Nightwear",
+                        "Bedsheet/blanket, if instructed by camp management",
+                    ],
+                ),
+                CampPackingGroup(
+                    title="Training Essentials",
+                    items=[
+                        "Kungfu training uniform",
+                        "Stretchable training pants",
+                        "Hand towel",
+                        "Notebook & pen for learning techniques and instructions",
+                        "Any prescribed protective equipment",
+                    ],
+                ),
+            ],
+            packing_important=[
+                "Do not carry mobile phones, gaming devices, expensive jewellery, or unnecessary valuables unless specifically permitted by camp management.",
+                "Label all personal belongings with the student’s name.",
+            ],
+        ),
+        gallery=ResidentialCampGallery(items=[]),
         schedule=ResidentialCampScheduleSection(
             masters=[
                 CampMasterProfile(

@@ -164,6 +164,12 @@ class CMSResidentialCampController:
             collection = db[CMSResidentialCampController.COLLECTION]
             existing = await collection.find_one({}, sort=[("updated_at", -1), ("created_at", -1)])
             payload = _dump(data)
+            defaults = default_residential_camp_dict()
+            incoming_daily = payload.get("daily_life") or {}
+            if not incoming_daily.get("sessions") and not incoming_daily.get("rules"):
+                payload["daily_life"] = (existing or {}).get("daily_life") or defaults.get("daily_life")
+            if payload.get("gallery") is None:
+                payload["gallery"] = (existing or {}).get("gallery") or defaults.get("gallery")
             if existing:
                 incoming_id = (payload.get("event_id") or "").strip()
                 existing_id = (existing.get("event_id") or "").strip()
