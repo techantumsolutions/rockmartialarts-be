@@ -376,21 +376,19 @@ class BranchManagerController:
         if not manager_name:
             manager_name = "Branch Manager"
 
-        # Generate secure password reset token (same as forgot password implementation)
-        reset_token = secrets.token_urlsafe(32)
-        reset_token_expiry = datetime.utcnow() + timedelta(hours=24)  # 24 hour expiry
-
-        # Store reset token in database (same as forgot password implementation)
-        await db.branch_managers.update_one(
-            {"id": manager_id},
-            {
-                "$set": {
-                    "reset_token": reset_token,
-                    "reset_token_expiry": reset_token_expiry,
-                    "updated_at": datetime.utcnow()
-                }
-            }
+        # JWT reset token (same pattern as coach credentials / forgot password)
+        reset_token = create_access_token(
+            data={"sub": manager["id"], "scope": "password_reset"},
+            expires_delta=timedelta(hours=24),
         )
+
+        import os
+        from utils.partner_org_service import resolve_partner_role_login_urls
+
+        frontend_url = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_APP_URL") or "http://localhost:3022").rstrip("/")
+        reset_link = f"{frontend_url}/branch-manager/reset-password?token={reset_token}"
+        login_urls = await resolve_partner_role_login_urls(db, manager.get("partner_org_id"))
+        login_link = login_urls.get("branch_manager") or f"{frontend_url}/branch-manager/login"
 
         # Get branch information for context
         branch_info = ""
@@ -425,6 +423,7 @@ Account Details:
 {f"- {branch_info}" if branch_info else ""}
 
 To set up your password and access your account, please click the link below:
+{reset_link}
 {reset_link}
 
 This link will expire in 24 hours for security reasons.
@@ -587,6 +586,104 @@ This is an automated message. Please do not reply to this email.
             )
 
         return {"message": "Password has been set successfully. You can now log in."}
+
+    @staticmethod
+    async def forgot_password(email: str):
+        """Initiate password reset for branch manager (same pattern as coach)."""
+        db = get_db()
+        email_clean = (email or "").strip().lower()
+        manager = await db.branch_managers.find_one({
+            "$or": [
+                {"email": email_clean},
+                {"contact_info.email": email_clean},
+            ]
+        })
+        if not manager:
+            return {"message": "If a branch manager account with that email exists, a password reset link has been sent."}
+
+        reset_token = create_access_token(
+            data={"sub": manager["id"], "scope": "password_reset"},
+            expires_delta=timedelta(minutes=15),
+        )
+        manager_name = manager.get("full_name") or "Branch Manager"
+        manager_email = manager.get("email") or manager.get("contact_info", {}).get("email") or email_clean
+
+        import os
+        frontend_url = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_APP_URL") or "http://localhost:3022").rstrip("/")
+        reset_link = f"{frontend_url}/branch-manager/reset-password?token={reset_token}"
+
+        subject = "Branch Manager Password Reset - Rock Martial Arts Academy"
+        plain_message = f"""
+Hello {manager_name},
+
+You have requested to reset your branch manager password.
+
+Please click the following link to reset your password:
+{reset_link}
+
+This link will expire in 15 minutes for security reasons.
+
+If you did not request this password reset, please ignore this email.
+
+Best regards,
+Rock Martial Arts Academy Team
+        """.strip()
+        html_message = f"""
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h2 style="color:#667eea;">Branch Manager Password Reset</h2>
+  <p>Hello <strong>{manager_name}</strong>,</p>
+  <p>You have requested to reset your branch manager password.</p>
+  <p style="text-align:center;margin:28px 0;">
+    <a href="{reset_link}" style="background:#667eea;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:bold;">Reset Password</a>
+  </p>
+  <p style="font-size:13px;color:#666;">This link expires in 15 minutes. If you did not request this, ignore this email.</p>
+</body>
+</html>
+        """.strip()
+
+        email_sent = await send_custom_email_webhook(
+            manager_email, subject, html_message, plain_message
+        )
+        import logging
+        logging.info(f"Branch manager password reset requested for {manager_email}. Email sent: {email_sent}")
+
+        response = {"message": "If a branch manager account with that email exists, a password reset link has been sent."}
+        if os.environ.get("TESTING") == "True":
+            response["reset_token"] = reset_token
+            response["email_sent"] = email_sent
+        return response
+
+    @staticmethod
+    async def reset_password(token: str, new_password: str):
+        """Reset branch manager password using a JWT reset token."""
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            if payload.get("scope") != "password_reset":
+                raise HTTPException(status_code=401, detail="Invalid token scope")
+            manager_id = payload.get("sub")
+            if not manager_id:
+                raise HTTPException(status_code=401, detail="Invalid token")
+        except jwt.PyJWTError:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        new_hashed_password = hash_password(new_password)
+        db = get_db()
+        result = await db.branch_managers.update_one(
+            {"id": manager_id},
+            {
+                "$set": {
+                    "password_hash": new_hashed_password,
+                    "password": new_hashed_password,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$unset": {"reset_token": "", "reset_token_expiry": ""},
+            },
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Branch manager not found")
+        return {"message": "Password has been reset successfully"}
 
     @staticmethod
     async def login_branch_manager(login_data: BranchManagerLogin):

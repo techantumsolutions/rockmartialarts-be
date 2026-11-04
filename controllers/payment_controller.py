@@ -3998,6 +3998,130 @@ class PaymentController:
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
     @staticmethod
+    async def get_payment_by_id(payment_id: str, current_user: dict):
+        """Return a single payment with student/course/branch details for admin detail pages.
+
+        Some historical notification payment_ids still have invoices after the payment
+        row was removed/deduped — fall back to invoice data so notification deep-links work.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+
+        def _iso(val):
+            return val.isoformat() if hasattr(val, "isoformat") else val
+
+        payment = await db.payments.find_one({"id": payment_id})
+        if not payment:
+            inv = await db.invoices.find_one({"payment_id": payment_id})
+            if not inv:
+                raise HTTPException(status_code=404, detail="Payment not found")
+
+            role = (current_user or {}).get("role")
+            uid = (current_user or {}).get("id")
+            if role == "student":
+                if inv.get("student_id") != uid and inv.get("account_user_id") != uid:
+                    raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+            elif role == "branch_manager":
+                from utils.student_status_service import get_managed_branch_ids_for_user
+
+                managed = await get_managed_branch_ids_for_user(db, current_user) or []
+                if inv.get("branch_id") and managed and inv.get("branch_id") not in managed:
+                    raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+            elif role not in {"super_admin", "coach_admin", "coach", "partner_super_admin"}:
+                raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+
+            customer = inv.get("customer") or {}
+            line = (inv.get("line_items") or [None])[0] or {}
+            return {
+                "id": payment_id,
+                "student_id": inv.get("student_id") or inv.get("account_user_id"),
+                "student_name": customer.get("name"),
+                "student_email": customer.get("email"),
+                "student_phone": customer.get("phone"),
+                "enrollment_id": None,
+                "amount": inv.get("total_amount"),
+                "payment_type": inv.get("source") or "registration",
+                "payment_method": inv.get("payment_gateway_label") or inv.get("payment_method"),
+                "payment_status": "paid" if str(inv.get("status") or "").lower() in {"issued", "paid", "completed"} else (inv.get("status") or "paid"),
+                "transaction_id": inv.get("payment_reference"),
+                "payment_date": _iso(inv.get("paid_at") or inv.get("created_at")),
+                "course_name": line.get("course_name"),
+                "course_id": line.get("course_id"),
+                "branch_name": line.get("branch_name"),
+                "branch_id": inv.get("branch_id") or line.get("branch_id"),
+                "created_at": _iso(inv.get("created_at")),
+                "partner_org_id": inv.get("partner_org_id"),
+                "invoice_id": inv.get("id"),
+                "invoice_number": inv.get("invoice_number"),
+            }
+
+        role = (current_user or {}).get("role")
+        uid = (current_user or {}).get("id")
+        if role == "student":
+            if payment.get("student_id") != uid and payment.get("user_id") != uid:
+                raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+        elif role == "branch_manager":
+            from utils.student_status_service import get_managed_branch_ids_for_user
+
+            managed = await get_managed_branch_ids_for_user(db, current_user) or []
+            branch_id = (
+                (payment.get("branch_details") or {}).get("branch_id")
+                or payment.get("branch_id")
+            )
+            if branch_id and managed and branch_id not in managed:
+                raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+        elif role not in {"super_admin", "coach_admin", "coach", "partner_super_admin"}:
+            raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+
+        student = None
+        student_id = payment.get("student_id")
+        if student_id:
+            student = await db.users.find_one({"id": student_id})
+
+        course_details = payment.get("course_details") or {}
+        branch_details = payment.get("branch_details") or {}
+        student_name = None
+        student_email = None
+        student_phone = None
+        if student:
+            student_name = (
+                student.get("full_name")
+                or " ".join(
+                    str(p).strip()
+                    for p in [student.get("first_name"), student.get("last_name")]
+                    if p
+                ).strip()
+                or None
+            )
+            student_email = student.get("email")
+            student_phone = student.get("phone")
+
+        return {
+            "id": payment.get("id"),
+            "student_id": student_id,
+            "student_name": student_name,
+            "student_email": student_email,
+            "student_phone": student_phone,
+            "enrollment_id": payment.get("enrollment_id"),
+            "amount": payment.get("amount"),
+            "payment_type": payment.get("payment_type"),
+            "payment_method": payment.get("payment_method")
+            or payment.get("gateway_payment_label")
+            or payment.get("gateway_method"),
+            "payment_status": payment.get("payment_status") or payment.get("status"),
+            "transaction_id": payment.get("transaction_id")
+            or payment.get("razorpay_payment_id"),
+            "payment_date": _iso(payment.get("payment_date") or payment.get("created_at")),
+            "course_name": course_details.get("course_name") or payment.get("course_name"),
+            "course_id": course_details.get("course_id") or payment.get("course_id"),
+            "branch_name": branch_details.get("branch_name") or payment.get("branch_name"),
+            "branch_id": branch_details.get("branch_id") or payment.get("branch_id"),
+            "created_at": _iso(payment.get("created_at")),
+            "partner_org_id": payment.get("partner_org_id"),
+        }
+
+    @staticmethod
     async def cancel_payment_attempt(payment_id: str, current_user: dict):
         """Cancel mistaken/pending payment attempts from admin payment tracking."""
         db = get_db()

@@ -1596,8 +1596,12 @@ class CoachController:
         )
 
         import os
+        from utils.partner_org_service import resolve_partner_role_login_urls
+
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3022").rstrip("/")
         reset_link = f"{frontend_url}/coach/reset-password?token={reset_token}"
+        login_urls = await resolve_partner_role_login_urls(db, coach.get("partner_org_id"))
+        login_link = login_urls.get("coach") or f"{frontend_url}/coach/login"
 
         # Prepare email content
         subject = "Your Coach Login Credentials - Marshalarts Academy"
@@ -1651,7 +1655,7 @@ class CoachController:
             <ul>
                 <li><strong>Step 1:</strong> Click "Set Up Your Password" button above</li>
                 <li><strong>Step 2:</strong> Create a secure password for your account</li>
-                <li><strong>Step 3:</strong> Visit the <a href="http://localhost:3022/coach/login" style="color: #ea580c;">Coach Portal</a> to log in</li>
+                <li><strong>Step 3:</strong> Visit the <a href="{login_link}" style="color: #ea580c;">Coach Portal</a> to log in</li>
                 <li><strong>Step 4:</strong> Complete your profile setup and review your assigned courses</li>
             </ul>
 
@@ -1677,7 +1681,7 @@ Your coach account has been created successfully. You can now set up your passwo
 
 📧 Email: {coach_email}
 🔑 Password Setup: {reset_link}
-🔗 Coach Portal: http://localhost:3022/coach/login
+🔗 Coach Portal: {login_link}
 
 🔒 SECURITY NOTICE: The password setup link above will expire in 15 minutes for security. After setting your password, you can log in at the coach portal.
 

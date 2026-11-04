@@ -17,6 +17,7 @@ from models.partner_org_models import (
     PartnerOrgStatus,
     PartnerOrgUpdateStatus,
     PartnerPaymentMethod,
+    PartnerProfileUpdate,
     PartnerSetPassword,
     PartnerOrgVerifyPayment,
     new_partner_org_id,
@@ -26,6 +27,7 @@ from models.user_models import UserRole
 from utils.auth import create_access_token, hash_password, verify_password
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.indian_phone import canonical_indian_phone
 from utils.razorpay_client import get_razorpay_client, verify_razorpay_signature
 from utils.resend_email import send_partner_invite_email
 
@@ -35,10 +37,134 @@ COL = "partner_organizations"
 COL_USERS = "users"
 
 
+def _phone_lookup_variants(phone: str) -> list:
+    raw = (phone or "").strip()
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) < 10:
+        return [raw] if raw else []
+    norm = digits[-10:]
+    variants = {
+        norm,
+        f"91{norm}",
+        f"+91{norm}",
+        f"+91-{norm}",
+        f"0{norm}",
+        f"91-{norm}",
+        f"+91 {norm}",
+        raw,
+    }
+    canonical = canonical_indian_phone(raw)
+    if canonical:
+        variants.add(canonical)
+        variants.add(canonical[3:] if canonical.startswith("+91") else canonical)
+    return [v for v in variants if v]
+
+
+async def _assert_partner_email_phone_available(
+    db,
+    *,
+    email: str,
+    phone: str,
+    allow_pending_partner_email: bool = False,
+) -> None:
+    """Fail fast before payment / partner creation when email or phone is already used."""
+    email_clean = str(email or "").lower().strip()
+    phone_clean = str(phone or "").strip()
+    if not email_clean:
+        raise HTTPException(status_code=400, detail="Email is required")
+    if not phone_clean:
+        raise HTTPException(status_code=400, detail="Mobile number is required")
+
+    org_email_q: Dict[str, Any] = {"email": email_clean}
+    if allow_pending_partner_email:
+        org_email_q["status"] = {"$ne": PartnerOrgStatus.PENDING_PAYMENT.value}
+    if await db[COL].find_one(org_email_q, {"id": 1}):
+        raise HTTPException(status_code=400, detail="A partner with this email already exists")
+
+    existing_user = await db[COL_USERS].find_one(
+        {"email": email_clean},
+        {"id": 1, "role": 1},
+    )
+    if existing_user and existing_user.get("role") != UserRole.PARTNER_SUPER_ADMIN.value:
+        raise HTTPException(status_code=400, detail="This email is already registered")
+
+    variants = _phone_lookup_variants(phone_clean)
+    if not variants:
+        raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+
+    phone_org_q: Dict[str, Any] = {"phone": {"$in": variants}}
+    if allow_pending_partner_email:
+        # Same email retrying unpaid checkout may keep the pending row's phone
+        phone_org_q = {
+            "$and": [
+                {"phone": {"$in": variants}},
+                {
+                    "$or": [
+                        {"email": {"$ne": email_clean}},
+                        {"status": {"$ne": PartnerOrgStatus.PENDING_PAYMENT.value}},
+                    ]
+                },
+            ]
+        }
+    if await db[COL].find_one(phone_org_q, {"id": 1}):
+        raise HTTPException(
+            status_code=400,
+            detail="A partner with this mobile number already exists",
+        )
+
+    if await db[COL_USERS].find_one({"phone": {"$in": variants}}, {"id": 1}):
+        raise HTTPException(
+            status_code=400,
+            detail="This mobile number is already registered",
+        )
+
+    # Digits-suffix match for legacy phone formatting in users
+    digits = "".join(c for c in phone_clean if c.isdigit())
+    norm = digits[-10:] if len(digits) >= 10 else ""
+    if norm:
+        async for doc in db[COL_USERS].find(
+            {"phone": {"$exists": True, "$nin": [None, ""]}},
+            {"phone": 1},
+        ).limit(5000):
+            stored = "".join(c for c in str(doc.get("phone") or "") if c.isdigit())
+            if len(stored) >= 10 and stored[-10:] == norm:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This mobile number is already registered",
+                )
+
+
 def _frontend_url() -> str:
     return (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_APP_URL") or "http://localhost:3022").rstrip(
         "/"
     )
+
+
+async def resolve_partner_role_login_urls(db, partner_org_id: Optional[str]) -> dict:
+    """White-label role login URLs for a partner org, or Rock defaults when unscoped."""
+    fe = _frontend_url()
+    defaults = {
+        "slug": None,
+        "admin": f"{fe}/partners/login",
+        "branch_manager": f"{fe}/branch-manager/login",
+        "coach": f"{fe}/coach/login",
+        "student": f"{fe}/login",
+    }
+    org_id = (partner_org_id or "").strip()
+    if not org_id:
+        return defaults
+    org = await db[COL].find_one({"id": org_id})
+    slug = ((org or {}).get("slug") or "").strip()
+    if not slug:
+        return defaults
+    base = f"{fe}/partners/{slug}"
+    return {
+        "slug": slug,
+        "admin": f"{base}/login",
+        "branch_manager": f"{base}/branch-manager/login",
+        "coach": f"{base}/coach/login",
+        "student": f"{base}/student/login",
+    }
 
 
 def _onboarding_fee_paise() -> int:
@@ -102,8 +228,15 @@ async def assert_partner_org_active(db, partner_org_id: str) -> dict:
 
 async def _send_invite_email(org: dict, invite_token: str) -> None:
     slug = org.get("slug") or "partner"
-    set_link = f"{_frontend_url()}/partners/{slug}/set-password?token={invite_token}"
-    login_link = f"{_frontend_url()}/partners/{slug}/login"
+    fe = _frontend_url()
+    set_link = f"{fe}/partners/{slug}/set-password?token={invite_token}"
+    login_link = f"{fe}/partners/{slug}/login"
+    role_login_links = {
+        "admin": login_link,
+        "branch_manager": f"{fe}/partners/{slug}/branch-manager/login",
+        "coach": f"{fe}/partners/{slug}/coach/login",
+        "student": f"{fe}/partners/{slug}/student/login",
+    }
     name = org.get("name") or "Partner"
     email = org.get("email")
     if not email:
@@ -117,6 +250,7 @@ async def _send_invite_email(org: dict, invite_token: str) -> None:
         payment_status=str(org.get("payment_status") or ""),
         set_password_link=set_link,
         login_link=login_link,
+        role_login_links=role_login_links,
     )
     if not sent:
         logger.error(
@@ -208,10 +342,13 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
     await ensure_partner_org_indexes(db)
 
     email = str(body.email).lower().strip()
-    if await db[COL].find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="A partner with this email already exists")
-    if await db[COL_USERS].find_one({"email": email, "role": {"$ne": UserRole.PARTNER_SUPER_ADMIN.value}}):
-        raise HTTPException(status_code=400, detail="This email is already registered")
+    phone = body.phone.strip()
+    await _assert_partner_email_phone_available(
+        db,
+        email=email,
+        phone=phone,
+        allow_pending_partner_email=False,
+    )
 
     now = datetime.utcnow()
     org_id = new_partner_org_id()
@@ -221,7 +358,7 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         "name": body.name.strip(),
         "slug": slug,
         "email": email,
-        "phone": body.phone.strip(),
+        "phone": phone,
         "address": body.address.strip(),
         "payment_method": PartnerPaymentMethod.OFFLINE.value,
         "payment_status": "offline_recorded",
@@ -252,8 +389,14 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
     await ensure_partner_org_indexes(db)
 
     email = str(body.email).lower().strip()
-    if await db[COL].find_one({"email": email, "status": {"$ne": PartnerOrgStatus.PENDING_PAYMENT.value}}):
-        raise HTTPException(status_code=400, detail="A partner with this email already exists")
+    phone = body.phone.strip()
+    # Validate email + phone before opening Razorpay (avoid pay-then-fail)
+    await _assert_partner_email_phone_available(
+        db,
+        email=email,
+        phone=phone,
+        allow_pending_partner_email=True,
+    )
 
     amount_paise = _onboarding_fee_paise()
     now = datetime.utcnow()
@@ -268,7 +411,7 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
             {
                 "$set": {
                     "name": body.name.strip(),
-                    "phone": body.phone.strip(),
+                    "phone": phone,
                     "address": body.address.strip(),
                     "payment_method": PartnerPaymentMethod.ONLINE.value,
                     "updated_at": now,
@@ -284,7 +427,7 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
                 "name": body.name.strip(),
                 "slug": slug,
                 "email": email,
-                "phone": body.phone.strip(),
+                "phone": phone,
                 "address": body.address.strip(),
                 "payment_method": PartnerPaymentMethod.ONLINE.value,
                 "payment_status": "pending",
@@ -489,6 +632,93 @@ async def get_partner_public_by_slug(slug: str) -> Dict[str, Any]:
         "is_active": org.get("is_active", True),
         "status": org.get("status"),
     }
+
+
+async def get_partner_me(current_user: dict) -> Dict[str, Any]:
+    """Return the logged-in partner admin profile (+ org name)."""
+    db = get_db()
+    org_id = partner_org_id_of(current_user)
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Partner organization is missing on this account")
+    org = await db[COL].find_one({"id": org_id})
+    user = await db[COL_USERS].find_one({"id": current_user.get("id")})
+    if not user:
+        raise HTTPException(status_code=404, detail="Partner admin user not found")
+    return {
+        "id": user.get("id"),
+        "full_name": user.get("full_name")
+        or f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+        or (org or {}).get("name")
+        or "Partner Admin",
+        "email": user.get("email") or "",
+        "phone": user.get("phone") or "",
+        "is_active": user.get("is_active", True),
+        "partner_org_id": org_id,
+        "partner_name": (org or {}).get("name"),
+        "partner_slug": (org or {}).get("slug"),
+        "role": UserRole.PARTNER_SUPER_ADMIN.value,
+        "role_label": "Partner Admin",
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+    }
+
+
+async def update_partner_me(body: PartnerProfileUpdate, current_user: dict) -> Dict[str, Any]:
+    """Update the logged-in partner admin profile fields."""
+    db = get_db()
+    user_id = current_user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    patch: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if body.full_name is not None:
+        name = body.full_name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Full name is required")
+        patch["full_name"] = name
+        parts = name.split(None, 1)
+        patch["first_name"] = parts[0]
+        patch["last_name"] = parts[1] if len(parts) > 1 else ""
+    if body.email is not None:
+        email_clean = str(body.email).strip().lower()
+        conflict = await db[COL_USERS].find_one(
+            {
+                "email": email_clean,
+                "id": {"$ne": user_id},
+            },
+            {"id": 1},
+        )
+        if conflict:
+            raise HTTPException(status_code=400, detail="This email address is already registered")
+        patch["email"] = email_clean
+    if body.phone is not None:
+        phone_clean = body.phone.strip()
+        if phone_clean:
+            conflict = await db[COL_USERS].find_one(
+                {
+                    "phone": phone_clean,
+                    "id": {"$ne": user_id},
+                },
+                {"id": 1},
+            )
+            if conflict:
+                raise HTTPException(status_code=400, detail="This mobile number is already registered")
+            patch["phone"] = phone_clean
+
+    result = await db[COL_USERS].update_one({"id": user_id}, {"$set": patch})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Partner admin user not found")
+
+    # Keep org contact email in sync when partner admin email changes
+    org_id = partner_org_id_of(current_user)
+    if org_id and "email" in patch:
+        await db[COL].update_one(
+            {"id": org_id},
+            {"$set": {"email": patch["email"], "updated_at": datetime.utcnow()}},
+        )
+
+    updated = await get_partner_me(current_user)
+    return {"message": "Profile updated successfully", "data": updated}
 
 
 async def get_partner_admin_profile(current_user: dict) -> Dict[str, Any]:
