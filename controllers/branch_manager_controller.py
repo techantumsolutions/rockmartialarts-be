@@ -128,18 +128,23 @@ class BranchManagerController:
         skip: int = 0,
         limit: int = 50,
         active_only: bool = True,
-        current_user: dict = None
+        current_user: dict = None,
+        all_tenants: bool = False,
     ):
         """Get list of branch managers with pagination"""
         db = get_db()
         
-        from utils.partner_tenant import apply_tenant_filter
+        from utils.partner_tenant import tenant_or_rock_owned_filter, is_partner_super_admin
 
         # Build query filter
         query_filter = {}
         if active_only:
             query_filter["is_active"] = True
-        query_filter = apply_tenant_filter(query_filter, current_user)
+
+        if all_tenants and not is_partner_super_admin(current_user):
+            pass
+        else:
+            query_filter = tenant_or_rock_owned_filter(query_filter, current_user)
         
         # Get total count
         total_count = await db.branch_managers.count_documents(query_filter)

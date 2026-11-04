@@ -62,6 +62,19 @@ async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
                 or (u.get("email") or "").strip()
                 or "Trainer"
             )
+        missing_ids = [i for i in ids if i not in name_map]
+        if missing_ids:
+            coaches = await db.coaches.find({"id": {"$in": missing_ids}}).to_list(length=300)
+            for c in coaches:
+                pinfo = c.get("personal_info") or {}
+                fn = (pinfo.get("first_name") or "").strip()
+                ln = (pinfo.get("last_name") or "").strip()
+                name_map[c["id"]] = (
+                    (c.get("full_name") or "").strip()
+                    or f"{fn} {ln}".strip()
+                    or ((c.get("contact_info") or {}).get("email") or "").strip()
+                    or "Trainer"
+                )
     for entry in sched:
         if not isinstance(entry, dict):
             continue
