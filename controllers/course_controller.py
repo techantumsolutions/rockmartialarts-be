@@ -2,6 +2,7 @@ from fastapi import HTTPException, Depends
 from typing import Optional, Dict, Any, Set
 from datetime import datetime
 import logging
+import re
 
 from models.course_models import CourseCreate, CourseUpdate, Course
 from models.user_models import UserRole
@@ -16,6 +17,7 @@ from utils.course_hierarchy import (
     name_slug,
 )
 from utils.branch_courses import available_course_ids_for_branch, assert_course_available_at_branch
+from utils.subscription_dates import is_subscription_period_over
 from controllers.student_showcase_achievement_controller import list_for_course_with_fallback
 
 logger = logging.getLogger(__name__)
@@ -108,10 +110,11 @@ async def _user_display_names_by_ids(db, user_ids: Set[str]) -> Dict[str, str]:
     return out
 
 
-def _public_branch_batches_for_course(
+async def _public_branch_batches_for_course(
     branch: dict,
     course_id: str,
     coach_names: Optional[Dict[str, str]] = None,
+    db: Any = None,
 ) -> list:
     """Batches from branch course_schedule for registration (batch_ref matches payment-info)."""
     sched = (branch.get("assignments") or {}).get("course_schedule") or []
@@ -152,6 +155,32 @@ def _public_branch_batches_for_course(
             if coach_names and coach_id:
                 trainer_name = coach_names.get(coach_id)
             fpd = b.get("fee_per_duration") if isinstance(b.get("fee_per_duration"), dict) else None
+            max_stu = b.get("max_students")
+            if max_stu is not None:
+                try:
+                    max_stu = int(max_stu)
+                except (ValueError, TypeError):
+                    max_stu = None
+
+            branch_id_str = str(branch.get("id") or "").strip()
+            active_count = 0
+            if db is not None and branch_id_str and course_id and (bid or ref):
+                batch_filters = []
+                if bid:
+                    batch_filters.extend([{"batch_id": bid}, {"slot_id": bid}])
+                if ref and ref != bid:
+                    batch_filters.append({"batch_ref": ref})
+                q = {
+                    "branch_id": branch_id_str,
+                    "course_id": str(course_id),
+                    "is_active": True,
+                }
+                if batch_filters:
+                    q["$or"] = batch_filters
+                active_count = await db.enrollments.count_documents(q)
+
+            is_full = bool(max_stu is not None and max_stu > 0 and active_count >= max_stu)
+
             row = {
                 "batch_ref": ref,
                 "name": bname or None,
@@ -161,6 +190,9 @@ def _public_branch_batches_for_course(
                 "days": days,
                 "start_time": st,
                 "end_time": et,
+                "max_students": max_stu,
+                "enrolled_students": active_count,
+                "is_full": is_full,
             }
             if coach_id:
                 row["coach_id"] = coach_id
@@ -184,6 +216,77 @@ def _timing_field(t: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+SHORT_DAYS_PY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_INDEX_PY = {
+    "mon": 0, "monday": 0, "mondays": 0,
+    "tue": 1, "tues": 1, "tuesday": 1, "tuesdays": 1,
+    "wed": 2, "wednesday": 2, "wednesdays": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "thursdays": 3,
+    "fri": 4, "friday": 4, "fridays": 4,
+    "sat": 5, "saturday": 5, "saturdays": 5,
+    "sun": 6, "sunday": 6, "sundays": 6,
+}
+
+
+def _format_time_with_am_pm(t_str: Any) -> str:
+    """Format time string like '06:00', '6:00', '18:30' into '06:00 AM', '06:30 PM'."""
+    if not t_str:
+        return ""
+    s = str(t_str).strip()
+    if not s:
+        return ""
+    m_12h = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm)$", s, re.I)
+    if m_12h:
+        h = int(m_12h.group(1))
+        m = m_12h.group(2) or "00"
+        p = m_12h.group(3).upper()
+        return f"{h:02d}:{m} {p}"
+    m_24h = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
+    if m_24h:
+        h = int(m_24h.group(1))
+        m = m_24h.group(2)
+        p = "AM" if h < 12 else "PM"
+        h12 = h % 12
+        if h12 == 0:
+            h12 = 12
+        return f"{h12:02d}:{m} {p}"
+    return s
+
+
+def _format_weekday_ranges(days: Any) -> str:
+    """Format days into Mon - Sat or Mon, Wed, Fri with breakers."""
+    if not days or not isinstance(days, (list, tuple)):
+        return ""
+    indices = []
+    for d in days:
+        if isinstance(d, str):
+            idx = DAY_INDEX_PY.get(d.strip().lower())
+            if idx is not None:
+                indices.append(idx)
+    unique = sorted(set(indices))
+    if not unique:
+        return ", ".join(str(d) for d in days if d)
+    parts: list[str] = []
+    run_start = unique[0]
+    run_end = unique[0]
+    for idx in unique[1:]:
+        if idx == run_end + 1:
+            run_end = idx
+        else:
+            parts.append(
+                f"{SHORT_DAYS_PY[run_start]}–{SHORT_DAYS_PY[run_end]}"
+                if run_start != run_end
+                else SHORT_DAYS_PY[run_start]
+            )
+            run_start = run_end = idx
+    parts.append(
+        f"{SHORT_DAYS_PY[run_start]}–{SHORT_DAYS_PY[run_end]}"
+        if run_start != run_end
+        else SHORT_DAYS_PY[run_start]
+    )
+    return ", ".join(parts)
+
+
 def format_branch_timings_display(timings_list: Any) -> str:
     """Build a single display string from branch operational_details.timings (flexible field names)."""
     if not timings_list or not isinstance(timings_list, (list, tuple)):
@@ -192,14 +295,19 @@ def format_branch_timings_display(timings_list: Any) -> str:
     for t in timings_list[:24]:
         if not isinstance(t, dict):
             continue
-        open_t = _timing_field(t, "open", "open_time", "start", "from")
-        close_t = _timing_field(t, "close", "close_time", "end", "to")
+        open_t = _format_time_with_am_pm(_timing_field(t, "open", "open_time", "start", "from"))
+        close_t = _format_time_with_am_pm(_timing_field(t, "close", "close_time", "end", "to"))
         day = _timing_field(t, "day", "weekday")
+        day_short = (
+            SHORT_DAYS_PY[DAY_INDEX_PY[day.strip().lower()]]
+            if day and day.strip().lower() in DAY_INDEX_PY
+            else day
+        )
         if open_t and close_t:
-            parts.append(f"{day}: {open_t} to {close_t}" if day else f"{open_t} to {close_t}")
+            parts.append(f"{day_short}: {open_t}–{close_t}" if day_short else f"{open_t}–{close_t}")
         elif open_t or close_t:
             slot = f"{open_t} – {close_t}".strip(" –") if (open_t and close_t) else (open_t or close_t)
-            parts.append(f"{day}: {slot}" if day else slot)
+            parts.append(f"{day_short}: {slot}" if day_short else slot)
     if parts:
         return " | ".join(parts)
     first = timings_list[0] if timings_list else None
@@ -230,10 +338,10 @@ def _format_course_batches_timings(course_id: str, schedule: Any) -> str:
         if not isinstance(b, dict):
             continue
         days = b.get("days") or []
-        ds = ", ".join(str(d) for d in days if d) if days else ""
-        st = str(b.get("start_time") or "").strip()
-        en = str(b.get("end_time") or "").strip()
-        ts = f"{st} – {en}" if st and en else (st or en)
+        ds = _format_weekday_ranges(days) if days else ""
+        st = _format_time_with_am_pm(b.get("start_time"))
+        en = _format_time_with_am_pm(b.get("end_time"))
+        ts = f"{st}–{en}" if st and en else (st or en)
         if ds and ts:
             parts.append(f"{ds} · {ts}")
         elif ds:
@@ -267,16 +375,30 @@ class CourseController:
 
         db = get_db()
 
-        # Check for duplicate course title
-        existing_course = await db.courses.find_one({
+        from utils.partner_tenant import (
+            apply_tenant_filter,
+            stamp_tenant,
+            partner_branch_ids,
+            assert_tenant_doc_access,
+        )
+
+        # Check for duplicate course title (scoped per partner tenant)
+        title_query = {
             "title": {"$regex": f"^{course_data.title.strip()}$", "$options": "i"}
-        })
+        }
+        title_query = apply_tenant_filter(title_query, current_user)
+        existing_course = await db.courses.find_one(title_query)
         if existing_course:
             raise HTTPException(status_code=400, detail=f"A course with the name '{course_data.title}' already exists")
 
         category_id, sub_category = await assert_course_hierarchy(
             db, course_data.category_id, course_data.sub_category
         )
+        cat_doc = await db.categories.find_one({"id": category_id})
+        assert_tenant_doc_access(cat_doc, current_user, entity="category")
+        if sub_category:
+            sub_doc = await db.categories.find_one({"id": sub_category})
+            assert_tenant_doc_access(sub_doc, current_user, entity="category")
         payload = course_data.dict()
         payload["category_id"] = category_id
         payload["sub_category"] = sub_category
@@ -292,6 +414,41 @@ class CourseController:
         if settings.get("active") is None:
             settings["active"] = True
         course_dict["settings"] = settings
+
+        # Store creator information
+        creator_id = current_user.get("id")
+        creator_role = current_user.get("role")
+        creator_name = current_user.get("full_name") or f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip()
+        course_dict["created_by"] = creator_id
+        course_dict["created_by_role"] = str(creator_role) if creator_role else None
+        course_dict["created_by_name"] = creator_name or None
+        stamp_tenant(course_dict, current_user)
+
+        current_role = current_user.get("role")
+        if current_role == UserRole.BRANCH_MANAGER or str(current_role) == "branch_manager":
+            from utils.student_status_service import get_managed_branch_ids_for_user
+            from utils.branch_courses import upsert_branch_course
+
+            managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+            course_dict["branch_ids"] = managed_branch_ids or []
+
+            await db.courses.insert_one(course_dict)
+
+            # Automatically assign this course to the branch manager's managed branch(es)
+            if managed_branch_ids:
+                for b_id in managed_branch_ids:
+                    try:
+                        await upsert_branch_course(db, b_id, course.id, is_available=True)
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).error(f"Failed to auto-assign course {course.id} to branch {b_id}: {e}")
+
+            return {"message": "Course created successfully", "course_id": course.id}
+
+        # Partner: auto-link to their tenant branches when present
+        p_branch_ids = await partner_branch_ids(db, current_user)
+        if p_branch_ids is not None:
+            course_dict["branch_ids"] = list(p_branch_ids)
 
         await db.courses.insert_one(course_dict)
         return {"message": "Course created successfully", "course_id": course.id}
@@ -328,20 +485,15 @@ class CourseController:
         managed_branch_ids = None
 
         if current_role == "branch_manager":
-            # Branch managers can only see courses from their managed branches
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-
-            if not managed_branches:
+            managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if not managed_branch_ids:
                 return {"courses": []}
 
-            # Get all branch IDs managed by this branch manager
-            managed_branch_ids = [branch["id"] for branch in managed_branches]
-            print(f"Branch manager {branch_manager_id} manages branches for courses: {managed_branch_ids}")
+        from utils.partner_tenant import apply_tenant_filter
+
+        filter_query = apply_tenant_filter(filter_query, current_user)
 
         courses = await db.courses.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
@@ -360,8 +512,28 @@ class CourseController:
 
             branches = await db.branches.find(branch_query).to_list(length=100)
 
+            # Check if this course was created by this branch manager
+            is_created_by_manager = (
+                current_role == "branch_manager" and (
+                    course.get("created_by") == current_user.get("id") or
+                    (managed_branch_ids and any(bid in (course.get("branch_ids") or []) for bid in managed_branch_ids))
+                )
+            )
+
+            # If created by this branch manager but not yet assigned to their branch(es),
+            # auto-assign to their managed branch(es) so it is available
+            if is_created_by_manager and len(branches) == 0 and managed_branch_ids:
+                from utils.branch_courses import upsert_branch_course
+                for mb_id in managed_branch_ids:
+                    try:
+                        await upsert_branch_course(db, mb_id, course["id"], is_available=True)
+                    except Exception:
+                        pass
+                branches = await db.branches.find(branch_query).to_list(length=100)
+
             # For branch managers, skip courses that aren't assigned to any of their managed branches
-            if managed_branch_ids is not None and len(branches) == 0:
+            # and were not created by them
+            if managed_branch_ids is not None and len(branches) == 0 and not is_created_by_manager:
                 continue
 
             # Get instructor assignments (coaches assigned to this course)
@@ -373,11 +545,23 @@ class CourseController:
                 ],
             }).to_list(length=100)
 
-            # Get student enrollment count
-            enrollment_count = await db.enrollments.count_documents({
-                "course_id": course["id"],
-                "is_active": True
-            })
+            # Student count. Branch managers see students enrolled in this course
+            # at their selected branch only; other roles keep the existing total.
+            if managed_branch_ids is not None:
+                student_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {
+                        "course_id": course["id"],
+                        "branch_id": {"$in": managed_branch_ids},
+                        "is_active": True,
+                    },
+                )
+                enrollment_count = len([student_id for student_id in student_ids if student_id])
+            else:
+                enrollment_count = await db.enrollments.count_documents({
+                    "course_id": course["id"],
+                    "is_active": True
+                })
 
             # Create enhanced course object
             enhanced_course = serialize_doc(course)
@@ -428,10 +612,24 @@ class CourseController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(course, current_user, entity="course")
+
         if current_user.get("role") == UserRole.BRANCH_MANAGER:
-            manager_id = current_user.get("id")
-            managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
-            if not any(
+            from utils.student_status_service import get_managed_branch_ids_for_user
+
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
+            is_creator = (
+                course.get("created_by") == current_user.get("id") or
+                (allowed_ids and any(bid in (course.get("branch_ids") or []) for bid in allowed_ids))
+            )
+            if not is_creator and not any(
                 course_id in (b.get("assignments") or {}).get("courses", [])
                 for b in (managed_branches or [])
             ):
@@ -475,23 +673,22 @@ class CourseController:
             # Apply role-based access control
             current_role = current_user.get("role")
             if current_role == "branch_manager":
-                # Branch managers can only access courses from their managed branches
-                # Get the branch assignment from the branch manager's profile
-                branch_assignment = current_user.get("branch_assignment")
-                if branch_assignment and branch_assignment.get("branch_id"):
-                    managed_branch_id = branch_assignment["branch_id"]
-                    if managed_branch_id != branch_id:
-                        raise HTTPException(
-                            status_code=403,
-                            detail="You can only access courses from your managed branch"
-                        )
-                else:
-                    raise HTTPException(status_code=403, detail="No branch assigned to this manager")
+                from utils.student_status_service import get_managed_branch_ids_for_user
+
+                allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if branch_id not in allowed_ids:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You can only access courses from your selected branch",
+                    )
 
             # First, get the branch to find assigned courses
             branch = await db.branches.find_one({"id": branch_id})
             if not branch:
                 raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+            from utils.partner_tenant import assert_tenant_doc_access
+            assert_tenant_doc_access(branch, current_user, entity="branch")
 
             # Get course IDs assigned and available at this branch
             course_ids = await available_course_ids_for_branch(db, branch)
@@ -503,7 +700,7 @@ class CourseController:
             courses = await db.courses.find({
                 "id": {"$in": course_ids},
                 "settings.active": True
-            }).to_list(length=100)
+            }).to_list(length=1000)
 
             # Enhance courses with additional data
             enhanced_courses = []
@@ -560,27 +757,31 @@ class CourseController:
         existing_course = await db.courses.find_one({"id": course_id})
         if not existing_course:
             raise HTTPException(status_code=404, detail="Course not found")
-        
-        bm_managed_branches = None
 
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_course, current_user, entity="course")
+        
         # Coach Admin permission check
         if current_user["role"] == UserRole.COACH_ADMIN:
             # Check if user is the instructor of this course or can manage it
             if existing_course.get("instructor_id") != current_user["id"]:
                 raise HTTPException(status_code=403, detail="You can only update courses where you are the instructor.")
 
-        # Branch Manager permission check
+        # Branch Manager permission check — full edit for courses assigned to managed branches
         elif current_user["role"] == UserRole.BRANCH_MANAGER:
-            # Check if this course is assigned to any branch managed by this branch manager
-            manager_id = current_user["id"]
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Find branches managed by this branch manager
-            bm_managed_branches = await db.branches.find({"manager_id": manager_id, "is_active": True}).to_list(length=None)
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            bm_managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
 
             if not bm_managed_branches:
                 raise HTTPException(status_code=403, detail="You don't manage any branches.")
 
-            # Check if the course is assigned to any of the managed branches
             course_assigned_to_managed_branch = False
             for branch in bm_managed_branches:
                 assigned_courses = branch.get("assignments", {}).get("courses", [])
@@ -588,47 +789,16 @@ class CourseController:
                     course_assigned_to_managed_branch = True
                     break
 
-            if not course_assigned_to_managed_branch:
+            is_creator = (
+                existing_course.get("created_by") == current_user.get("id") or
+                (
+                    str(existing_course.get("created_by_role") or "").lower() == "branch_manager"
+                    and allowed_ids
+                    and any(bid in (existing_course.get("branch_ids") or []) for bid in allowed_ids)
+                )
+            )
+            if not course_assigned_to_managed_branch and not is_creator:
                 raise HTTPException(status_code=403, detail="You can only update courses assigned to branches you manage.")
-
-        # Branch managers may only merge branch-specific fees (branch_pricing) for their branches
-        if current_user["role"] == UserRole.BRANCH_MANAGER:
-            managed_branches = bm_managed_branches or []
-            managed_ids = {b["id"] for b in managed_branches}
-            raw = course_update.dict(exclude_unset=True)
-            if not raw:
-                raise HTTPException(status_code=400, detail="No update data provided")
-            pricing = raw.get("pricing")
-            if not isinstance(pricing, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Branch managers can only update branch-specific fees. Send pricing.branch_prices for your branch.",
-                )
-            branch_prices = pricing.get("branch_prices") or []
-            delta_bp = _expand_branch_prices_to_branch_pricing(branch_prices)
-            if not delta_bp:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide at least one branch fee in pricing.branch_prices for your branch.",
-                )
-            for bid in delta_bp.keys():
-                if bid not in managed_ids:
-                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
-                branch_doc = next((b for b in managed_branches if b["id"] == bid), None)
-                if not branch_doc:
-                    raise HTTPException(status_code=403, detail=f"Cannot set fees for branch {bid}")
-                assigned = branch_doc.get("assignments", {}).get("courses", [])
-                if course_id not in assigned:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="This course is not assigned to that branch.",
-                    )
-            merged_bp = _merge_branch_pricing_delta(existing_course.get("branch_pricing"), delta_bp)
-            update_data = {"branch_pricing": merged_bp, "updated_at": datetime.utcnow()}
-            result = await db.courses.update_one({"id": course_id}, {"$set": update_data})
-            if result.matched_count == 0:
-                raise HTTPException(status_code=404, detail="Course not found")
-            return {"message": "Course updated successfully"}
 
         update_data = {k: v for k, v in course_update.dict(exclude_unset=True).items()}
         if not update_data:
@@ -644,9 +814,16 @@ class CourseController:
                 raise HTTPException(status_code=400, detail=f"A course with the name '{update_data['title']}' already exists")
 
         if "category_id" in update_data or "sub_category" in update_data:
+            from utils.partner_tenant import assert_tenant_doc_access
+
             cat_id = update_data.get("category_id") or existing_course.get("category_id")
             sub_id = update_data["sub_category"] if "sub_category" in update_data else existing_course.get("sub_category")
             cat_id, sub_id = await assert_course_hierarchy(db, cat_id, sub_id)
+            cat_doc = await db.categories.find_one({"id": cat_id})
+            assert_tenant_doc_access(cat_doc, current_user, entity="category")
+            if sub_id:
+                sub_doc = await db.categories.find_one({"id": sub_id})
+                assert_tenant_doc_access(sub_doc, current_user, entity="category")
             update_data["category_id"] = cat_id
             update_data["sub_category"] = sub_id
 
@@ -740,6 +917,43 @@ class CourseController:
         return {"message": "Course updated successfully"}
 
     @staticmethod
+    def _enrollment_is_completed(enrollment: dict) -> bool:
+        """
+        Completed for course stats:
+        - explicit status completed, or progress >= 100
+        - enrollment period finished (end_date over)
+        - inactive enrollment that was not cancelled
+        Cancelled / superseded rows are not completed.
+        """
+        if enrollment.get("superseded_by_enrollment_id"):
+            return False
+
+        status = str(enrollment.get("status") or "").strip().lower()
+        payment_status = str(enrollment.get("payment_status") or "").strip().lower()
+        if status in {"cancelled", "canceled"} or payment_status in {"cancelled", "canceled"}:
+            return False
+
+        if status == "completed":
+            return True
+
+        progress = enrollment.get("progress_percent")
+        if progress is None:
+            progress = enrollment.get("progress")
+        try:
+            if progress is not None and float(progress) >= 100:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        if is_subscription_period_over(enrollment.get("end_date")):
+            return True
+
+        if enrollment.get("is_active") is False:
+            return True
+
+        return False
+
+    @staticmethod
     async def get_course_stats(
         course_id: str,
         current_user: dict = None
@@ -753,11 +967,32 @@ class CourseController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
-        active_enrollments = await db.enrollments.count_documents({"course_id": course_id, "is_active": True})
+        enrollments = await db.enrollments.find({"course_id": course_id}).to_list(length=None)
+        # Prefer current rows; ignore superseded renewals so totals stay accurate
+        current_rows = [
+            e for e in enrollments
+            if not e.get("superseded_by_enrollment_id")
+        ]
+        if not current_rows:
+            current_rows = enrollments
+
+        student_ids = {e.get("student_id") for e in current_rows if e.get("student_id")}
+        completed_student_ids = {
+            e.get("student_id")
+            for e in current_rows
+            if e.get("student_id") and CourseController._enrollment_is_completed(e)
+        }
+        active_enrollments = sum(1 for e in current_rows if e.get("is_active", True))
+        total_enrolled = len(student_ids)
+        completed = len(completed_student_ids)
+        completion_rate = int(round((completed / total_enrolled) * 100)) if total_enrolled else 0
 
         stats = {
             "course_details": serialize_doc(course),
-            "active_enrollments": active_enrollments
+            "total_enrolled": total_enrolled,
+            "active_enrollments": active_enrollments,
+            "completed": completed,
+            "completion_rate": completion_rate,
         }
         return stats
 
@@ -1174,8 +1409,8 @@ class CourseController:
                     "fee_per_duration": pricing.get("fee_per_duration"),
                 }
             # Live prices come from super-admin batch setup, not leftover course catalog amounts.
-            branch_batches = _public_branch_batches_for_course(
-                branch, serialized.get("id"), coach_names
+            branch_batches = await _public_branch_batches_for_course(
+                branch, serialized.get("id"), coach_names, db=db
             )
             live_fpd: dict = {}
             live_amounts = []

@@ -21,14 +21,23 @@ def make_code(value: str, max_len: int = 12) -> str:
     return raw[:max_len]
 
 
-async def unique_slug(collection, base: str, exclude_id: Optional[str] = None) -> str:
+async def unique_slug(
+    collection,
+    base: str,
+    exclude_id: Optional[str] = None,
+    scope: Optional[dict] = None,
+) -> str:
+    from utils.partner_tenant import merge_and_clause
+
     slug = slugify(base)
     candidate = slug
     n = 2
     while True:
-        query = {"slug": candidate}
+        query: dict = {"slug": candidate}
         if exclude_id:
             query["id"] = {"$ne": exclude_id}
+        if scope:
+            query = merge_and_clause(query, scope)
         existing = await collection.find_one(query)
         if not existing:
             return candidate
@@ -38,14 +47,23 @@ async def unique_slug(collection, base: str, exclude_id: Optional[str] = None) -
             return f"{slug}-{n}"
 
 
-async def unique_code(collection, base: str, exclude_id: Optional[str] = None) -> str:
+async def unique_code(
+    collection,
+    base: str,
+    exclude_id: Optional[str] = None,
+    scope: Optional[dict] = None,
+) -> str:
+    from utils.partner_tenant import merge_and_clause
+
     code = make_code(base)
     candidate = code
     n = 2
     while True:
-        query = {"code": candidate}
+        query: dict = {"code": candidate}
         if exclude_id:
             query["id"] = {"$ne": exclude_id}
+        if scope:
+            query = merge_and_clause(query, scope)
         existing = await collection.find_one(query)
         if not existing:
             return candidate

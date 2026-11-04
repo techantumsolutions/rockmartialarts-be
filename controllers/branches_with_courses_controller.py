@@ -5,6 +5,7 @@ from datetime import datetime
 from models.user_models import UserRole
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.branch_courses import available_course_ids_for_branch, unique_course_ids
 
 class BranchesWithCoursesController:
     @staticmethod
@@ -37,13 +38,16 @@ class BranchesWithCoursesController:
         # Apply role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
-            # Branch managers can only access branches they manage
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_assigned_branch_ids_for_user
 
-            # Find all branches managed by this branch manager
-            managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
+            # This endpoint supplies branch filter options, so return every branch
+            # assigned to the manager rather than only the active report branch.
+            allowed_ids = await get_assigned_branch_ids_for_user(db, current_user)
+            managed_branches = (
+                await db.branches.find({"id": {"$in": allowed_ids}}).to_list(length=None)
+                if allowed_ids
+                else []
+            )
 
             if not managed_branches:
                 return {
@@ -126,21 +130,63 @@ class BranchesWithCoursesController:
         for branch in branches:
             branch_id_current = branch["id"]
             
-            # Get courses assigned to this branch
-            course_ids = branch.get("assignments", {}).get("courses", [])
+            # Branch-admin filter options include current branch-course mappings
+            # and legacy course names; other roles retain the existing ID lookup.
+            if current_role == "branch_manager":
+                course_ids = await available_course_ids_for_branch(db, branch)
+                course_mappings = await db.branch_courses.find(
+                    {"branch_id": branch_id_current}
+                ).to_list(length=500)
+                course_ids = unique_course_ids(
+                    course_ids
+                    + [
+                        str(mapping["course_id"])
+                        for mapping in course_mappings
+                        if mapping.get("course_id")
+                        and mapping.get("is_available", True) is not False
+                    ]
+                )
+                offered_course_names = unique_course_ids(
+                    (branch.get("operational_details") or {}).get("courses_offered")
+                )
+            else:
+                course_ids = branch.get("assignments", {}).get("courses", [])
+                offered_course_names = []
             branch_courses = []
-            
-            if course_ids:
-                courses_cursor = db.courses.find({"id": {"$in": course_ids}})
+
+            if course_ids or offered_course_names:
+                if current_role == "branch_manager":
+                    course_query = {
+                        "$or": [
+                            {"id": {"$in": unique_course_ids(course_ids + offered_course_names)}},
+                            {"title": {"$in": offered_course_names}},
+                        ]
+                    }
+                else:
+                    course_query = {"id": {"$in": course_ids}}
+                courses_cursor = db.courses.find(course_query)
                 courses = await courses_cursor.to_list(length=None)
+                unavailable_course_ids = set()
+                if current_role == "branch_manager":
+                    unavailable_mappings = await db.branch_courses.find(
+                        {"branch_id": branch_id_current, "is_available": False}
+                    ).to_list(length=None)
+                    unavailable_course_ids = {
+                        mapping.get("course_id")
+                        for mapping in unavailable_mappings
+                        if mapping.get("course_id")
+                    }
                 
                 for course in courses:
                     # Serialize and structure course data
                     course_data = serialize_doc(course)
+                    course_id = course_data.get("id", "")
+                    if current_role == "branch_manager" and course_id not in course_ids and course_id in unavailable_course_ids:
+                        continue
                     
                     # Ensure all required fields are present with defaults
                     structured_course = {
-                        "id": course_data.get("id", ""),
+                        "id": course_id,
                         "title": course_data.get("title", ""),
                         "name": course_data.get("title", ""),  # Use title as name fallback
                         "code": course_data.get("code", ""),
@@ -251,15 +297,14 @@ class BranchesWithCoursesController:
         # Apply role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
-            # Branch managers can only access branches they manage
-            branch_manager_id = current_user.get("id")
-            if not branch_manager_id:
-                raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # Verify this branch is managed by the current branch manager
-            managed_branch = await db.branches.find_one({"id": branch_id, "manager_id": branch_manager_id, "is_active": True})
-            if not managed_branch:
+            allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if branch_id not in allowed_ids:
                 raise HTTPException(status_code=403, detail="You don't have permission to access this branch")
+            managed_branch = await db.branches.find_one({"id": branch_id})
+            if not managed_branch:
+                raise HTTPException(status_code=404, detail="Branch not found")
         else:
             # For other roles, just check if branch exists
             managed_branch = await db.branches.find_one({"id": branch_id})

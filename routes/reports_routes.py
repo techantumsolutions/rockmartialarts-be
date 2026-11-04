@@ -482,12 +482,8 @@ async def list_renewal_reports(
         end_date=end_date,
         skip=skip,
         limit=limit,
-        extra_query={
-            "$or": [
-                {"is_renewal": True},
-                {"payment_type": {"$regex": "renew", "$options": "i"}},
-            ]
-        },
+        # Plain equality — Atlas on this cluster rejects $or/$regex on payments.
+        extra_query={"is_renewal": True},
     )
 
 
@@ -507,15 +503,10 @@ async def export_renewal_reports(
         start_date=start_date,
         end_date=end_date,
         format=format,
-        fieldnames=["id", "student_id", "amount", "payment_status", "payment_date", "is_renewal"],
+        fieldnames=["id", "student_name", "course_name", "branch_name", "amount", "payment_status", "payment_date", "is_renewal"],
         report_type="renewals",
         background_tasks=background_tasks,
-        extra_query={
-            "$or": [
-                {"is_renewal": True},
-                {"payment_type": {"$regex": "renew", "$options": "i"}},
-            ]
-        },
+        extra_query={"is_renewal": True},
     )
 
 

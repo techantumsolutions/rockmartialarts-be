@@ -23,6 +23,7 @@ def profile_summary(user: Dict[str, Any]) -> Dict[str, Any]:
         "last_name": user.get("last_name"),
         "relationship": user.get("relationship") or "self",
         "profile_image": user.get("profile_image") or user.get("profile_photo") or user.get("photo"),
+        "is_active": user.get("is_active") is not False,
     }
 
 
@@ -82,6 +83,16 @@ async def student_on_same_account(
         if legacy:
             return True
     return False
+
+
+STUDENT_DEACTIVATED_MESSAGE = "This student has been deactivated by the admin."
+
+
+async def is_student_deactivated(db, student_id: Optional[str]) -> bool:
+    if not student_id:
+        return False
+    doc = await db.users.find_one({"id": student_id}, {"is_active": 1})
+    return bool(doc) and doc.get("is_active") is False
 
 
 async def ensure_account_indexes(db) -> None:
@@ -265,4 +276,5 @@ def student_login_user_payload(user: Dict[str, Any]) -> Dict[str, Any]:
         "profile_image": profile_img,
         "account_id": user.get("account_id"),
         "relationship": user.get("relationship") or "self",
+        "is_active": user.get("is_active") is not False,
     }

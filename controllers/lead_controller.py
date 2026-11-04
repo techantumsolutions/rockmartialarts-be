@@ -115,6 +115,7 @@ class LeadController:
         sort: Optional[str] = None,
         coach_assignment_status: Optional[str] = None,
         unassigned_coach: bool = False,
+        priority: Optional[str] = None,
         current_user: Optional[dict] = None,
     ) -> Dict[str, Any]:
         try:
@@ -130,6 +131,7 @@ class LeadController:
                 sort=sort,
                 coach_assignment_status=coach_assignment_status,
                 unassigned_coach=unassigned_coach,
+                priority=priority,
                 current_user=current_user,
             )
             # Keep response shape: leads as LeadResponse-compatible dicts
@@ -190,6 +192,7 @@ class LeadController:
                 lead_id,
                 status=body.status,
                 note=body.note,
+                priority=body.priority,
                 current_user=current_user,
             )
             return LeadResponse(**data)

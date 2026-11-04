@@ -62,27 +62,51 @@ async def get_attendance_reports(
     branch_id: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, description="present | absent | late"),
+    method: Optional[str] = Query(None, description="manual | biometric | ..."),
     limit: Optional[int] = Query(None, ge=1, le=1000),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get attendance reports with filtering"""
     return await AttendanceController.get_attendance_reports(
-        student_id, coach_id, course_id, branch_id, start_date, end_date, current_user, limit
+        student_id=student_id,
+        coach_id=coach_id,
+        course_id=course_id,
+        branch_id=branch_id,
+        start_date=start_date,
+        end_date=end_date,
+        current_user=current_user,
+        limit=limit,
+        status=status,
+        method=method,
     )
 
 @router.get("/students")
 async def get_student_attendance(
     branch_id: Optional[str] = Query(None),
     course_id: Optional[str] = Query(None),
+    batch_ref: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None),
     date: Optional[str] = Query(None, description="Single date in ISO format (YYYY-MM-DD)"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get student attendance data"""
+    effective_batch = batch_ref or batch_id
     return await AttendanceController.get_student_attendance(
-        branch_id, course_id, date, start_date, end_date, current_user
+        branch_id, course_id, date, start_date, end_date, current_user, batch_ref=effective_batch
     )
+
+@router.get("/batches")
+async def get_attendance_course_batches(
+    course_id: str = Query(..., description="Course ID to fetch batches for"),
+    branch_id: Optional[str] = Query(None, description="Optional branch ID"),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+):
+    """Fetch batches for a course (at the branch or across branches)"""
+    return await AttendanceController.get_course_batches(course_id, branch_id, current_user)
+
 
 @router.get("/coaches")
 async def get_coach_attendance(
@@ -141,24 +165,34 @@ async def get_unmatched_biometric_punches(
     limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
         )
     ),
 ):
     """M09-S03: list unmatched biometric punches for Admin review."""
-    return await list_unmatched(skip=skip, limit=limit)
+    return await list_unmatched(skip=skip, limit=limit, current_user=current_user)
 
 
 @router.get("/ingest/stats")
 async def get_biometric_ingest_stats(
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
         )
     ),
 ):
     """M09-S03: ingest summary stats."""
-    return await ingest_stats()
+    return await ingest_stats(current_user=current_user)
 
 
 @router.get("/export")
@@ -204,6 +238,27 @@ async def get_coach_students_attendance(
 ):
     """Get students assigned to a specific coach with their attendance for a specific date"""
     return await AttendanceController.get_coach_students_attendance(coach_id, date, current_user)
+
+@router.get("/coach/my-attendance")
+async def get_my_coach_attendance(
+    coach_id: Optional[str] = Query(None),
+    month: Optional[int] = Query(None),
+    year: Optional[int] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+):
+    """Get attendance records and stats for the logged-in coach (or specified coach for admins)"""
+    return await AttendanceController.get_my_coach_attendance(
+        current_user=current_user,
+        coach_id=coach_id,
+        month=month,
+        year=year,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+    )
 
 @router.post("/coach/mark")
 async def mark_coach_attendance(

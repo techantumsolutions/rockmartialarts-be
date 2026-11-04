@@ -32,13 +32,14 @@ from utils.collaboration_partner import (
 
 
 async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
-    """Add trainer_name to each batch in assignments.course_schedule (mutates branch)."""
+    """Add trainer_name and batch capacity to each batch in assignments.course_schedule (mutates branch)."""
     asg = branch.get("assignments")
     if not isinstance(asg, dict):
         return
     sched = asg.get("course_schedule")
     if not isinstance(sched, list) or not sched:
         return
+    branch_id = str(branch.get("id") or "").strip()
     ids = set()
     for entry in sched:
         if not isinstance(entry, dict):
@@ -49,22 +50,35 @@ async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
             cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
             if cid:
                 ids.add(cid)
-    if not ids:
-        return
-    users = await db.users.find({"id": {"$in": list(ids)}}).to_list(length=300)
     name_map = {}
-    for u in users:
-        fn = (u.get("first_name") or "").strip()
-        ln = (u.get("last_name") or "").strip()
-        name_map[u["id"]] = (
-            f"{fn} {ln}".strip()
-            or (u.get("full_name") or "").strip()
-            or (u.get("email") or "").strip()
-            or "Trainer"
-        )
+    if ids:
+        users = await db.users.find({"id": {"$in": list(ids)}}).to_list(length=300)
+        for u in users:
+            fn = (u.get("first_name") or "").strip()
+            ln = (u.get("last_name") or "").strip()
+            name_map[u["id"]] = (
+                f"{fn} {ln}".strip()
+                or (u.get("full_name") or "").strip()
+                or (u.get("email") or "").strip()
+                or "Trainer"
+            )
+        missing_ids = [i for i in ids if i not in name_map]
+        if missing_ids:
+            coaches = await db.coaches.find({"id": {"$in": missing_ids}}).to_list(length=300)
+            for c in coaches:
+                pinfo = c.get("personal_info") or {}
+                fn = (pinfo.get("first_name") or "").strip()
+                ln = (pinfo.get("last_name") or "").strip()
+                name_map[c["id"]] = (
+                    (c.get("full_name") or "").strip()
+                    or f"{fn} {ln}".strip()
+                    or ((c.get("contact_info") or {}).get("email") or "").strip()
+                    or "Trainer"
+                )
     for entry in sched:
         if not isinstance(entry, dict):
             continue
+        cid_entry = str(entry.get("course_id") or entry.get("courseId") or "").strip()
         batches = entry.get("batches")
         if not isinstance(batches, list):
             continue
@@ -74,6 +88,27 @@ async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
             cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
             if cid and name_map.get(cid):
                 b["trainer_name"] = name_map[cid]
+
+            # Capacity enrichment
+            bid = str(b.get("batch_id") or b.get("id") or "").strip()
+            max_stu = b.get("max_students")
+            if max_stu is not None:
+                try:
+                    max_stu = int(max_stu)
+                except (ValueError, TypeError):
+                    max_stu = None
+            b["max_students"] = max_stu
+
+            active_count = 0
+            if branch_id and cid_entry and bid:
+                active_count = await db.enrollments.count_documents({
+                    "branch_id": branch_id,
+                    "course_id": cid_entry,
+                    "$or": [{"batch_id": bid}, {"batch_ref": bid}, {"slot_id": bid}],
+                    "is_active": True
+                })
+            b["enrolled_students"] = active_count
+            b["is_full"] = bool(max_stu is not None and max_stu > 0 and active_count >= max_stu)
 
 
 def _pydantic_dump(model) -> dict:
@@ -117,6 +152,12 @@ class BranchController:
         # Store the branch with nested structure exactly as provided
         branch_dict = branch.dict()
         apply_collaboration_flag(branch_dict, flag)
+
+        from utils.partner_tenant import stamp_tenant, require_partner_org_id, is_partner_super_admin
+
+        if is_partner_super_admin(current_user):
+            require_partner_org_id(current_user)
+            stamp_tenant(branch_dict, current_user)
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
@@ -143,15 +184,14 @@ class BranchController:
         current_role = current_user.get("role")
 
         if current_role == "branch_manager":
-            # Branch managers can only see branches they manage
-            # The unified auth system populates managed_branches array
-            managed_branches = current_user.get("managed_branches", [])
+            # Full assigned list (not the selected branch) so the header switch can list them.
+            from utils.student_status_service import get_assigned_branch_ids_for_user
+
+            managed_branches = await get_assigned_branch_ids_for_user(db, current_user)
 
             if managed_branches:
-                # Filter to only show branches managed by this branch manager
                 filter_query["id"] = {"$in": managed_branches}
             else:
-                # If no branches are managed, return empty result
                 return {
                     "branches": [],
                     "total_count": 0,
@@ -159,10 +199,23 @@ class BranchController:
                     "limit": limit,
                     "message": "No branches assigned to this manager"
                 }
+        from utils.partner_tenant import apply_tenant_filter
+
+        filter_query = apply_tenant_filter(filter_query, current_user)
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
+        for b in branches:
+            b_info = b.get("branch") if isinstance(b.get("branch"), dict) else {}
+            if not b.get("name") and b_info.get("name"):
+                b["name"] = b_info.get("name")
+            if not b.get("code") and b_info.get("code"):
+                b["code"] = b_info.get("code")
+
         if not include_stats:
+            for branch in branches:
+                await _enrich_course_schedule_trainers(db, branch)
+                enrich_collaboration_flag(branch)
             return {"branches": serialize_doc(branches)}
 
         # Enhance branches with coach and student counts
@@ -208,6 +261,7 @@ class BranchController:
                     "active_courses": len(branch.get("assignments", {}).get("courses", []))
                 }
             }
+            await _enrich_course_schedule_trainers(db, branch_with_stats)
             enrich_collaboration_flag(branch_with_stats)
             enhanced_branches.append(branch_with_stats)
 
@@ -492,6 +546,10 @@ class BranchController:
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
 
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(branch, current_user, entity="branch")
+
         # Count coaches assigned to this branch
         coach_count = await db.coaches.count_documents({
             "branch_id": branch_id,
@@ -529,6 +587,12 @@ class BranchController:
                 "active_courses": len(branch.get("assignments", {}).get("courses", []))
             }
         }
+
+        b_info = branch_with_stats.get("branch") if isinstance(branch_with_stats.get("branch"), dict) else {}
+        if not branch_with_stats.get("name") and b_info.get("name"):
+            branch_with_stats["name"] = b_info.get("name")
+        if not branch_with_stats.get("code") and b_info.get("code"):
+            branch_with_stats["code"] = b_info.get("code")
 
         await _enrich_course_schedule_trainers(db, branch_with_stats)
         enrich_collaboration_flag(branch_with_stats)
@@ -672,8 +736,15 @@ class BranchController:
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid user role")
         
+        existing_branch_for_tenant = await db.branches.find_one({"id": branch_id})
+        if not existing_branch_for_tenant:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        from utils.partner_tenant import assert_tenant_doc_access
+
+        assert_tenant_doc_access(existing_branch_for_tenant, current_user, entity="branch")
+
         # Branch Manager permission check
-        if current_role == "branch_manager":
+        if current_role == "branch_manager" or current_role == UserRole.BRANCH_MANAGER:
             # Branch managers can only update branches they manage
             managed_branches = current_user.get("managed_branches", [])
             if branch_id not in managed_branches:
@@ -682,9 +753,7 @@ class BranchController:
         # Coach Admin permission check
         elif current_role == UserRole.COACH_ADMIN:
             # For nested structure, check if user is admin of this branch
-            existing_branch = await db.branches.find_one({"id": branch_id})
-            if not existing_branch:
-                raise HTTPException(status_code=404, detail="Branch not found")
+            existing_branch = existing_branch_for_tenant
             
             # Check if current user is in the branch_admins list
             branch_admins = existing_branch.get("assignments", {}).get("branch_admins", [])
@@ -762,6 +831,18 @@ class BranchController:
         # would erase saved batch data — carry forward the previous schedule.
         if "assignments" in update_data and isinstance(update_data["assignments"], dict):
             new_asg = update_data["assignments"]
+            if "course_schedule" in new_asg:
+                from utils.coach_batch_schedule import assert_batch_coach_assignments
+
+                branch_payload = update_data.get("branch") if isinstance(update_data.get("branch"), dict) else {}
+                existing_branch = existing_for_geo.get("branch") if isinstance(existing_for_geo.get("branch"), dict) else {}
+                branch_name = branch_payload.get("name") or existing_branch.get("name") or "Branch"
+                await assert_batch_coach_assignments(
+                    db,
+                    branch_id,
+                    branch_name,
+                    new_asg.get("course_schedule") or [],
+                )
             if "course_schedule" not in new_asg:
                 prev_doc = await db.branches.find_one(
                     {"id": branch_id},

@@ -10,17 +10,28 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from bson import Binary
 from fastapi import HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from models.course_syllabus_models import CourseSyllabusMetaUpdate
 from utils.course_syllabus_storage import (
+    load_syllabus_bytes,
+    persist_syllabus_file,
     read_and_validate_pdf,
     resolve_syllabus_path,
-    write_syllabus_bytes,
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
+
+# BSON document limit is 16MB; keep embedded PDF under that with headroom.
+_MAX_EMBEDDED_PDF_BYTES = 15 * 1024 * 1024
+
+
+def _optional_embedded_pdf(data: bytes) -> Optional[Binary]:
+    if not data or len(data) > _MAX_EMBEDDED_PDF_BYTES:
+        return None
+    return Binary(data)
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +110,9 @@ async def _deactivate_others(
 
 def _public_row(doc: dict, course: Optional[dict] = None) -> dict:
     row = serialize_doc(doc)
-    # Never expose absolute disk paths
+    # Never expose absolute disk paths or raw PDF payloads
     row.pop("absolute_path", None)
+    row.pop("file_bytes", None)
     if course:
         row["course_name"] = course.get("title") or course.get("name") or course.get("id")
     return row
@@ -176,10 +188,12 @@ async def create_syllabus(
     course = await _require_course(db, course_id)
     parsed = await read_and_validate_pdf(file)
     version = await _next_version(db, course_id)
-    storage_key = write_syllabus_bytes(
+    storage_key, gridfs_id = await persist_syllabus_file(
+        db,
         course_id=course_id,
         stored_filename=parsed["stored_filename"],
         data=parsed["data"],
+        sha256=parsed["sha256"],
     )
 
     now = datetime.utcnow()
@@ -197,6 +211,7 @@ async def create_syllabus(
         "content_type": parsed["content_type"],
         "size_bytes": parsed["size_bytes"],
         "storage_key": storage_key,
+        "gridfs_id": gridfs_id,
         "sha256": parsed["sha256"],
         "effective_from": now if activate else None,
         "effective_to": None,
@@ -209,6 +224,9 @@ async def create_syllabus(
         "created_at": now,
         "updated_at": now,
     }
+    embedded = _optional_embedded_pdf(parsed["data"])
+    if embedded is not None:
+        doc["file_bytes"] = embedded
     await db[COL].insert_one(doc)
 
     if activate:
@@ -233,6 +251,17 @@ async def create_syllabus(
     }
 
 
+def _syllabus_file_missing(doc: dict) -> bool:
+    """True when this host cannot serve the PDF (no disk / embedded / GridFS)."""
+    if doc.get("file_bytes") is not None or doc.get("gridfs_id"):
+        return False
+    try:
+        resolve_syllabus_path(doc.get("storage_key") or "")
+        return False
+    except HTTPException as exc:
+        return exc.status_code in (404, 400)
+
+
 async def replace_syllabus(
     syllabus_id: str,
     *,
@@ -245,6 +274,9 @@ async def replace_syllabus(
     """
     Upload a new version for the same course. Marks the source row as superseded.
     Keeps historical PDF on disk and in Mongo.
+
+    If the current row's PDF is missing on this host (shared-DB / local-disk mismatch),
+    repairs that same syllabus id in place so student viewer URLs keep working.
     """
     db = get_db()
     if db is None:
@@ -258,11 +290,61 @@ async def replace_syllabus(
     course = await _require_course(db, course_id)
 
     parsed = await read_and_validate_pdf(file)
+
+    # In-place repair for orphaned metadata (DB row without a readable PDF).
+    if _syllabus_file_missing(old):
+        storage_key, gridfs_id = await persist_syllabus_file(
+            db,
+            course_id=course_id,
+            stored_filename=parsed["stored_filename"],
+            data=parsed["data"],
+            sha256=parsed["sha256"],
+        )
+        now = datetime.utcnow()
+        actor = _actor(current_user)
+        patch: Dict[str, Any] = {
+            "title": (title or "").strip() or old.get("title") or f"Syllabus v{old.get('version') or 1}",
+            "notes": (notes or "").strip() or old.get("notes"),
+            "original_filename": parsed["original_filename"],
+            "stored_filename": parsed["stored_filename"],
+            "content_type": parsed["content_type"],
+            "size_bytes": parsed["size_bytes"],
+            "storage_key": storage_key,
+            "gridfs_id": gridfs_id,
+            "sha256": parsed["sha256"],
+            "uploaded_by": actor["id"],
+            "uploaded_by_name": actor["name"],
+            "updated_at": now,
+            "repaired_at": now,
+        }
+        embedded = _optional_embedded_pdf(parsed["data"])
+        if embedded is not None:
+            patch["file_bytes"] = embedded
+        if activate and not old.get("is_active"):
+            await _deactivate_others(db, course_id, except_id=syllabus_id)
+            patch.update(
+                {
+                    "is_active": True,
+                    "activated_by": actor["id"],
+                    "activated_at": now,
+                    "effective_from": now,
+                }
+            )
+        await db[COL].update_one({"id": syllabus_id}, {"$set": patch})
+        updated = await db[COL].find_one({"id": syllabus_id})
+        return {
+            "message": "Syllabus file repaired in place",
+            "syllabus": _public_row(updated, course),
+            "previous_id": syllabus_id,
+        }
+
     version = await _next_version(db, course_id)
-    storage_key = write_syllabus_bytes(
+    storage_key, gridfs_id = await persist_syllabus_file(
+        db,
         course_id=course_id,
         stored_filename=parsed["stored_filename"],
         data=parsed["data"],
+        sha256=parsed["sha256"],
     )
 
     now = datetime.utcnow()
@@ -280,6 +362,7 @@ async def replace_syllabus(
         "content_type": parsed["content_type"],
         "size_bytes": parsed["size_bytes"],
         "storage_key": storage_key,
+        "gridfs_id": gridfs_id,
         "sha256": parsed["sha256"],
         "effective_from": None,
         "effective_to": None,
@@ -293,6 +376,9 @@ async def replace_syllabus(
         "updated_at": now,
         "replaces_id": syllabus_id,
     }
+    embedded = _optional_embedded_pdf(parsed["data"])
+    if embedded is not None:
+        new_doc["file_bytes"] = embedded
     await db[COL].insert_one(new_doc)
 
     await db[COL].update_one(
@@ -429,10 +515,22 @@ async def update_syllabus_meta(
     return {"message": "Syllabus updated", "syllabus": _public_row(updated, course)}
 
 
-async def stream_syllabus_file(syllabus_id: str) -> FileResponse:
+_STREAM_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, private",
+    "Pragma": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+    "X-Robots-Tag": "noindex, nofollow",
+    # Hints for intermediaries; browser save/print cannot be fully blocked
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Content-Disposition": 'inline; filename="syllabus.pdf"',
+}
+
+
+async def stream_syllabus_file(syllabus_id: str):
     """
     Authenticated inline PDF stream (private storage).
     M11-S03: discourage caching / attachment; no public URL.
+    Prefers local disk; falls back to GridFS (shared Atlas) and rehydrates disk.
     """
     db = get_db()
     if db is None:
@@ -440,19 +538,31 @@ async def stream_syllabus_file(syllabus_id: str) -> FileResponse:
     doc = await db[COL].find_one({"id": syllabus_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Syllabus not found")
-    path = resolve_syllabus_path(doc.get("storage_key") or "")
-    # Use a generic inline name — avoid suggesting "download as ..."
-    return FileResponse(
-        path,
+
+    # Fast path: serve from disk when present
+    try:
+        path = resolve_syllabus_path(doc.get("storage_key") or "")
+        return FileResponse(
+            path,
+            media_type="application/pdf",
+            filename="syllabus.pdf",
+            content_disposition_type="inline",
+            headers={
+                "Cache-Control": _STREAM_HEADERS["Cache-Control"],
+                "Pragma": _STREAM_HEADERS["Pragma"],
+                "X-Content-Type-Options": _STREAM_HEADERS["X-Content-Type-Options"],
+                "X-Robots-Tag": _STREAM_HEADERS["X-Robots-Tag"],
+                "Content-Security-Policy": _STREAM_HEADERS["Content-Security-Policy"],
+            },
+        )
+    except HTTPException as disk_exc:
+        if disk_exc.status_code not in (404, 400):
+            raise
+
+    data = await load_syllabus_bytes(db, doc)
+    # Persist gridfs_id if we recovered only via legacy paths in future
+    return Response(
+        content=data,
         media_type="application/pdf",
-        filename="syllabus.pdf",
-        content_disposition_type="inline",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, private",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-            "X-Robots-Tag": "noindex, nofollow",
-            # Hints for intermediaries; browser save/print cannot be fully blocked
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-        },
+        headers=_STREAM_HEADERS,
     )

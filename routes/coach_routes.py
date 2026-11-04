@@ -9,6 +9,7 @@ from models.coach_models import (
     CoachForgotPassword,
     CoachResetPassword,
     CoachRegistrationCreate,
+    CreateCoachRegistrationOrderBody,
     CoachApprovalActionBody,
     CoachRejectBody,
     CoachActiveStatusBody,
@@ -19,6 +20,7 @@ from utils.unified_auth import (
     require_role_unified,
 )
 from utils.coach_registration_service import (
+    create_coach_registration_order,
     get_coach_registration_options,
     register_coach,
     upload_registration_photo,
@@ -67,6 +69,14 @@ async def coach_registration_options():
 async def coach_registration_photo(file: UploadFile = File(...)):
     """M14-S01 public — image-only photo upload for coach registration."""
     return await upload_registration_photo(file)
+
+
+@router.post("/register/create-order")
+async def coach_registration_create_order(
+    body: Optional[CreateCoachRegistrationOrderBody] = None,
+):
+    """M14-S01 public — create Razorpay order for coach registration checkout."""
+    return await create_coach_registration_order(body)
 
 
 @router.post("/register", status_code=201)
@@ -191,11 +201,20 @@ async def get_coaches(
     approval_status: Optional[str] = Query(
         None, description="M14 additive: pending | approved | rejected"
     ),
+    branch_id: Optional[str] = Query(
+        None, description="Only coaches assigned to this branch"
+    ),
+    course_id: Optional[str] = Query(
+        None, description="Only coaches assigned to this course"
+    ),
+    all_tenants: bool = Query(
+        False, description="Super admin only: include coaches across all partner tenants"
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get coaches with filtering options"""
     return await CoachController.get_coaches(
-        skip, limit, active_only, area_of_expertise, current_user, approval_status
+        skip, limit, active_only, area_of_expertise, current_user, approval_status, branch_id, course_id, all_tenants
     )
 
 @router.get("/me")

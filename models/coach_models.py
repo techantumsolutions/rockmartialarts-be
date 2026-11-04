@@ -59,6 +59,12 @@ class CoachApprovalStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class CreateCoachRegistrationOrderBody(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+
 class CoachRegistrationCreate(BaseModel):
     """
     M14-S01 public self-registration payload.
@@ -72,7 +78,7 @@ class CoachRegistrationCreate(BaseModel):
     email: EmailStr
     country_code: str = Field(default="+91", max_length=8)
     phone: str = Field(..., min_length=5, max_length=20)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
     address: str = Field(..., min_length=1, max_length=300)
     area: str = Field(default="", max_length=120)
     city: str = Field(..., min_length=1, max_length=120)
@@ -96,6 +102,9 @@ class CoachRegistrationCreate(BaseModel):
     user_id: Optional[str] = Field(
         default=None, max_length=64, description="Optional linked user id"
     )
+    razorpay_payment_id: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 class CoachCreate(BaseModel):
@@ -210,9 +219,10 @@ class CoachApprovalActionBody(BaseModel):
 
 
 class CoachRejectBody(BaseModel):
-    """M14-S02 reject action — note recommended for audit."""
+    """M14-S02 reject action — reason required for audit and notification."""
 
     note: Optional[str] = Field(default=None, max_length=1000)
+    reason: Optional[str] = Field(default=None, max_length=1000)
 
 
 class CoachActiveStatusBody(BaseModel):

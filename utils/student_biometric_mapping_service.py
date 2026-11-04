@@ -73,11 +73,31 @@ async def _find_duplicate(
 ) -> Optional[dict]:
     if not value:
         return None
+    # Match exact / trimmed / case-insensitive, and numeric twin (e.g. "1001" vs 1001).
+    candidates: List[Any] = [value, str(value).strip()]
+    stripped = str(value).strip()
+    if stripped.isdigit():
+        try:
+            candidates.append(int(stripped))
+        except (TypeError, ValueError):
+            pass
+    unique_candidates = []
+    seen_c = set()
+    for c in candidates:
+        key = (type(c).__name__, c)
+        if key in seen_c:
+            continue
+        seen_c.add(key)
+        unique_candidates.append(c)
+
     return await db.users.find_one(
         {
             "role": "student",
-            field: value,
             "id": {"$ne": exclude_student_id},
+            "$or": [
+                {field: {"$in": unique_candidates}},
+                {field: {"$regex": f"^{re.escape(stripped)}$", "$options": "i"}},
+            ],
         },
         {"id": 1, "full_name": 1, "first_name": 1, "last_name": 1, "email": 1, "biometric_id": 1, "essl_user_id": 1},
     )
@@ -233,6 +253,26 @@ async def list_mappings(
                 detail="You cannot list biometric mappings for another branch.",
             )
         scope_branches = [branch_id] if branch_id else managed
+        scoped_ids = await db.enrollments.distinct("student_id", {"branch_id": {"$in": scope_branches}})
+        direct = await db.users.distinct(
+            "id",
+            {"role": "student", "branch_id": {"$in": scope_branches}},
+        )
+        allowed = list({*(scoped_ids or []), *(direct or [])})
+        if not allowed:
+            return {"students": [], "total": 0, "count": 0, "message": "No students in scope"}
+        clauses.append({"id": {"$in": allowed}})
+    elif role == "partner_super_admin":
+        from utils.partner_tenant import assert_partner_owns_branch, partner_branch_ids
+
+        p_bids = await partner_branch_ids(db, current_user) or []
+        if branch_id:
+            await assert_partner_owns_branch(db, current_user, branch_id)
+            scope_branches = [branch_id]
+        else:
+            scope_branches = list(p_bids)
+        if not scope_branches:
+            return {"students": [], "total": 0, "count": 0, "message": "No branches in organization"}
         scoped_ids = await db.enrollments.distinct("student_id", {"branch_id": {"$in": scope_branches}})
         direct = await db.users.distinct(
             "id",

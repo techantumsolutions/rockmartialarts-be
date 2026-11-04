@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
@@ -153,16 +152,9 @@ async def query_student_report_rows(
     if is_active is not None:
         student_filter["is_active"] = bool(is_active)
 
-    if q and len(str(q).strip()) >= 2:
-        pattern = {"$regex": re.escape(str(q).strip()), "$options": "i"}
-        student_filter["$or"] = [
-            {"full_name": pattern},
-            {"first_name": pattern},
-            {"last_name": pattern},
-            {"email": pattern},
-            {"phone": pattern},
-            {"id": pattern},
-        ]
+    # Text search is applied in Python below. Atlas blocks $regex / $regexMatch
+    # on this cluster, so Mongo regex filters return empty results.
+    search_term = str(q).strip().lower() if q and len(str(q).strip()) >= 2 else ""
 
     start_dt = _parse_iso_date(start_date)
     end_dt = _parse_iso_date(end_date, end_of_day=True)
@@ -212,19 +204,111 @@ async def query_student_report_rows(
     skip = max(0, int(skip or 0))
     limit = max(1, min(int(limit or 50), 10000))
 
-    total = await db.users.count_documents(student_filter)
-    cursor = db.users.find(student_filter).sort("created_at", -1).skip(skip).limit(limit)
-    students = await cursor.to_list(length=limit)
+    def _student_matches_search(doc: Dict[str, Any], term: str) -> bool:
+        if not term:
+            return True
+        haystacks = [
+            doc.get("full_name"),
+            doc.get("first_name"),
+            doc.get("last_name"),
+            doc.get("email"),
+            doc.get("phone"),
+            doc.get("id"),
+            doc.get("student_id"),
+        ]
+        blob = " ".join(str(v) for v in haystacks if v).lower()
+        return term in blob
+
+    # Projection keeps payload small for list/export
+    student_projection = {
+        "id": 1,
+        "full_name": 1,
+        "first_name": 1,
+        "last_name": 1,
+        "email": 1,
+        "phone": 1,
+        "is_active": 1,
+        "gender": 1,
+        "date_of_birth": 1,
+        "created_at": 1,
+        "student_id": 1,
+    }
+
+    if search_term:
+        # Load candidates then filter + paginate in app (Atlas-safe, no $regex)
+        candidates = (
+            await db.users.find(student_filter, student_projection)
+            .sort("created_at", -1)
+            .to_list(length=20000)
+        )
+        matched = [s for s in candidates if _student_matches_search(s, search_term)]
+        total = len(matched)
+        students = matched[skip : skip + limit]
+    else:
+        total = await db.users.count_documents(student_filter)
+        cursor = (
+            db.users.find(student_filter, student_projection)
+            .sort("created_at", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+        students = await cursor.to_list(length=limit)
+
+    # Batch-enrich enrollments / courses / branches (avoids N+1 — export was very slow)
+    student_ids = [s.get("id") for s in students if s.get("id")]
+    enrollments_by_student: Dict[str, List[Dict[str, Any]]] = {sid: [] for sid in student_ids}
+    course_map: Dict[str, Dict[str, Any]] = {}
+    branch_map: Dict[str, Dict[str, Any]] = {}
+
+    if student_ids:
+        all_enrollments = await db.enrollments.find(
+            {"student_id": {"$in": student_ids}},
+            {
+                "student_id": 1,
+                "course_id": 1,
+                "branch_id": 1,
+                "payment_status": 1,
+                "is_active": 1,
+            },
+        ).to_list(length=None)
+        course_ids: List[str] = []
+        branch_ids: List[str] = []
+        seen_courses = set()
+        seen_branches = set()
+        for enrollment in all_enrollments:
+            sid = enrollment.get("student_id")
+            if sid in enrollments_by_student:
+                enrollments_by_student[sid].append(enrollment)
+            cid = enrollment.get("course_id")
+            if cid and cid not in seen_courses:
+                seen_courses.add(cid)
+                course_ids.append(cid)
+            bid = enrollment.get("branch_id")
+            if bid and bid not in seen_branches:
+                seen_branches.add(bid)
+                branch_ids.append(bid)
+
+        if course_ids:
+            course_docs = await db.courses.find(
+                {"id": {"$in": course_ids}},
+                {"id": 1, "name": 1, "title": 1, "code": 1},
+            ).to_list(length=None)
+            course_map = {c.get("id"): c for c in course_docs if c.get("id")}
+        if branch_ids:
+            branch_docs = await db.branches.find(
+                {"id": {"$in": branch_ids}},
+                {"id": 1, "name": 1, "branch.name": 1, "branch.code": 1},
+            ).to_list(length=None)
+            branch_map = {b.get("id"): b for b in branch_docs if b.get("id")}
 
     enriched: List[Dict[str, Any]] = []
     for student in students:
         sid = student.get("id")
-        enrollments = await db.enrollments.find({"student_id": sid}).to_list(length=100)
-        # Prefer active enrollments for display, but keep all for counts
+        enrollments = enrollments_by_student.get(sid, []) if sid else []
         courses: List[Dict[str, Any]] = []
         branches: List[Dict[str, Any]] = []
         for enrollment in enrollments:
-            course = await db.courses.find_one({"id": enrollment.get("course_id")})
+            course = course_map.get(enrollment.get("course_id"))
             if course:
                 courses.append(
                     {
@@ -235,7 +319,7 @@ async def query_student_report_rows(
                         "is_active": enrollment.get("is_active", True),
                     }
                 )
-            branch = await db.branches.find_one({"id": enrollment.get("branch_id")})
+            branch = branch_map.get(enrollment.get("branch_id"))
             if branch:
                 bname = (branch.get("branch") or {}).get("name") or branch.get("name") or "Branch"
                 bid = branch.get("id")

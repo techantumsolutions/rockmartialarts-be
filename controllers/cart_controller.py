@@ -24,9 +24,13 @@ from utils.cart_duplicates import find_exact_duplicate, find_same_course_at_bran
 from models.user_models import UserRole
 from utils.cart_helpers import build_cart_public_payload, recompute_cart_totals
 from utils.discount_engine import compute_cart_promotions_for_cart
-from utils.cart_validation import validate_cart_document
+from utils.cart_validation import cart_addition_blocking_issues, validate_cart_document
 from utils.database import get_db
-from utils.family_accounts import student_on_same_account
+from utils.family_accounts import (
+    STUDENT_DEACTIVATED_MESSAGE,
+    is_student_deactivated,
+    student_on_same_account,
+)
 
 
 class CartController:
@@ -264,6 +268,8 @@ class CartController:
                     status_code=403,
                     detail="You can only add student profiles on your account",
                 )
+        if body.student_id and await is_student_deactivated(db, body.student_id):
+            raise HTTPException(status_code=403, detail=STUDENT_DEACTIVATED_MESSAGE)
 
         cart = await CartController.ensure_cart(current_user=current_user, guest_token=guest_token)
         students = list(cart.get("students") or [])
@@ -323,6 +329,9 @@ class CartController:
             if sid:
                 if sid in existing_student_ids:
                     skipped.append({"label": label, "reason": "This student is already in the cart"})
+                    continue
+                if await is_student_deactivated(db, sid):
+                    skipped.append({"label": label, "reason": STUDENT_DEACTIVATED_MESSAGE})
                     continue
             line = CartStudentLine(
                 label=label,
@@ -566,6 +575,7 @@ class CartController:
         student_row = students[body.student_line_id]
         student_id = (student_row.get("student_id") or "").strip() or None
         items = list(cart.get("items") or [])
+        existing_item_ids = {item.get("id") for item in items if item.get("id")}
         CartController._assert_item_can_be_added(
             items,
             student_line_id=body.student_line_id,
@@ -589,23 +599,22 @@ class CartController:
                     status_code=400,
                     detail="This student is already enrolled in this course.",
                 )
-        items.append(
-            await CartController._build_item_row(
-                student_line_id=body.student_line_id,
-                course_id=body.course_id,
-                branch_id=body.branch_id,
-                duration_id=body.duration_id,
-                batch_ref=body.batch_ref,
-                student_id=student_id,
-            )
+        new_item = await CartController._build_item_row(
+            student_line_id=body.student_line_id,
+            course_id=body.course_id,
+            branch_id=body.branch_id,
+            duration_id=body.duration_id,
+            batch_ref=body.batch_ref,
+            student_id=student_id,
         )
+        items.append(new_item)
 
         issues, items = await validate_cart_document(
             {**cart, "items": items},
             current_user=current_user,
             reprice_check=False,
         )
-        blocking = [i for i in issues if i.code not in ("fee_drift",)]
+        blocking = cart_addition_blocking_issues(issues, existing_item_ids)
         if blocking:
             raise HTTPException(status_code=400, detail=blocking[0].message)
 
@@ -635,6 +644,7 @@ class CartController:
 
         student_id = (students[body.student_line_id].get("student_id") or "").strip() or None
         items = list(cart.get("items") or [])
+        existing_item_ids = {item.get("id") for item in items if item.get("id")}
         added = 0
         skipped: List[dict] = []
         seen_in_request: set = set()
@@ -713,7 +723,7 @@ class CartController:
             current_user=current_user,
             reprice_check=False,
         )
-        blocking = [i for i in issues if i.code not in ("fee_drift",)]
+        blocking = cart_addition_blocking_issues(issues, existing_item_ids)
         if blocking:
             raise HTTPException(status_code=400, detail=blocking[0].message)
 

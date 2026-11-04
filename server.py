@@ -114,6 +114,7 @@ from routes.champion_routes import (
 from routes.collaboration_partner_routes import (
     router as collaboration_partner_router,
 )
+from routes.partner_org_routes import router as partner_org_router
 
 # Import database utility
 from utils.database import db
@@ -228,6 +229,13 @@ async def lifespan(app: FastAPI):
         await ensure_billing_cycle_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure billing cycle indexes")
+
+    # Razorpay go-live readiness (keys/mode/webhook/FRONTEND_URL) — logs warnings only.
+    try:
+        from utils.razorpay_client import log_razorpay_startup_warnings
+        log_razorpay_startup_warnings()
+    except Exception:
+        logging.exception("Failed to evaluate Razorpay go-live status")
 
     # Additive indexes (safe to re-run).
     try:
@@ -523,22 +531,29 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
-# Get CORS origins from environment or use default
-cors_origins = os.getenv("CORS_ORIGINS", "*")
-if cors_origins == "*":
-    allowed_origins = ["*"]
-else:
-    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
-
-# Add specific origins for your deployment
-allowed_origins_list = [
+# Add CORS middleware — merge env + production defaults (never rely on :8003 as a browser origin)
+_default_cors_origins = [
     "http://localhost:3022",
     "http://127.0.0.1:3022",
     "https://rockmartialartsacademy.com",
+    "https://www.rockmartialartsacademy.com",
     "http://rockmartialartsacademy.com",
-    "*"  # Allow all origins as fallback
+    "http://www.rockmartialartsacademy.com",
 ]
+_cors_env = (os.getenv("CORS_ORIGINS") or "").strip()
+_allowed_origins: list[str] = []
+if _cors_env and _cors_env != "*":
+    _allowed_origins.extend(o.strip() for o in _cors_env.split(",") if o.strip())
+_allowed_origins.extend(_default_cors_origins)
+# De-dupe, drop accidental API-port origins (browsers never send Origin with :8003 for the website)
+_seen = set()
+allowed_origins_list: list[str] = []
+for origin in _allowed_origins:
+    if ":8003" in origin:
+        continue
+    if origin not in _seen:
+        _seen.add(origin)
+        allowed_origins_list.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
@@ -563,8 +578,23 @@ async def disable_http_caching(request: Request, call_next):
         response.headers["Expires"] = "0"
         response.headers["Surrogate-Control"] = "no-store"
         # Helps some proxies/CDNs avoid coalescing stale variants.
-        response.headers["Vary"] = "Authorization, Cookie, Origin"
+        response.headers["Vary"] = "Authorization, Cookie, Origin, X-Active-Branch-Id"
     return response
+
+
+@app.middleware("http")
+async def bind_active_branch(request: Request, call_next):
+    """Remember the branch a branch manager selected so list queries stay on that branch."""
+    from utils.student_status_service import (
+        reset_request_active_branch_id,
+        set_request_active_branch_id,
+    )
+
+    token = set_request_active_branch_id(request.headers.get("x-active-branch-id"))
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_active_branch_id(token)
 
 # Include routers
 app.include_router(superadmin_router, prefix="/api/superadmin", tags=["Super Admin"])
@@ -675,6 +705,11 @@ app.include_router(
     collaboration_partner_router,
     prefix="/api/collaboration-partners",
     tags=["Collaboration Partners"],
+)
+app.include_router(
+    partner_org_router,
+    prefix="/api/partner-organizations",
+    tags=["Partner Organizations"],
 )
 app.include_router(callback_router, prefix="/api/callbacks", tags=["Callbacks"])
 app.include_router(dropdown_settings_router, prefix="/api/dropdown-settings", tags=["Master Data"])

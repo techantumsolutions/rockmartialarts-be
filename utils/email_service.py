@@ -420,14 +420,32 @@ async def send_password_reset_email_webhook(to_email: str, reset_token: str, use
     return await service.send_password_reset_email_webhook(to_email, reset_token, user_name, user_type)
 
 async def send_custom_email_webhook(to_email: str, subject: str, html_message: str, plain_message: str) -> bool:
-    """Send custom email using webhook service"""
+    """Send custom email. Prefer Resend when configured (webhook host SSL is unreliable)."""
+    import logging
+    import os
+
+    logger = logging.getLogger(__name__)
+
+    # Prefer Resend — same path used by partner invite / student welcome
+    if (os.getenv("RESEND_API_KEY") or "").strip():
+        try:
+            from utils.resend_email import send_html_email_via_resend
+
+            logger.info(f"📧 Sending custom email via Resend to {to_email}")
+            logger.info(f"📋 Subject: {subject}")
+            if await send_html_email_via_resend(
+                to_email, subject, html_message, plain_message
+            ):
+                return True
+            logger.warning("Resend custom email failed; falling back to webhook")
+        except Exception as e:
+            logger.error(f"❌ Resend custom email error: {str(e)}; falling back to webhook")
+
     webhook_url = "https://ai.alviongs.com/webhook/de77d8d6-ae98-471d-ba19-8d7f58ec8449"
 
     try:
         import httpx
-        import logging
 
-        logger = logging.getLogger(__name__)
         logger.info(f"📧 Sending custom email via webhook to {to_email}")
         logger.info(f"📍 Webhook URL: {webhook_url}")
         logger.info(f"📋 Subject: {subject}")
@@ -462,7 +480,5 @@ async def send_custom_email_webhook(to_email: str, subject: str, html_message: s
             return True
 
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"❌ Failed to send custom email via webhook: {str(e)}")
         return False

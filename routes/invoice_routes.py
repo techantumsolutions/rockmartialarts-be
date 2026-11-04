@@ -22,11 +22,23 @@ class InvoiceWhatsAppResendBody(BaseModel):
 async def list_invoices(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
-    search: Optional[str] = None,
-    payment_id: Optional[str] = None,
+    search: Optional[str] = Query(None, description="Invoice number, customer, payment reference"),
+    payment_id: Optional[str] = Query(None),
+    payer_type: Optional[str] = Query(
+        None, description="student | coach — payment party filter"
+    ),
+    course_id: Optional[str] = Query(
+        None, description="Filter student course invoices by course id"
+    ),
+    plan_id: Optional[str] = Query(
+        None, description="Filter coach subscription invoices by plan id"
+    ),
+    payment_method: Optional[str] = Query(
+        None, description="razorpay | offline (hand cash)"
+    ),
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):
@@ -36,6 +48,10 @@ async def list_invoices(
         limit=limit,
         search=search,
         payment_id=payment_id,
+        payer_type=payer_type,
+        course_id=course_id,
+        plan_id=plan_id,
+        payment_method=payment_method,
     )
 
 
@@ -44,7 +60,7 @@ async def get_invoice_by_payment(
     payment_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):
@@ -56,7 +72,7 @@ async def get_invoice_document(
     invoice_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):
@@ -68,7 +84,7 @@ async def get_invoice_whatsapp_deliveries(
     invoice_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):
@@ -82,7 +98,7 @@ async def resend_invoice_whatsapp(
     body: Optional[InvoiceWhatsAppResendBody] = None,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):
@@ -101,7 +117,7 @@ async def get_invoice(
     include_html: bool = False,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT]
+            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
         )
     ),
 ):

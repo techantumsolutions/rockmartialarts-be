@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,7 @@ from fastapi import HTTPException, UploadFile
 from models.coach_models import (
     CoachApprovalStatus,
     CoachRegistrationCreate,
+    CreateCoachRegistrationOrderBody,
 )
 from utils.auth import hash_password
 from utils.database import get_db
@@ -48,6 +50,70 @@ def _normalize_phone(country_code: str, phone: str) -> tuple[str, str]:
         cc = f"+{cc}"
     local = re.sub(r"\s+", "", (phone or "").strip())
     return cc, local
+
+
+async def _assert_coach_email_phone_available(
+    db,
+    *,
+    email: str = "",
+    country_code: str = "+91",
+    phone: str = "",
+    full_phone: str = "",
+) -> None:
+    """Block coach registration when email or mobile is already on a coach record."""
+    email_clean = (email or "").strip().lower()
+    if full_phone:
+        digits = "".join(c for c in full_phone if c.isdigit())
+        local = digits[-10:] if len(digits) >= 10 else re.sub(r"\s+", "", full_phone.strip())
+        cc = "+91"
+        if full_phone.strip().startswith("+") and len(digits) > 10:
+            cc = f"+{digits[:-10]}" if digits[:-10] else "+91"
+        resolved_full = f"{cc}{local}" if local else full_phone.strip()
+    else:
+        cc, local = _normalize_phone(country_code, phone)
+        resolved_full = f"{cc}{local}" if local else ""
+
+    or_clauses: List[Dict[str, Any]] = []
+    if email_clean:
+        or_clauses.extend(
+            [
+                {"email": email_clean},
+                {"contact_info.email": email_clean},
+                {"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+                {
+                    "contact_info.email": {
+                        "$regex": f"^{re.escape(email_clean)}$",
+                        "$options": "i",
+                    }
+                },
+            ]
+        )
+    if local:
+        variants = list(
+            {
+                local,
+                resolved_full,
+                f"+91{local}",
+                f"91{local}",
+                f"0{local}",
+            }
+        )
+        or_clauses.extend(
+            [
+                {"phone": {"$in": variants}},
+                {"contact_info.phone": local},
+                {"contact_info.phone": {"$in": variants}},
+            ]
+        )
+    if not or_clauses:
+        return
+
+    existing = await db[COL].find_one({"$or": or_clauses}, {"id": 1})
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Coach with this email or phone already exists",
+        )
 
 
 async def _validate_service_locations(db, location_ids: List[str]) -> List[Dict[str, str]]:
@@ -120,6 +186,78 @@ async def get_coach_registration_options() -> Dict[str, Any]:
     }
 
 
+async def create_coach_registration_order(
+    body: Optional[CreateCoachRegistrationOrderBody] = None,
+) -> Dict[str, Any]:
+    """Create Razorpay order for coach registration checkout."""
+    import os
+    from utils.razorpay_client import get_razorpay_client
+
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    settings_doc = await db.system_settings.find_one({}) or {}
+    fee = 0.0
+    if settings_doc.get("coach_registration_fee") is not None:
+        try:
+            fee = float(settings_doc["coach_registration_fee"])
+        except (TypeError, ValueError):
+            fee = 0.0
+
+    name = (body.name if body else "") or ""
+    email = (body.email if body else "") or ""
+    phone = (body.phone if body else "") or ""
+
+    # Block checkout when email/mobile already registered as a coach
+    if email.strip() or phone.strip():
+        await _assert_coach_email_phone_available(
+            db, email=email, full_phone=phone
+        )
+
+    if fee <= 0:
+        return {
+            "fee_required": False,
+            "amount_inr": 0.0,
+            "amount_paise": 0,
+            "currency": "INR",
+        }
+
+    client = get_razorpay_client()
+    key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
+    amount_paise = int(round(fee * 100))
+    receipt = f"coach_reg_{secrets.token_hex(6)}"
+
+    order_payload = {
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": {
+            "type": "coach_registration",
+            "name": name,
+            "email": email,
+            "phone": phone,
+        },
+    }
+
+    try:
+        rp_order = client.order.create(data=order_payload)
+        return {
+            "fee_required": True,
+            "order_id": rp_order["id"],
+            "amount_paise": amount_paise,
+            "amount_inr": fee,
+            "currency": "INR",
+            "key_id": key_id,
+        }
+    except Exception as e:
+        logger.exception("Failed to create Razorpay order for coach registration: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to create payment order: {str(e)}",
+        )
+
+
 async def register_coach(
     body: CoachRegistrationCreate,
     *,
@@ -149,20 +287,39 @@ async def register_coach(
     full_phone = f"{cc}{local_phone}"
     email = str(body.email).strip().lower()
 
-    existing = await db[COL].find_one(
-        {
-            "$or": [
-                {"email": email},
-                {"contact_info.email": email},
-                {"phone": full_phone},
-                {"contact_info.phone": local_phone},
-            ]
-        }
+    await _assert_coach_email_phone_available(
+        db,
+        email=email,
+        country_code=cc,
+        phone=local_phone,
     )
-    if existing:
-        raise HTTPException(
-            status_code=400, detail="Coach with this email or phone already exists"
+
+    coach_fee = 0.0
+    settings_doc = await db.system_settings.find_one({}) or {}
+    if settings_doc.get("coach_registration_fee") is not None:
+        try:
+            coach_fee = float(settings_doc["coach_registration_fee"])
+        except (TypeError, ValueError):
+            coach_fee = 0.0
+
+    if coach_fee > 0:
+        if not body.razorpay_order_id or not body.razorpay_payment_id or not body.razorpay_signature:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment of registration fee (₹{coach_fee:.2f}) is required to submit registration.",
+            )
+        from utils.razorpay_client import verify_razorpay_signature
+        valid_sig = verify_razorpay_signature(
+            body.razorpay_order_id,
+            body.razorpay_payment_id,
+            body.razorpay_signature,
         )
+        if not valid_sig:
+            raise HTTPException(
+                status_code=400,
+                detail="Payment signature verification failed. Please contact support.",
+            )
+
 
     user_id = (body.user_id or "").strip() or None
     if current_user and current_user.get("id") and not user_id:
@@ -219,13 +376,22 @@ async def register_coach(
         "last_name": body.last_name.strip(),
         "full_name": full_name,
         "role": "coach",
-        "password_hash": hash_password(body.password),
+        "password_hash": hash_password(body.password or secrets.token_urlsafe(32)),
         "profile_image_url": (body.profile_image_url or "").strip() or None,
         "about_short": (body.about_short or "").strip() or None,
         "featured_on_homepage": False,
         "homepage_rating": None,
         "display_order": None,
         # M14 registration gate
+        "registration_payment": {
+            "fee_amount": coach_fee,
+            "currency": "INR",
+            "razorpay_order_id": body.razorpay_order_id if coach_fee > 0 else None,
+            "razorpay_payment_id": body.razorpay_payment_id if coach_fee > 0 else None,
+            "razorpay_signature": body.razorpay_signature if coach_fee > 0 else None,
+            "payment_status": "paid" if coach_fee > 0 else "free",
+            "paid_at": now if coach_fee > 0 else None,
+        },
         "approval_status": CoachApprovalStatus.PENDING.value,
         "is_active": False,
         "user_id": user_id,
@@ -234,6 +400,29 @@ async def register_coach(
         "updated_at": now,
     }
     await db[COL].insert_one(doc)
+    if coach_fee > 0:
+        try:
+            payment_doc = {
+                "id": str(uuid.uuid4()),
+                "payment_type": "coach_registration",
+                "coach_id": coach_id,
+                "student_id": None,
+                "amount": coach_fee,
+                "currency": "INR",
+                "payment_method": "razorpay",
+                "payment_status": "paid",
+                "transaction_id": body.razorpay_payment_id,
+                "razorpay_order_id": body.razorpay_order_id,
+                "razorpay_payment_id": body.razorpay_payment_id,
+                "payment_date": now,
+                "notes": f"Coach registration fee for {full_name}",
+                "created_at": now,
+                "updated_at": now,
+            }
+            await db.payments.insert_one(payment_doc)
+        except Exception:
+            logger.exception("Failed inserting coach registration payment record for %s", coach_id)
+
 
     # M14-S02: seed approval history (best-effort)
     try:
@@ -248,6 +437,15 @@ async def register_coach(
     return {
         "message": "Coach registration submitted. Awaiting admin approval.",
         "coach_id": coach_id,
+        "registration_payment": {
+            "fee_amount": coach_fee,
+            "currency": "INR",
+            "razorpay_order_id": body.razorpay_order_id if coach_fee > 0 else None,
+            "razorpay_payment_id": body.razorpay_payment_id if coach_fee > 0 else None,
+            "razorpay_signature": body.razorpay_signature if coach_fee > 0 else None,
+            "payment_status": "paid" if coach_fee > 0 else "free",
+            "paid_at": now if coach_fee > 0 else None,
+        },
         "approval_status": CoachApprovalStatus.PENDING.value,
         "coach": safe,
     }

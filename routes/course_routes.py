@@ -61,7 +61,7 @@ async def get_course_stats(
 @router.get("/by-branch/{branch_id}")
 async def get_courses_by_branch(
     branch_id: str,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER, UserRole.PARTNER_SUPER_ADMIN]))
 ):
     """Get courses assigned to a specific branch"""
     return await CourseController.get_courses_by_branch(branch_id, current_user)

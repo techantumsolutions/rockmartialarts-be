@@ -8,7 +8,27 @@ from utils.branch_courses import assert_course_available_at_branch
 from utils.branch_geography import assert_branch_accepts_enrollment
 from utils.cart_duplicates import course_branch_tuple
 from utils.database import get_db
-from utils.family_accounts import student_on_same_account
+from utils.family_accounts import (
+    STUDENT_DEACTIVATED_MESSAGE,
+    is_student_deactivated,
+    student_on_same_account,
+)
+
+
+def cart_addition_blocking_issues(
+    issues: List[CartValidationIssue],
+    existing_item_ids: set[str],
+) -> List[CartValidationIssue]:
+    """Keep legacy enrollment issues from blocking unrelated cart additions."""
+    return [
+        issue
+        for issue in issues
+        if issue.code != "fee_drift"
+        and not (
+            issue.code == "already_enrolled"
+            and issue.item_id in existing_item_ids
+        )
+    ]
 
 
 def _item_key(item: dict) -> tuple:
@@ -114,6 +134,17 @@ async def validate_cart_document(
                 CartValidationIssue(
                     code="course_unavailable",
                     message=str(exc.detail),
+                    item_id=iid,
+                    student_line_id=sid,
+                )
+            )
+            continue
+
+        if student_id and await is_student_deactivated(db, student_id):
+            issues.append(
+                CartValidationIssue(
+                    code="student_deactivated",
+                    message=STUDENT_DEACTIVATED_MESSAGE,
                     item_id=iid,
                     student_line_id=sid,
                 )

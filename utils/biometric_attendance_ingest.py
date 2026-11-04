@@ -380,20 +380,38 @@ async def ingest_events(payload: BiometricIngestRequest) -> Dict[str, Any]:
     }
 
 
+async def _partner_device_branch_scope(db, current_user: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Return Mongo clause for partner-owned device branch_ids, or None if unscoped."""
+    try:
+        from utils.partner_tenant import partner_branch_ids
+
+        p_bids = await partner_branch_ids(db, current_user)
+    except Exception:
+        return None
+    if p_bids is None:
+        return None
+    return {"branch_id": {"$in": list(p_bids or [])}}
+
+
 async def list_unmatched(
     *,
     skip: int = 0,
     limit: int = 50,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     skip = max(0, skip)
     limit = max(1, min(limit, 200))
-    total = await db[UNMATCHED].count_documents({})
+    q: Dict[str, Any] = {}
+    scope = await _partner_device_branch_scope(db, current_user)
+    if scope is not None:
+        q.update(scope)
+    total = await db[UNMATCHED].count_documents(q)
     rows = (
         await db[UNMATCHED]
-        .find({})
+        .find(q)
         .sort("created_at", -1)
         .skip(skip)
         .limit(limit)
@@ -402,14 +420,18 @@ async def list_unmatched(
     return {"unmatched": serialize_doc(rows), "total": total, "count": len(rows)}
 
 
-async def ingest_stats() -> Dict[str, Any]:
+async def ingest_stats(current_user: Optional[dict] = None) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     since = datetime.utcnow() - timedelta(days=7)
-    processed_7d = await db[PUNCH_EVENTS].count_documents({"created_at": {"$gte": since}})
-    unmatched_7d = await db[UNMATCHED].count_documents({"created_at": {"$gte": since}})
-    unmatched_total = await db[UNMATCHED].count_documents({})
+    scope = await _partner_device_branch_scope(db, current_user) or {}
+    processed_q = {"created_at": {"$gte": since}, **scope}
+    unmatched_q = {"created_at": {"$gte": since}, **scope}
+    unmatched_total_q = dict(scope)
+    processed_7d = await db[PUNCH_EVENTS].count_documents(processed_q)
+    unmatched_7d = await db[UNMATCHED].count_documents(unmatched_q)
+    unmatched_total = await db[UNMATCHED].count_documents(unmatched_total_q)
     return {
         "processed_last_7_days": processed_7d,
         "unmatched_last_7_days": unmatched_7d,

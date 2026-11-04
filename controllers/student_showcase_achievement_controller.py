@@ -14,6 +14,8 @@ from utils.helpers import serialize_doc
 from utils.student_content_access import (
     is_super_admin,
     is_branch_manager,
+    is_partner_super_admin,
+    partner_org_id_of,
     assert_branch_manager_can_set_global,
     assert_branch_manager_branch,
     assert_can_modify_showcase,
@@ -74,6 +76,13 @@ async def list_for_course_with_fallback(
     return [serialize_doc(d) for d in docs3]
 
 
+async def _partner_owned_branch_ids(db, partner_org_id: str) -> List[str]:
+    rows = await db.branches.find(
+        {"partner_org_id": partner_org_id}, {"id": 1}
+    ).to_list(500)
+    return [r["id"] for r in rows if r.get("id")]
+
+
 async def list_manage(current_user: dict, status: Optional[str] = None) -> List[Dict[str, Any]]:
     db = get_db()
     q: Dict[str, Any] = {}
@@ -81,6 +90,16 @@ async def list_manage(current_user: dict, status: Optional[str] = None) -> List[
         q["status"] = status
     if is_super_admin(current_user):
         pass
+    elif is_partner_super_admin(current_user):
+        org_id = partner_org_id_of(current_user)
+        if not org_id:
+            raise HTTPException(status_code=403, detail="Partner organization missing")
+        branch_ids = await _partner_owned_branch_ids(db, org_id)
+        q["$or"] = [
+            {"partner_org_id": org_id},
+            {"branch_id": {"$in": branch_ids}},
+        ]
+        q["is_global"] = False
     elif is_branch_manager(current_user):
         managed = current_user.get("managed_branches") or []
         q["branch_id"] = {"$in": managed}
@@ -93,9 +112,24 @@ async def list_manage(current_user: dict, status: Optional[str] = None) -> List[
 
 
 async def create(data: StudentShowcaseAchievementCreate, current_user: dict) -> Dict[str, Any]:
-    if not is_super_admin(current_user) and not is_branch_manager(current_user):
+    if (
+        not is_super_admin(current_user)
+        and not is_branch_manager(current_user)
+        and not is_partner_super_admin(current_user)
+    ):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    if is_branch_manager(current_user):
+    partner_org_id = None
+    if is_partner_super_admin(current_user):
+        partner_org_id = partner_org_id_of(current_user)
+        if not partner_org_id:
+            raise HTTPException(status_code=403, detail="Partner organization missing")
+        if data.is_global:
+            raise HTTPException(status_code=403, detail="Partners cannot create global showcase items")
+        db = get_db()
+        owned = await _partner_owned_branch_ids(db, partner_org_id)
+        if data.branch_id and data.branch_id not in owned:
+            raise HTTPException(status_code=403, detail="Branch is not in your organization")
+    elif is_branch_manager(current_user):
         assert_branch_manager_can_set_global(data.is_global)
         assert_branch_manager_branch(data.branch_id, current_user)
     elif is_super_admin(current_user):
@@ -118,6 +152,8 @@ async def create(data: StudentShowcaseAchievementCreate, current_user: dict) -> 
         "created_at": now,
         "updated_at": now,
     }
+    if partner_org_id:
+        doc["partner_org_id"] = partner_org_id
     await get_db()[COLLECTION].insert_one(doc)
     return serialize_doc(doc)
 
@@ -125,7 +161,21 @@ async def create(data: StudentShowcaseAchievementCreate, current_user: dict) -> 
 async def update(aid: str, data: StudentShowcaseAchievementUpdate, current_user: dict) -> Dict[str, Any]:
     db = get_db()
     doc = await db[COLLECTION].find_one({"id": aid})
-    assert_can_modify_showcase(doc, current_user)
+    # Partner may also edit showcase tied to their branches
+    if is_partner_super_admin(current_user) and doc:
+        org_id = partner_org_id_of(current_user)
+        owned = await _partner_owned_branch_ids(db, org_id or "")
+        if doc.get("partner_org_id") != org_id and doc.get("branch_id") not in owned:
+            raise HTTPException(status_code=403, detail="Not allowed to modify this achievement")
+    else:
+        assert_can_modify_showcase(doc, current_user)
+    if is_partner_super_admin(current_user):
+        if data.is_global is True:
+            raise HTTPException(status_code=403, detail="Cannot set global")
+        org_id = partner_org_id_of(current_user)
+        owned = await _partner_owned_branch_ids(db, org_id or "")
+        if data.branch_id is not None and data.branch_id not in owned:
+            raise HTTPException(status_code=403, detail="Invalid branch")
     if is_branch_manager(current_user):
         if data.is_global is True:
             raise HTTPException(status_code=403, detail="Cannot set global")
@@ -142,6 +192,12 @@ async def update(aid: str, data: StudentShowcaseAchievementUpdate, current_user:
 async def delete_showcase(aid: str, current_user: dict) -> Dict[str, str]:
     db = get_db()
     doc = await db[COLLECTION].find_one({"id": aid})
-    assert_can_modify_showcase(doc, current_user)
+    if is_partner_super_admin(current_user) and doc:
+        org_id = partner_org_id_of(current_user)
+        owned = await _partner_owned_branch_ids(db, org_id or "")
+        if doc.get("partner_org_id") != org_id and doc.get("branch_id") not in owned:
+            raise HTTPException(status_code=403, detail="Not allowed to modify this achievement")
+    else:
+        assert_can_modify_showcase(doc, current_user)
     await db[COLLECTION].delete_one({"id": aid})
     return {"message": "Achievement deleted"}

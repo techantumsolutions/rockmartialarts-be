@@ -67,8 +67,10 @@ async def list_manage(current_user: dict, status: Optional[str] = None) -> List[
     if is_super_admin(current_user):
         pass
     elif is_branch_manager(current_user):
-        managed = current_user.get("managed_branches") or []
-        q["branch_id"] = {"$in": managed}
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        managed = await get_managed_branch_ids_for_user(db, current_user)
+        q["branch_id"] = {"$in": managed or ["__none__"]}
         q["is_global"] = False
     else:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -81,8 +83,14 @@ async def create(data: StudentTestimonialCreate, current_user: dict) -> Dict[str
     if not is_super_admin(current_user) and not is_branch_manager(current_user):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if is_branch_manager(current_user):
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
         assert_branch_manager_can_set_global(data.is_global)
-        assert_branch_manager_branch(data.branch_id, current_user)
+        managed = await get_managed_branch_ids_for_user(get_db(), current_user)
+        if len(managed) == 1:
+            data.branch_id = managed[0]
+        if not data.branch_id or data.branch_id not in managed:
+            raise HTTPException(status_code=403, detail="You can only manage content for your selected branch")
     elif is_super_admin(current_user):
         if not data.is_global and not data.branch_id:
             raise HTTPException(status_code=400, detail="branch_id is required when is_global is false")
@@ -112,9 +120,14 @@ async def update(tid: str, data: StudentTestimonialUpdate, current_user: dict) -
     doc = await db[COLLECTION].find_one({"id": tid})
     assert_can_modify_testimonial(doc, current_user)
     if is_branch_manager(current_user):
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
         if data.is_global is True:
             raise HTTPException(status_code=403, detail="Cannot set global")
-        if data.branch_id is not None and data.branch_id not in (current_user.get("managed_branches") or []):
+        managed = await get_managed_branch_ids_for_user(db, current_user)
+        if str((doc or {}).get("branch_id") or "") not in managed:
+            raise HTTPException(status_code=403, detail="Not allowed to modify this testimonial")
+        if data.branch_id is not None and data.branch_id not in managed:
             raise HTTPException(status_code=403, detail="Invalid branch")
     update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
     payload = data.dict(exclude_unset=True)
@@ -136,5 +149,11 @@ async def delete_testimonial(tid: str, current_user: dict) -> Dict[str, str]:
     db = get_db()
     doc = await db[COLLECTION].find_one({"id": tid})
     assert_can_modify_testimonial(doc, current_user)
+    if is_branch_manager(current_user):
+        from utils.student_status_service import get_managed_branch_ids_for_user
+
+        managed = await get_managed_branch_ids_for_user(db, current_user)
+        if str((doc or {}).get("branch_id") or "") not in managed:
+            raise HTTPException(status_code=403, detail="Not allowed to modify this testimonial")
     await db[COLLECTION].delete_one({"id": tid})
     return {"message": "Testimonial deleted"}

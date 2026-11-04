@@ -19,16 +19,15 @@ async def branch_manager_login(login_data: BranchManagerLogin):
 @router.post("/forgot-password")
 async def forgot_password(forgot_password_data: BranchManagerForgotPassword):
     """Initiate password reset process for branch manager"""
-    # TODO: Implement forgot password functionality similar to coach
-    from fastapi import HTTPException
-    raise HTTPException(status_code=501, detail="Branch manager forgot password not yet implemented")
+    return await BranchManagerController.forgot_password(forgot_password_data.email)
 
 @router.post("/reset-password")
 async def reset_password(reset_password_data: BranchManagerResetPassword):
     """Reset branch manager password using a token"""
-    # TODO: Implement reset password functionality similar to coach
-    from fastapi import HTTPException
-    raise HTTPException(status_code=501, detail="Branch manager reset password not yet implemented")
+    return await BranchManagerController.reset_password(
+        reset_password_data.token,
+        reset_password_data.new_password,
+    )
 
 @router.get("/me")
 async def get_branch_manager_profile(
@@ -121,10 +120,11 @@ async def get_branch_managers(
     skip: int = Query(0, ge=0, description="Number of branch managers to skip"),
     limit: int = Query(50, ge=1, le=100, description="Number of branch managers to return"),
     active_only: bool = Query(True, description="Filter only active branch managers"),
+    all_tenants: bool = Query(False, description="Super admin only: include branch managers across all partner tenants"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN]))
 ):
     """Get list of branch managers with pagination"""
-    return await BranchManagerController.get_branch_managers(skip, limit, active_only, current_user)
+    return await BranchManagerController.get_branch_managers(skip, limit, active_only, current_user, all_tenants)
 
 @router.get("/{manager_id}")
 async def get_branch_manager(

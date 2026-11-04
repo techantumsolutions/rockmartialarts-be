@@ -24,7 +24,7 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'student_management_secret_key_2025_se
 ALGORITHM = "HS256"
 
 # Debug: Print the SECRET_KEY being used (first 20 chars only for security)
-print(f"🔑 auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
+print(f"[AUTH] auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 
@@ -119,9 +119,43 @@ async def get_current_active_user(current_user: dict = Depends(get_current_user)
 
     return current_user
 
+async def get_current_student_any_status(current_user: dict = Depends(get_current_user)):
+    """Student token regardless of is_active. Only for account-level endpoints
+    (session status, profile list, switch) so a deactivated profile can still switch away."""
+    if str(current_user.get("role") or "").lower() != UserRole.STUDENT.value:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return current_user
+
 def require_role(allowed_roles: List[UserRole]):
     async def role_checker(current_user: dict = Depends(get_current_active_user)):
         if current_user["role"] not in [role.value for role in allowed_roles]:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return current_user
     return role_checker
+
+
+security_optional = HTTPBearer(auto_error=False)
+
+async def get_optional_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional)):
+    if not credentials or not credentials.credentials:
+        return None
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get('sub')
+        if not user_id:
+            return None
+        user = await db.users.find_one({'id': user_id})
+        if user:
+            return serialize_doc(user)
+        coach = await db.coaches.find_one({'': [{'id': user_id}, {'user_id': user_id}]})
+        if coach:
+            return serialize_doc(coach)
+        bm = await db.branch_managers.find_one({'': [{'id': user_id}, {'user_id': user_id}]})
+        if bm:
+            return serialize_doc(bm)
+        return None
+    except Exception:
+        return None

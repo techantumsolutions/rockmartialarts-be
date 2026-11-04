@@ -141,16 +141,25 @@ def name_slug(value: Optional[str]) -> str:
 
 
 async def resolve_public_category(db, slug: str) -> dict:
-    """Active category by stored slug, UUID, or name-derived slug. Inactive/missing → 404."""
+    """Active Rock category by stored slug, UUID, or name-derived slug. Inactive/missing → 404."""
+    from utils.partner_tenant import merge_and_clause, rock_owned_clause
+
     value = (slug or "").strip().lower()
     if not value:
         raise HTTPException(status_code=404, detail="Category not found")
 
-    category = await db.categories.find_one({"slug": value, "is_active": True})
+    rock = rock_owned_clause()
+    category = await db.categories.find_one(
+        merge_and_clause({"slug": value, "is_active": True}, rock)
+    )
     if not category and UUID_RE.match(value):
-        category = await db.categories.find_one({"id": value, "is_active": True})
+        category = await db.categories.find_one(
+            merge_and_clause({"id": value, "is_active": True}, rock)
+        )
     if not category:
-        candidates = await db.categories.find({"is_active": True}).to_list(500)
+        candidates = await db.categories.find(
+            merge_and_clause({"is_active": True}, rock)
+        ).to_list(500)
         for item in candidates:
             stored = (item.get("slug") or "").strip().lower()
             if stored == value or name_slug(item.get("name")) == value:

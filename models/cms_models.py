@@ -54,6 +54,7 @@ class HomepageSection(BaseModel):
     media_section: Optional[List[HomepageMediaItem]] = None
     testimonials_title: Optional[str] = None
     testimonials_subtitle: Optional[str] = None
+    testimonials_enabled: bool = True
     testimonials: Optional[List[TestimonialItem]] = None
     cta_title: Optional[str] = None
     cta_subtitle: Optional[str] = None

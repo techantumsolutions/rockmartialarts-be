@@ -13,6 +13,7 @@ class StudentAchievement(BaseModel):
     description: Optional[str] = None
     images: List[str] = Field(default_factory=list, description="List of image URLs")
     documents: List[str] = Field(default_factory=list, description="List of document/certificate URLs")
+    is_featured: bool = Field(default=False, description="Show on homepage when true (super admin)")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     created_by: Optional[str] = None
@@ -32,3 +33,8 @@ class AchievementUpdate(BaseModel):
     description: Optional[str] = None
     images: Optional[List[str]] = None
     documents: Optional[List[str]] = None
+    is_featured: Optional[bool] = None
+
+
+class AchievementFeaturedUpdate(BaseModel):
+    is_featured: bool

@@ -21,7 +21,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from models.lead_models import LEAD_FOLLOW_UP_ACTIONS, LEAD_STATUSES, LeadCreate, LeadStatus
+from models.lead_models import (
+    LEAD_FOLLOW_UP_ACTIONS,
+    LEAD_PRIORITIES,
+    LEAD_STATUSES,
+    LeadCreate,
+    LeadStatus,
+)
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.indian_phone import canonical_indian_phone
@@ -51,6 +57,7 @@ KNOWN_SOURCE_TYPES = (
     "event",
     "manual",
     "partner_landing",
+    "partner_org_landing",
     "other",
 )
 
@@ -89,6 +96,9 @@ SOURCE_ALIASES = {
     "collaboration_partner": "partner_landing",
     "partner_page": "partner_landing",
     "partner_contact": "partner_landing",
+    "partner_org_landing": "partner_org_landing",
+    "white_label_partner": "partner_org_landing",
+    "partner_organization": "partner_org_landing",
 }
 
 
@@ -152,6 +162,13 @@ def _normalize_lead_status(raw: Any) -> LeadStatus:
     return "new"
 
 
+def _normalize_lead_priority(raw: Any) -> str:
+    s = (str(raw).strip().lower() if raw is not None else "")
+    if s in LEAD_PRIORITIES:
+        return s
+    return "medium"
+
+
 def lead_to_response_dict(ser: Dict[str, Any], fallback_now: Optional[datetime] = None) -> Dict[str, Any]:
     now = fallback_now or datetime.utcnow()
     created = ser.get("created_at", now)
@@ -169,6 +186,7 @@ def lead_to_response_dict(ser: Dict[str, Any], fallback_now: Optional[datetime] 
         "branch_name": ser.get("branch_name"),
         "message": ser.get("message"),
         "status": _normalize_lead_status(ser.get("status")),
+        "priority": _normalize_lead_priority(ser.get("priority")),
         "phone_canonical": ser.get("phone_canonical"),
         "capture_count": int(ser.get("capture_count") or 1),
         "last_captured_at": ser.get("last_captured_at") or created,
@@ -198,14 +216,8 @@ async def _bm_branch_filter(db, current_user: Optional[dict]) -> Optional[Dict[s
     managed = await get_managed_branch_ids_for_user(db, current_user)
     if not managed:
         return {"branch_id": {"$in": []}}
-    return {
-        "$or": [
-            {"branch_id": {"$in": managed}},
-            {"branch_id": {"$exists": False}},
-            {"branch_id": None},
-            {"branch_id": ""},
-        ]
-    }
+    # Branch managers see only leads assigned to their managed branch(es).
+    return {"branch_id": {"$in": [str(x) for x in managed if x]}}
 
 
 def _build_lead_doc(
@@ -221,6 +233,7 @@ def _build_lead_doc(
     branch_id: Optional[str] = None,
     branch_name: Optional[str] = None,
     message: Optional[str] = None,
+    partner_org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
     email_raw = (email or "").strip().lower()
@@ -244,8 +257,10 @@ def _build_lead_doc(
         "source_ref_type": (source_ref_type or "").strip() or None,
         "branch_id": (branch_id or "").strip() or None,
         "branch_name": (branch_name or "").strip() or None,
+        "partner_org_id": (partner_org_id or "").strip() or None,
         "message": msg,
         "status": "new",
+        "priority": "medium",
         "capture_count": 1,
         "last_captured_at": now,
         "duplicate_merged": False,
@@ -267,6 +282,7 @@ async def create_or_merge_lead(
     branch_id: Optional[str] = None,
     branch_name: Optional[str] = None,
     message: Optional[str] = None,
+    partner_org_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
     """
     Returns (lead_doc_serialized, was_merged).
@@ -288,6 +304,7 @@ async def create_or_merge_lead(
         branch_id=branch_id,
         branch_name=branch_name,
         message=message,
+        partner_org_id=partner_org_id,
     )
     now = datetime.utcnow()
 
@@ -315,6 +332,8 @@ async def create_or_merge_lead(
                 patch["branch_id"] = draft["branch_id"]
             if draft["branch_name"]:
                 patch["branch_name"] = draft["branch_name"]
+            if draft.get("partner_org_id"):
+                patch["partner_org_id"] = draft["partner_org_id"]
             if draft.get("message"):
                 patch["message"] = draft["message"]
             await db[COL].update_one({"id": existing["id"]}, {"$set": patch})
@@ -326,13 +345,17 @@ async def create_or_merge_lead(
     st = draft.get("source_type")
     if phone_c and st:
         since = now - timedelta(hours=_duplicate_window_hours())
+        soft_q: Dict[str, Any] = {
+            "phone_canonical": phone_c,
+            "source_type": st,
+            "created_at": {"$gte": since},
+            "status": {"$nin": ["converted", "lost"]},
+        }
+        # Keep white-label partner leads from merging across orgs
+        if draft.get("partner_org_id"):
+            soft_q["partner_org_id"] = draft["partner_org_id"]
         existing = await db[COL].find_one(
-            {
-                "phone_canonical": phone_c,
-                "source_type": st,
-                "created_at": {"$gte": since},
-                "status": {"$nin": ["converted", "lost"]},
-            },
+            soft_q,
             sort=[("created_at", -1)],
         )
         if existing:
@@ -354,6 +377,8 @@ async def create_or_merge_lead(
                 patch["branch_id"] = draft["branch_id"]
             if draft["branch_name"]:
                 patch["branch_name"] = draft["branch_name"]
+            if draft.get("partner_org_id"):
+                patch["partner_org_id"] = draft["partner_org_id"]
             if draft.get("message"):
                 patch["message"] = draft["message"]
             if ref_id and not existing.get("source_ref_id"):
@@ -436,16 +461,34 @@ async def list_leads_service(
     sort: Optional[str] = None,
     coach_assignment_status: Optional[str] = None,
     unassigned_coach: bool = False,
+    priority: Optional[str] = None,
     current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=503, detail="Database not initialized")
 
+    # Leads marked Assigned while the coach request is still pending were saved
+    # before acceptance was required. Show them as Pending acceptance.
+    await db[COL].update_many(
+        {"status": "assigned", "coach_assignment_status": "pending"},
+        {"$set": {"status": "pending_acceptance"}},
+    )
+
     clauses: List[Dict[str, Any]] = []
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         clauses.append(scope)
+
+    # White-label partner SA: only their org's leads
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            clauses.append({"partner_org_id": partner_org})
+    except Exception:
+        pass
 
     if search and search.strip():
         s = search.strip()
@@ -481,6 +524,22 @@ async def list_leads_service(
             )
         else:
             clauses.append({"status": st})
+
+    pr = (priority or "").strip().lower()
+    if pr in LEAD_PRIORITIES:
+        if pr == "medium":
+            clauses.append(
+                {
+                    "$or": [
+                        {"priority": "medium"},
+                        {"priority": {"$exists": False}},
+                        {"priority": None},
+                        {"priority": ""},
+                    ]
+                }
+            )
+        else:
+            clauses.append({"priority": pr})
 
     stype = (source_type or "").strip().lower()
     if stype and stype != "all":
@@ -576,6 +635,15 @@ async def list_lead_source_options(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            tenant_clause = {"partner_org_id": partner_org}
+            match = {**match, **tenant_clause} if match else tenant_clause
+    except Exception:
+        pass
     pipeline: List[Dict[str, Any]] = []
     if match:
         pipeline.append({"$match": match})
@@ -606,15 +674,18 @@ async def list_lead_source_options(
     seen = {s["value"] for s in sources}
     for k in KNOWN_SOURCE_TYPES:
         if k not in seen:
-            label = (
-                "Partner Landing"
-                if k == "partner_landing"
-                else k.replace("_", " ").title()
-            )
+            if k == "partner_landing":
+                label = "Partner Landing"
+            elif k == "partner_org_landing":
+                label = "Partner Org Landing"
+            else:
+                label = k.replace("_", " ").title()
             sources.append({"value": k, "label": label, "count": 0})
     for s in sources:
         if s.get("value") == "partner_landing":
             s["label"] = "Partner Landing"
+        elif s.get("value") == "partner_org_landing":
+            s["label"] = "Partner Org Landing"
     return {"sources": sources, "duplicate_window_hours": _duplicate_window_hours()}
 
 
@@ -628,6 +699,16 @@ async def _assert_lead_access(db, doc: dict, current_user: Optional[dict]) -> No
         return
     role = _role(current_user)
     if role in {"superadmin", "super_admin", "coach_admin", "coachadmin"}:
+        return
+    if role in {"partner_super_admin", "partnersuperadmin"}:
+        from utils.partner_tenant import partner_org_id_of
+
+        org_id = partner_org_id_of(current_user)
+        if not org_id or doc.get("partner_org_id") != org_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only manage leads for your partner organization.",
+            )
         return
     if role not in {"branch_manager", "branch_admin", "branchmanager"}:
         raise HTTPException(status_code=403, detail="Not allowed")
@@ -704,6 +785,7 @@ async def list_lead_follow_ups(
     current_user: Optional[dict] = None,
     skip: int = 0,
     limit: int = 50,
+    access_already_checked: bool = False,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -712,7 +794,8 @@ async def list_lead_follow_ups(
     doc = await db[COL].find_one({"id": lid})
     if not doc:
         raise HTTPException(status_code=404, detail="Lead not found")
-    await _assert_lead_access(db, doc, current_user)
+    if not access_already_checked:
+        await _assert_lead_access(db, doc, current_user)
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
     q = {"lead_id": lid}
@@ -742,6 +825,7 @@ async def create_lead_follow_up(
     next_follow_up_at: Optional[datetime] = None,
     clear_next_follow_up: bool = False,
     current_user: Optional[dict] = None,
+    access_already_checked: bool = False,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -751,7 +835,8 @@ async def create_lead_follow_up(
     doc = await db[COL].find_one({"id": lid})
     if not doc:
         raise HTTPException(status_code=404, detail="Lead not found")
-    await _assert_lead_access(db, doc, current_user)
+    if not access_already_checked:
+        await _assert_lead_access(db, doc, current_user)
 
     note_clean = (note or "").strip() or None
     new_status = (status or "").strip().lower() or None
@@ -829,17 +914,75 @@ async def update_lead_status_with_history(
     *,
     status: str,
     note: Optional[str] = None,
+    priority: Optional[str] = None,
     current_user: Optional[dict] = None,
+    access_already_checked: bool = False,
 ) -> Dict[str, Any]:
-    """Backward-compatible status update that also appends follow-up history."""
-    result = await create_lead_follow_up(
-        lead_id,
-        note=note,
-        action="status_change",
-        status=status,
-        current_user=current_user,
-    )
-    return result["lead"]
+    """Backward-compatible status update that also appends follow-up history.
+
+    Priority can change on its own. An unchanged status does not write a status event.
+    """
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    lid = (lead_id or "").strip()
+    doc = await db[COL].find_one({"id": lid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if not access_already_checked:
+        await _assert_lead_access(db, doc, current_user)
+
+    requested = (status or "").strip().lower()
+    if requested not in LEAD_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {requested}")
+
+    new_priority = (priority or "").strip().lower() or None
+    if new_priority and new_priority not in LEAD_PRIORITIES:
+        raise HTTPException(status_code=400, detail=f"Invalid priority: {new_priority}")
+
+    from_status = _normalize_lead_status(doc.get("status"))
+    current_priority = _normalize_lead_priority(doc.get("priority"))
+    status_changed = requested != from_status
+    priority_changed = bool(new_priority and new_priority != current_priority)
+    note_clean = (note or "").strip() or None
+
+    lead_dict: Dict[str, Any]
+    if status_changed or note_clean:
+        result = await create_lead_follow_up(
+            lid,
+            note=note_clean,
+            action="status_change" if status_changed else "note",
+            status=requested if status_changed else None,
+            current_user=current_user,
+            access_already_checked=True,
+        )
+        lead_dict = result["lead"]
+    else:
+        lead_dict = lead_to_response_dict(serialize_doc(doc) or {})
+
+    if priority_changed and new_priority:
+        now = datetime.utcnow()
+        await db[COL].update_one(
+            {"id": lid},
+            {"$set": {"priority": new_priority, "updated_at": now}},
+        )
+        await _append_follow_up_event(
+            db,
+            lead_id=lid,
+            action="other",
+            note=f"Priority changed from {current_priority} to {new_priority}",
+            from_status=None,
+            to_status=None,
+            next_follow_up_at=doc.get("next_follow_up_at"),
+            actor=current_user,
+        )
+        updated = await db[COL].find_one({"id": lid})
+        lead_dict = lead_to_response_dict(serialize_doc(updated) or {}, now)
+
+    if not status_changed and not note_clean and not priority_changed:
+        return lead_dict
+
+    return lead_dict
 
 
 async def lead_pipeline_summary(
@@ -853,6 +996,15 @@ async def lead_pipeline_summary(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
+    try:
+        from utils.partner_tenant import partner_org_id_of
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            tenant_clause = {"partner_org_id": partner_org}
+            match = {**match, **tenant_clause} if match else tenant_clause
+    except Exception:
+        pass
 
     pipeline: List[Dict[str, Any]] = []
     if match:

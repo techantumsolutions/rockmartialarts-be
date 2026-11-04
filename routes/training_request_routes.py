@@ -9,6 +9,8 @@ from models.training_request_models import (
     HomeTrainingRequestCreate,
     ResidentialTrainingRequestCreate,
     SchoolTrainingRequestCreate,
+    CreateTrainingOrderBody,
+    CoachTrainingRequestResponse,
     TrainingRequestCoachAssign,
     TrainingRequestPaymentVerify,
     TrainingRequestStatusUpdate,
@@ -19,11 +21,14 @@ from utils.training_request_service import (
     create_college_training_request,
     create_corporate_training_request,
     create_home_training_request,
+    create_training_payment_order,
     create_residential_payment_order,
     create_residential_training_request,
     create_school_training_request,
     get_training_request,
     list_residential_packages,
+    list_coach_training_requests,
+    coach_respond_to_request,
     list_status_history,
     list_training_requests,
     summarize_training_requests,
@@ -39,6 +44,15 @@ ADMIN_ROLES = [
     UserRole.COACH_ADMIN,
     UserRole.BRANCH_MANAGER,
 ]
+
+
+@router.post("/create-order")
+async def api_create_training_order(
+    body: CreateTrainingOrderBody,
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin),
+):
+    """Public (optional auth) — create Razorpay order for training request based on Super Admin configured fee."""
+    return await create_training_payment_order(body, current_user=current_user)
 
 
 @router.post("/home", status_code=status.HTTP_201_CREATED)
@@ -149,6 +163,26 @@ async def api_list_training_requests(
     )
 
 
+@router.get("/coach/my-requests")
+async def api_coach_training_requests(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    type_filter: Optional[str] = Query(None, alias="type"),
+    search: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_role_unified([UserRole.COACH])),
+):
+    """M12 List training requests assigned to the logged-in coach."""
+    return await list_coach_training_requests(
+        current_user=current_user,
+        status_filter=status_filter,
+        type_filter=type_filter,
+        search=search,
+        skip=skip,
+        limit=limit,
+    )
+
+
 @router.get("/{request_id}")
 async def api_get_training_request(
     request_id: str,
@@ -183,3 +217,15 @@ async def api_assign_coach(
     current_user: dict = Depends(require_role_unified(ADMIN_ROLES)),
 ):
     return await assign_coach(request_id, body, current_user=current_user)
+
+
+@router.post("/{request_id}/coach-respond")
+async def api_coach_respond(
+    request_id: str,
+    body: CoachTrainingRequestResponse,
+    current_user: dict = Depends(require_role_unified([UserRole.COACH])),
+):
+    """M12 Coach accepts or rejects an assigned training request."""
+    return await coach_respond_to_request(
+        request_id, body, current_user=current_user
+    )

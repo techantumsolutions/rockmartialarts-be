@@ -164,12 +164,16 @@ class AuthController:
         """Register a new student (public endpoint)"""
         db = get_db()
         
-        # Check if user exists
-        existing_user = await db.users.find_one({
-            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
-        })
-        if existing_user:
-            raise HTTPException(status_code=400, detail="User with this email or phone already exists")
+        # Block duplicate email/mobile (case/format tolerant)
+        availability = await AuthController.check_student_availability(
+            email=user_data.email, phone=user_data.phone
+        )
+        if not availability.get("available", True):
+            raise HTTPException(
+                status_code=400,
+                detail=availability.get("message")
+                or "User with this email or phone already exists",
+            )
         
         # Generate password if not provided
         if not user_data.password:
@@ -336,11 +340,15 @@ class AuthController:
     async def create_user_silent(user_data: UserCreate):
         """Create user and optional enrollment without sending SMS. Used by bulk import."""
         db = get_db()
-        existing_user = await db.users.find_one({
-            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
-        })
-        if existing_user:
-            raise HTTPException(status_code=400, detail=f"User with email {user_data.email} or phone {user_data.phone} already exists")
+        availability = await AuthController.check_student_availability(
+            email=user_data.email, phone=user_data.phone
+        )
+        if not availability.get("available", True):
+            raise HTTPException(
+                status_code=400,
+                detail=availability.get("message")
+                or f"User with email {user_data.email} or phone {user_data.phone} already exists",
+            )
         if not user_data.password:
             user_data.password = secrets.token_urlsafe(8)
         hashed_password = hash_password(user_data.password)
@@ -472,7 +480,11 @@ class AuthController:
                     )
                 user = await pick_login_student(db, acc)
                 if not user:
-                    await AuthController._reject_login(request, user_credentials.email, "No active student on account")
+                    await AuthController._reject_login(
+                        request, user_credentials.email, "No active student on account",
+                        status_code=400,
+                        detail="All student profiles on this account have been deactivated by the admin. Please contact your branch for assistance.",
+                    )
                 account_id = acc["id"]
                 if not user.get("account_id"):
                     await db.users.update_one(
@@ -826,6 +838,7 @@ class AuthController:
         digits = "".join(c for c in raw if c.isdigit())
         if len(digits) < 10:
             return {"exists": False}
+
         norm = digits[-10:]
         variants = [
             norm,
@@ -854,9 +867,87 @@ class AuthController:
                 if len(stored) >= 10 and stored[-10:] == norm:
                     return {"exists": True}
             return {"exists": False}
+
         except Exception as e:
             logger.error("Error checking phone existence: %s", e)
             return {"exists": False}
+
+
+    @staticmethod
+    async def check_student_availability(email: Optional[str] = None, phone: Optional[str] = None):
+        """
+        Verify if email or phone is already registered in db.users or accounts before initiating payments.
+        """
+        db = get_db()
+        email_clean = (email or "").strip().lower()
+        phone_clean = (phone or "").strip()
+
+        email_exists = False
+        phone_exists = False
+
+        if email_clean:
+            try:
+                acc = await get_account_by_email(db, email_clean)
+                if acc:
+                    email_exists = True
+                else:
+                    user = await db.users.find_one({"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}})
+                    if user:
+                        email_exists = True
+            except Exception as e:
+                logger.error("Error checking email availability: %s", e)
+
+        if phone_clean:
+            digits = "".join(c for c in phone_clean if c.isdigit())
+            if len(digits) >= 10:
+                norm = digits[-10:]
+                variants = [
+                    norm,
+                    f"91{norm}",
+                    f"+91{norm}",
+                    f"+91-{norm}",
+                    f"0{norm}",
+                    f"91-{norm}",
+                    f"+91 {norm}",
+                ]
+                try:
+                    acc = await get_account_by_phone(db, norm)
+                    if acc:
+                        phone_exists = True
+                    else:
+                        u = await db.users.find_one({"phone": {"$in": variants}})
+                        if not u:
+                            u = await db.users.find_one({"phone": {"$regex": re.escape(norm) + r"\s*$"}})
+                        if not u:
+                            async for doc in db.users.find(
+                                {"phone": {"$exists": True, "$nin": [None, ""]}},
+                                {"phone": 1},
+                            ).limit(5000):
+                                stored = "".join(c for c in str(doc.get("phone", "")) if c.isdigit())
+                                if len(stored) >= 10 and stored[-10:] == norm:
+                                    u = doc
+                                    break
+                        if u:
+                            phone_exists = True
+                except Exception as e:
+                    logger.error("Error checking phone availability: %s", e)
+
+        available = not (email_exists or phone_exists)
+        message = None
+        if email_exists and phone_exists:
+            message = "Both this email address and mobile number are already registered."
+        elif email_exists:
+            message = "This email address is already registered."
+        elif phone_exists:
+            message = "This mobile number is already registered."
+
+        return {
+            "available": available,
+            "email_exists": email_exists,
+            "phone_exists": phone_exists,
+            "message": message,
+        }
+
 
     @staticmethod
     async def get_student_profile(current_user: dict):
@@ -1228,6 +1319,21 @@ class AuthController:
         }
 
     @staticmethod
+    async def student_session_status(current_user: dict):
+        db = get_db()
+        acc = await ensure_account_for_student(db, current_user)
+        is_active = current_user.get("is_active") is not False
+        return {
+            "student_id": current_user.get("id"),
+            "full_name": current_user.get("full_name")
+            or f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip(),
+            "is_active": is_active,
+            "status": "active" if is_active else "deactivated",
+            "account_id": acc["id"],
+            "profiles": await list_profiles(db, acc["id"]),
+        }
+
+    @staticmethod
     async def switch_student(body: SwitchStudentBody, current_user: dict, request: Request):
         db = get_db()
         if current_user.get("role") != "student":
@@ -1238,8 +1344,11 @@ class AuthController:
             "account_id": acc["id"],
             "role": "student",
         })
-        if not target or target.get("is_active") is False:
+        if not target:
             raise HTTPException(status_code=403, detail="Student is not linked to this account")
+        # Deactivated profiles may be selected; data APIs still reject their token and the
+        # dashboard renders the deactivated screen from /auth/session-status.
+        target_inactive = target.get("is_active") is False
 
         access_token = create_access_token(data={
             "sub": target["id"],
@@ -1253,7 +1362,11 @@ class AuthController:
                 action="switch_student",
                 user_id=target["id"],
                 user_name=target.get("full_name", ""),
-                details={"from_student_id": current_user.get("id"), "account_id": acc["id"]},
+                details={
+                    "from_student_id": current_user.get("id"),
+                    "account_id": acc["id"],
+                    "target_inactive": target_inactive,
+                },
             )
         except Exception:
             pass

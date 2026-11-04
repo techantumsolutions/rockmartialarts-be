@@ -1,6 +1,7 @@
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Union, Any, Dict
+from datetime import datetime, timedelta, timezone
 import jwt
 import os
 from dotenv import load_dotenv
@@ -19,9 +20,40 @@ optional_security = HTTPBearer(auto_error=False)
 # Use the same SECRET_KEY as the main server
 SECRET_KEY = os.environ.get('SECRET_KEY', 'student_management_secret_key_2025_secure')
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 # Debug: Print the SECRET_KEY being used (first 20 chars only for security)
-print(f"🔑 unified_auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
+print(f"[AUTH] unified_auth.py using SECRET_KEY: {SECRET_KEY[:20]}...")
+
+
+def create_access_token(
+    data: Optional[Dict[str, Any]] = None,
+    expires_delta: Optional[timedelta] = None,
+    subject: Optional[Union[str, Any]] = None,
+    additional_claims: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Generate a JWT access token.
+
+    Supports both data dict (e.g. data={"sub": ...}) and subject/additional_claims.
+    """
+    to_encode: Dict[str, Any] = {}
+    if data:
+        to_encode.update(data)
+    if subject is not None:
+        to_encode["sub"] = str(subject)
+    if additional_claims:
+        to_encode.update(additional_claims)
+
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode["exp"] = expire
+    if "iat" not in to_encode:
+        to_encode["iat"] = datetime.now(timezone.utc)
+
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def _resolve_user_from_token(db, token: str) -> dict:
@@ -94,7 +126,13 @@ async def _resolve_user_from_token(db, token: str) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
-    return serialize_doc(user)
+    user_data = serialize_doc(user)
+    # Prefer JWT partner tenant claim when present
+    if payload.get("partner_org_id"):
+        user_data["partner_org_id"] = payload.get("partner_org_id")
+    if payload.get("partner_slug"):
+        user_data["partner_slug"] = payload.get("partner_slug")
+    return user_data
 
 
 async def get_current_user_or_superadmin(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -125,7 +163,7 @@ async def get_optional_current_user_or_superadmin(
     except (jwt.PyJWTError, HTTPException):
         return None
 
-def require_role_unified(allowed_roles: List[UserRole]):
+def require_role_unified(allowed_roles: List[UserRole], allow_inactive_coach: bool = False):
     """
     Role checker that works with regular users, superadmins, coaches, and branch managers
     """
@@ -133,7 +171,10 @@ def require_role_unified(allowed_roles: List[UserRole]):
         # Only block when explicitly inactive. Missing/None must not become 400
         # (superadmin docs often omit is_active; .get("is_active", True) still returns None if key exists).
         if current_user.get("is_active") is False:
-            raise HTTPException(status_code=400, detail="Inactive user")
+            is_coach = current_user.get("role") == "coach"
+            is_expired_sub = current_user.get("subscription_status") == "expired"
+            if not (is_coach and (allow_inactive_coach or is_expired_sub)):
+                raise HTTPException(status_code=400, detail="Inactive user")
 
         user_role = current_user["role"]
 
@@ -153,6 +194,24 @@ def require_role_unified(allowed_roles: List[UserRole]):
         elif user_role == "student":
             if UserRole.STUDENT not in allowed_roles:
                 raise HTTPException(status_code=403, detail="Insufficient permissions")
+        elif user_role == "partner_super_admin":
+            if UserRole.PARTNER_SUPER_ADMIN not in allowed_roles:
+                # Partner super admins may use the same APIs as Rock super admins
+                # when SUPER_ADMIN is in the allowed list (tenant-scoped in controllers).
+                if UserRole.SUPER_ADMIN not in allowed_roles:
+                    raise HTTPException(status_code=403, detail="Insufficient permissions")
+            # Block disabled partner orgs
+            org_id = (current_user.get("partner_org_id") or "").strip()
+            if org_id:
+                _db = get_db()
+                org = await _db.partner_organizations.find_one(
+                    {"id": org_id}, {"is_active": 1, "status": 1}
+                )
+                if not org or org.get("is_active") is False or org.get("status") == "disabled":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This partner account is disabled. Please contact administrator.",
+                    )
         else:
             # Fallback for any other roles
             if user_role not in [role.value for role in allowed_roles]:

@@ -462,6 +462,60 @@ class SearchController:
             # For branch managers, we need to filter by enrollments in managed branches
             # We'll handle this filtering after getting the base student list
 
+        partner_branch_ids = None
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_branch_ids as _partner_branch_ids,
+            partner_org_id_of,
+            partner_student_visibility_clause,
+            resolve_staff_partner_org_id,
+            rock_owned_clause,
+        )
+
+        staff_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+            db, current_user
+        )
+        if current_role == UserRole.PARTNER_SUPER_ADMIN or staff_org:
+            p_org = partner_org_id_of(current_user) or staff_org
+            partner_branch_ids = await _partner_branch_ids(db, current_user)
+            if partner_branch_ids is None and p_org:
+                partner_branch_ids = list(
+                    await db.branches.distinct("id", {"partner_org_id": p_org}) or []
+                )
+            if not partner_branch_ids and current_role == UserRole.PARTNER_SUPER_ADMIN:
+                return {
+                    "query": query or "",
+                    "students": [],
+                    "total": 0,
+                    "count": 0,
+                    "message": "No branches in your partner organization",
+                }
+            if branch_id and branch_id != "all" and partner_branch_ids and branch_id not in set(partner_branch_ids):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Branch is outside your partner organization",
+                )
+            enrolled_ids = await db.enrollments.distinct(
+                "student_id",
+                {
+                    "$or": [
+                        {"partner_org_id": p_org},
+                        {"branch_id": {"$in": list(partner_branch_ids or [])}},
+                    ]
+                },
+            )
+            student_filter = merge_and_clause(
+                student_filter,
+                partner_student_visibility_clause(
+                    p_org,
+                    partner_branch_ids=list(partner_branch_ids or []),
+                    enrolled_student_ids=list(enrolled_ids or []),
+                ),
+            )
+        else:
+            # Rock roles: exclude partner-owned students
+            student_filter = merge_and_clause(student_filter, rock_owned_clause())
+
         # Get students matching the base criteria
         students_cursor = db.users.find(student_filter).skip(skip).limit(limit)
         students = await students_cursor.to_list(length=limit)
@@ -492,6 +546,24 @@ class SearchController:
             # Filter students based on enrollment matches
             enrolled_student_ids = set(enrollment["student_id"] for enrollment in enrollments)
             students = [student for student in students if student["id"] in enrolled_student_ids]
+
+        elif current_role == UserRole.PARTNER_SUPER_ADMIN:
+            student_ids = [student["id"] for student in students]
+            enrollment_filter = {
+                "student_id": {"$in": student_ids},
+                "branch_id": {
+                    "$in": [branch_id]
+                    if branch_id and branch_id != "all"
+                    else list(partner_branch_ids or [])
+                },
+                "is_active": True,
+            }
+            if course_id and course_id != "all":
+                enrollment_filter["course_id"] = course_id
+            enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
+            enrolled_student_ids = set(enrollment["student_id"] for enrollment in enrollments)
+            students = [student for student in students if student["id"] in enrolled_student_ids]
+            total_students = len(students)
 
         elif branch_id or course_id:
             # Regular branch or course filtering for other roles
@@ -527,6 +599,7 @@ class SearchController:
                 # Get course details
                 course = await db.courses.find_one({"id": enrollment["course_id"]})
                 if course:
+                    b_ref = enrollment.get("batch_ref") or (student.get("course") or {}).get("batch_ref")
                     courses.append({
                         "id": course["id"],
                         "name": course.get("name", course.get("title", "Unknown Course")),
@@ -534,7 +607,10 @@ class SearchController:
                         "enrollment_date": enrollment["enrollment_date"],
                         "start_date": enrollment["start_date"],
                         "end_date": enrollment["end_date"],
-                        "payment_status": enrollment.get("payment_status", "unknown")
+                        "payment_status": enrollment.get("payment_status", "unknown"),
+                        "batch_ref": b_ref,
+                        "batch_name": enrollment.get("batch_name"),
+                        "branch_id": enrollment.get("branch_id"),
                     })
 
                 # Get branch details
@@ -555,8 +631,13 @@ class SearchController:
             student_data.pop("password", None)
 
             # Add enriched data
+            student_batch_ref = (
+                (student_enrollments[0].get("batch_ref") if student_enrollments else None)
+                or (student.get("course") or {}).get("batch_ref")
+            )
             enriched_student = {
                 **student_data,
+                "batch_ref": student_batch_ref,
                 "courses": courses,
                 "branches": branches,
                 "total_enrollments": len(student_enrollments),

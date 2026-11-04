@@ -17,6 +17,15 @@ from utils.course_hierarchy import (
     public_category_nav_item,
     resolve_public_category,
 )
+from utils.partner_tenant import (
+    assert_tenant_doc_access,
+    merge_and_clause,
+    partner_org_id_of,
+    rock_owned_clause,
+    stamp_tenant,
+    tenant_or_rock_owned_filter,
+    uniqueness_scope_for_user,
+)
 
 class CategoryController:
     @staticmethod
@@ -24,21 +33,25 @@ class CategoryController:
         category_data: CategoryCreate,
         current_user: dict = None
     ):
-        """Create new category (Super Admin only)"""
+        """Create new category (Super Admin / Partner Super Admin)"""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
         
         db = get_db()
-        
-        # Check if category code already exists
-        existing_category = await db.categories.find_one({"code": category_data.code})
+
+        code_query = merge_and_clause(
+            {"code": category_data.code},
+            uniqueness_scope_for_user(current_user),
+        )
+        existing_category = await db.categories.find_one(code_query)
         if existing_category:
             raise HTTPException(status_code=400, detail="Category code already exists")
 
         payload = category_data.dict()
         parent_id = (payload.get("parent_category_id") or "").strip() or None
         if parent_id:
-            await assert_parent_for_subcategory(db, parent_id)
+            parent = await assert_parent_for_subcategory(db, parent_id)
+            assert_tenant_doc_access(parent, current_user, entity="category")
         payload["parent_category_id"] = parent_id
         payload["slug"] = await ensure_category_slug(
             db, payload.get("name") or "category", existing_slug=payload.get("slug")
@@ -46,6 +59,7 @@ class CategoryController:
 
         category = Category(**payload)
         category_dict = category.dict()
+        stamp_tenant(category_dict, current_user)
         
         await db.categories.insert_one(category_dict)
         return {"message": "Category created successfully", "category_id": category.id}
@@ -57,7 +71,8 @@ class CategoryController:
         include_subcategories: bool = False,
         skip: int = 0,
         limit: int = 50,
-        current_user: dict = None
+        current_user: dict = None,
+        include_rock_master: bool = False,
     ):
         """Get categories with optional filtering"""
         db = get_db()
@@ -68,6 +83,19 @@ class CategoryController:
             query["parent_category_id"] = parent_id
         if active_only:
             query["is_active"] = True
+
+        org_id = partner_org_id_of(current_user)
+        if include_rock_master and org_id:
+            query = merge_and_clause(query, {
+                "$or": [
+                    {"partner_org_id": org_id},
+                    {"partner_org_id": {"$exists": False}},
+                    {"partner_org_id": None},
+                    {"partner_org_id": ""},
+                ]
+            })
+        else:
+            query = tenant_or_rock_owned_filter(query, current_user)
         
         # Get categories with sorting
         categories_cursor = db.categories.find(query).sort("display_order", 1).skip(skip).limit(limit)
@@ -100,10 +128,22 @@ class CategoryController:
             
             # Include subcategories if requested
             if include_subcategories:
-                subcategories = await db.categories.find({
+                sub_q = {
                     "parent_category_id": category["id"],
-                    "is_active": True
-                }).sort("display_order", 1).to_list(100)
+                    "is_active": True,
+                }
+                if include_rock_master and org_id:
+                    sub_q = merge_and_clause(sub_q, {
+                        "$or": [
+                            {"partner_org_id": org_id},
+                            {"partner_org_id": {"$exists": False}},
+                            {"partner_org_id": None},
+                            {"partner_org_id": ""},
+                        ]
+                    })
+                else:
+                    sub_q = tenant_or_rock_owned_filter(sub_q, current_user)
+                subcategories = await db.categories.find(sub_q).sort("display_order", 1).to_list(100)
                 
                 subcategory_list = []
                 for subcat in subcategories:
@@ -146,10 +186,10 @@ class CategoryController:
         """Get categories - Public endpoint (no authentication required)"""
         db = get_db()
         
-        # Build query for top-level categories only
-        query = {"parent_category_id": None}
+        # Build query for top-level Rock categories only (exclude partner tenants)
+        query = merge_and_clause({"parent_category_id": None}, rock_owned_clause())
         if active_only:
-            query["is_active"] = True
+            query = merge_and_clause(query, {"is_active": True})
         
         # Apply pagination
         if limit > 100:
@@ -181,10 +221,12 @@ class CategoryController:
             
             # Include subcategories if requested
             if include_subcategories:
-                subcategories = await db.categories.find({
-                    "parent_category_id": category["id"],
-                    "is_active": True
-                }).sort("display_order", 1).to_list(100)
+                subcategories = await db.categories.find(
+                    merge_and_clause(
+                        {"parent_category_id": category["id"], "is_active": True},
+                        rock_owned_clause(),
+                    )
+                ).sort("display_order", 1).to_list(100)
                 
                 subcategory_list = []
                 for subcat in subcategories:
@@ -237,10 +279,12 @@ class CategoryController:
     async def get_public_category_nav():
         """Slim top-level categories for website Courses navigation."""
         db = get_db()
-        categories = await db.categories.find({
-            "parent_category_id": None,
-            "is_active": True,
-        }).sort("display_order", 1).to_list(100)
+        categories = await db.categories.find(
+            merge_and_clause(
+                {"parent_category_id": None, "is_active": True},
+                rock_owned_clause(),
+            )
+        ).sort("display_order", 1).to_list(100)
         items = [public_category_nav_item(category) for category in categories]
         return {
             "categories": items,
@@ -255,14 +299,18 @@ class CategoryController:
         parent = None
         parent_id = (category.get("parent_category_id") or "").strip() or None
         if parent_id:
-            parent_doc = await db.categories.find_one({"id": parent_id, "is_active": True})
+            parent_doc = await db.categories.find_one(
+                merge_and_clause({"id": parent_id, "is_active": True}, rock_owned_clause())
+            )
             if parent_doc:
                 parent = public_category_nav_item(parent_doc)
 
-        subcategories = await db.categories.find({
-            "parent_category_id": category["id"],
-            "is_active": True,
-        }).sort("display_order", 1).to_list(100)
+        subcategories = await db.categories.find(
+            merge_and_clause(
+                {"parent_category_id": category["id"], "is_active": True},
+                rock_owned_clause(),
+            )
+        ).sort("display_order", 1).to_list(100)
 
         course_query = await courses_for_category_query(db, category["id"])
         course_query = {"$and": [course_query, {"settings.active": True}]}
@@ -300,15 +348,17 @@ class CategoryController:
         category = await db.categories.find_one({"id": category_id})
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
+        assert_tenant_doc_access(category, current_user, entity="category")
         
         # Count courses in this category
         course_count = await db.courses.count_documents(course_count_query(category_id))
         
         # Get subcategories
-        subcategories = await db.categories.find({
-            "parent_category_id": category_id,
-            "is_active": True
-        }).sort("display_order", 1).to_list(100)
+        sub_q = tenant_or_rock_owned_filter(
+            {"parent_category_id": category_id, "is_active": True},
+            current_user,
+        )
+        subcategories = await db.categories.find(sub_q).sort("display_order", 1).to_list(100)
         
         subcategory_list = []
         for subcat in subcategories:
@@ -347,7 +397,7 @@ class CategoryController:
         category_update: CategoryUpdate,
         current_user: dict = None
     ):
-        """Update category (Super Admin only)"""
+        """Update category (Super Admin / Partner Super Admin)"""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
         
@@ -357,13 +407,16 @@ class CategoryController:
         existing_category = await db.categories.find_one({"id": category_id})
         if not existing_category:
             raise HTTPException(status_code=404, detail="Category not found")
+        assert_tenant_doc_access(existing_category, current_user, entity="category")
         
-        # Check if new code conflicts with existing categories
+        # Check if new code conflicts with existing categories (same tenant)
         if category_update.code and category_update.code != existing_category["code"]:
-            code_conflict = await db.categories.find_one({
-                "code": category_update.code,
-                "id": {"$ne": category_id}
-            })
+            code_conflict = await db.categories.find_one(
+                merge_and_clause(
+                    {"code": category_update.code, "id": {"$ne": category_id}},
+                    uniqueness_scope_for_user(current_user),
+                )
+            )
             if code_conflict:
                 raise HTTPException(status_code=400, detail="Category code already exists")
         
@@ -371,7 +424,8 @@ class CategoryController:
         if "parent_category_id" in category_update.dict(exclude_unset=True):
             parent_id = (category_update.parent_category_id or "").strip() or None
             if parent_id:
-                await assert_parent_for_subcategory(db, parent_id, exclude_id=category_id)
+                parent = await assert_parent_for_subcategory(db, parent_id, exclude_id=category_id)
+                assert_tenant_doc_access(parent, current_user, entity="category")
                 child_count = await db.categories.count_documents({"parent_category_id": category_id})
                 if child_count > 0:
                     raise HTTPException(
@@ -415,7 +469,7 @@ class CategoryController:
         category_id: str,
         current_user: dict = None
     ):
-        """Delete category (Super Admin only)"""
+        """Delete category (Super Admin / Partner Super Admin)"""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
         
@@ -425,6 +479,7 @@ class CategoryController:
         category = await db.categories.find_one({"id": category_id})
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
+        assert_tenant_doc_access(category, current_user, entity="category")
         
         # Check if category has courses (including as a subcategory)
         course_count = await db.courses.count_documents(course_count_query(category_id))
@@ -461,10 +516,12 @@ class CategoryController:
         parent = await db.categories.find_one({"id": category_id})
         if not parent:
             raise HTTPException(status_code=404, detail="Category not found")
+        assert_tenant_doc_access(parent, current_user, entity="category")
 
         query = {"parent_category_id": category_id}
         if active_only:
             query["is_active"] = True
+        query = tenant_or_rock_owned_filter(query, current_user)
         children = await db.categories.find(query).sort("name", 1).to_list(200)
         items = []
         for subcat in children:
@@ -500,12 +557,13 @@ class CategoryController:
         """Get category details with associated courses - Public endpoint"""
         db = get_db()
 
-        # Build query
+        # Build query (Rock-owned only — exclude partner tenants)
         query = {}
         if category_id:
             query["id"] = category_id
         if active_only:
             query["is_active"] = True
+        query = merge_and_clause(query, rock_owned_clause())
 
         # Apply pagination
         if limit > 100:
@@ -556,10 +614,12 @@ class CategoryController:
                     courses.append(course_data)
 
             # Get subcategories
-            subcategories = await db.categories.find({
-                "parent_category_id": category["id"],
-                "is_active": True
-            }).sort("display_order", 1).to_list(100)
+            subcategories = await db.categories.find(
+                merge_and_clause(
+                    {"parent_category_id": category["id"], "is_active": True},
+                    rock_owned_clause(),
+                )
+            ).sort("display_order", 1).to_list(100)
 
             subcategory_list = []
             for subcat in subcategories:
@@ -602,12 +662,13 @@ class CategoryController:
         """Get categories with their courses and available durations in nested structure - Public endpoint"""
         db = get_db()
 
-        # Build query
+        # Build query (Rock-owned only — exclude partner tenants)
         query = {}
         if category_id:
             query["id"] = category_id
         if active_only:
             query["is_active"] = True
+        query = merge_and_clause(query, rock_owned_clause())
 
         # Apply pagination
         if limit > 50:
@@ -727,8 +788,10 @@ class CategoryController:
         """Get complete hierarchy for a category - courses, locations, branches, and durations - Public endpoint"""
         db = get_db()
 
-        # Get category
-        category = await db.categories.find_one({"id": category_id})
+        # Get category (Rock-owned only)
+        category = await db.categories.find_one(
+            merge_and_clause({"id": category_id}, rock_owned_clause())
+        )
         if not category:
             raise HTTPException(status_code=404, detail="Category not found")
 

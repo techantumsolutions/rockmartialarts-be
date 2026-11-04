@@ -19,6 +19,7 @@ _LEAD_ADMIN_ROLES = [
     UserRole.SUPER_ADMIN,
     UserRole.COACH_ADMIN,
     UserRole.BRANCH_MANAGER,
+    UserRole.PARTNER_SUPER_ADMIN,
 ]
 
 
@@ -62,7 +63,11 @@ async def list_leads(
     limit: int = Query(50, ge=1, le=200),
     search: Optional[str] = None,
     status: Optional[str] = Query(
-        None, description="Filter by status: new, contacted, qualified, converted, lost"
+        None,
+        description="Filter by status: new, pending_acceptance, assigned, contacted, qualified, converted, lost",
+    ),
+    priority: Optional[str] = Query(
+        None, description="Filter by priority: low, medium, high, urgent"
     ),
     source: Optional[str] = Query(None, description="Legacy source label filter"),
     source_type: Optional[str] = Query(
@@ -97,6 +102,7 @@ async def list_leads(
         sort=sort,
         coach_assignment_status=coach_assignment_status,
         unassigned_coach=unassigned_coach,
+        priority=priority,
         current_user=current_user,
     )
 

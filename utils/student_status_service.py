@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,23 @@ from utils.database import get_db
 from utils.helpers import serialize_doc
 
 logger = logging.getLogger(__name__)
+
+_BM_ROLES = {"branch_manager", "branch_admin", "branchmanager"}
+_request_active_branch_id: ContextVar[Optional[str]] = ContextVar(
+    "request_active_branch_id", default=None
+)
+
+
+def set_request_active_branch_id(branch_id: Optional[str]):
+    return _request_active_branch_id.set((branch_id or "").strip() or None)
+
+
+def reset_request_active_branch_id(token) -> None:
+    _request_active_branch_id.reset(token)
+
+
+def _is_branch_manager(current_user: Optional[dict]) -> bool:
+    return str((current_user or {}).get("role") or "").lower() in _BM_ROLES
 
 
 async def ensure_student_status_indexes(db=None) -> None:
@@ -31,26 +49,46 @@ async def ensure_student_status_indexes(db=None) -> None:
         logger.exception("Failed ensuring student_status_history indexes")
 
 
-async def get_managed_branch_ids_for_user(db, current_user: dict) -> List[str]:
-    """Resolve branch manager managed branch ids (DB first, JWT fallback)."""
-    manager_id = current_user.get("id")
+async def get_assigned_branch_ids_for_user(db, current_user: dict) -> List[str]:
+    """Every live branch this manager is assigned to (branches.manager_id).
+
+    Used by the header switch. Data queries use get_managed_branch_ids_for_user,
+    which narrows this list to the selected branch.
+    """
+    manager_id = (current_user or {}).get("id")
     ids: List[str] = []
-    if manager_id:
+    if manager_id and db is not None:
         rows = await db.branches.find(
             {"manager_id": manager_id, "is_active": True}, {"id": 1}
         ).to_list(length=None)
         ids = [str(r["id"]) for r in rows if r.get("id")]
     if not ids:
-        raw = current_user.get("managed_branches") or current_user.get("branch_ids") or []
+        raw = (current_user or {}).get("managed_branches") or (current_user or {}).get("branch_ids") or []
         if isinstance(raw, str):
             raw = [raw]
         ids = [str(x) for x in raw if x]
     if not ids:
-        ba = current_user.get("branch_assignment") or {}
-        bid = ba.get("branch_id") or current_user.get("branch_id")
+        ba = (current_user or {}).get("branch_assignment") or {}
+        bid = ba.get("branch_id") or (current_user or {}).get("branch_id")
         if bid:
             ids = [str(bid)]
     return ids
+
+
+async def get_managed_branch_ids_for_user(db, current_user: dict) -> List[str]:
+    """Branch ids a data query may use.
+
+    Branch managers get exactly one id: the X-Active-Branch-Id request header
+    when it is one of their assigned branches, otherwise the first assigned id.
+    Other roles get the full assigned list (unchanged).
+    """
+    ids = await get_assigned_branch_ids_for_user(db, current_user)
+    if not _is_branch_manager(current_user) or not ids:
+        return ids
+    requested = _request_active_branch_id.get()
+    if requested and requested in ids:
+        return [requested]
+    return [sorted(ids)[0]]
 
 
 async def assert_can_manage_student_status(

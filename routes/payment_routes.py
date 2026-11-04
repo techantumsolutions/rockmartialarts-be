@@ -9,14 +9,24 @@ from models.student_models import (
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
 )
-from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody
+from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody, CreateRegistrationOrderBody
 from models.user_models import UserRole
 from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin, get_optional_current_user_or_superadmin
 from fastapi import Request, HTTPException
 from utils.razorpay_reconciliation import verify_razorpay_webhook_signature
+from utils.razorpay_client import get_razorpay_runtime_status
 
 router = APIRouter()
+
+
+@router.get("/razorpay/status", status_code=status.HTTP_200_OK)
+async def razorpay_status():
+    """
+    Public go-live readiness check (no secrets).
+    Confirms live/test mode, key presence, webhook secret, and FRONTEND_URL sanity.
+    """
+    return get_razorpay_runtime_status()
 
 @router.post("/students/payments", status_code=status.HTTP_201_CREATED)
 async def student_process_payment(
@@ -87,10 +97,19 @@ async def confirm_razorpay_payment(
     """Record Razorpay payment and update enrollment (student-only)."""
     return await PaymentController.confirm_razorpay_payment(data, current_user)
 
+@router.post("/create-registration-order", status_code=status.HTTP_200_OK)
+async def create_registration_order(body: CreateRegistrationOrderBody):
+    """Create a Razorpay order for online student registration checkout."""
+    return await PaymentController.create_registration_order(body)
+
+
 @router.post("/process-registration", status_code=status.HTTP_201_CREATED)
-async def process_registration_payment(payment_data: RegistrationPaymentCreate):
-    """Process payment for student registration (public endpoint)"""
-    return await PaymentController.process_registration_payment(payment_data)
+async def process_registration_payment(
+    payment_data: RegistrationPaymentCreate,
+    current_user: Optional[dict] = Depends(get_optional_current_user_or_superadmin)
+):
+    """Process payment for student registration (public or authenticated admin/coach endpoint)"""
+    return await PaymentController.process_registration_payment(payment_data, current_user)
 
 @router.post("/renew-subscription", status_code=status.HTTP_200_OK)
 async def renew_subscription(
@@ -143,11 +162,23 @@ async def get_payment_stats(
     start_date: Optional[str] = Query(None, description="Period start YYYY-MM-DD (inclusive)"),
     end_date: Optional[str] = Query(None, description="Period end YYYY-MM-DD (inclusive)"),
     branch_id: Optional[str] = Query(None, description="Filter by branch id (super admin)"),
+    partner_org_id: Optional[str] = Query(
+        None, description="Rock SA: filter stats to one partner organization"
+    ),
+    partner_scope: Optional[str] = Query(
+        None,
+        description="Rock SA: all | rock | partners — separate Rock vs partner revenue",
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
 ):
     """Get payment statistics for dashboard - Students get their own payment stats"""
     return await PaymentController.get_payment_stats(
-        current_user, start_date=start_date, end_date=end_date, branch_id=branch_id
+        current_user,
+        start_date=start_date,
+        end_date=end_date,
+        branch_id=branch_id,
+        partner_org_id=partner_org_id,
+        partner_scope=partner_scope,
     )
 
 @router.get("")
@@ -157,6 +188,13 @@ async def get_payments(
     status: Optional[str] = Query(None),
     payment_type: Optional[str] = Query(None),
     branch_id: Optional[str] = Query(None, description="Filter by branch id"),
+    partner_org_id: Optional[str] = Query(
+        None, description="Rock SA: filter payments to one partner organization"
+    ),
+    partner_scope: Optional[str] = Query(
+        None,
+        description="Rock SA: all | rock | partners — separate Rock vs partner transactions",
+    ),
     search: Optional[str] = Query(None, description="Search by student name/email/phone or transaction id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
@@ -173,6 +211,8 @@ async def get_payments(
         end_date=end_date,
         search=search,
         branch_id=branch_id,
+        partner_org_id=partner_org_id,
+        partner_scope=partner_scope,
     )
 
 @router.put("/{payment_id}/cancel")
@@ -254,3 +294,22 @@ async def revenue_by_branch(
     return await PaymentController.get_revenue_by_branch(
         current_user, start_date=start_date, end_date=end_date, branch_id=branch_id
     )
+
+
+@router.get("/{payment_id}")
+async def get_payment_by_id(
+    payment_id: str,
+    current_user: dict = Depends(
+        require_role_unified(
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.COACH,
+                UserRole.STUDENT,
+            ]
+        )
+    ),
+):
+    """Get a single payment by id (detail page / recover checks)."""
+    return await PaymentController.get_payment_by_id(payment_id, current_user)
