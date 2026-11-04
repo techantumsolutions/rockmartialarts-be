@@ -5,6 +5,7 @@ from models.partner_org_models import (
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
+    PartnerProfileUpdate,
     PartnerSetPassword,
 )
 from utils import partner_org_service as svc
@@ -44,3 +45,11 @@ class PartnerOrgController:
     @staticmethod
     async def set_active(partner_org_id: str, body: PartnerOrgUpdateStatus, current_user: dict):
         return await svc.set_partner_org_active(partner_org_id, body, current_user)
+
+    @staticmethod
+    async def get_me(current_user: dict):
+        return await svc.get_partner_me(current_user)
+
+    @staticmethod
+    async def update_me(body: PartnerProfileUpdate, current_user: dict):
+        return await svc.update_partner_me(body, current_user)

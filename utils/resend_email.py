@@ -495,6 +495,7 @@ async def send_partner_invite_email(
     payment_status: str,
     set_password_link: str,
     login_link: str,
+    role_login_links: Optional[dict] = None,
 ) -> bool:
     """Send partner admin invite (create password) via Resend."""
     api_key = (os.getenv("RESEND_API_KEY") or "").strip()
@@ -513,6 +514,20 @@ async def send_partner_invite_email(
         return False
 
     display = (partner_name or "Partner").strip()
+    links = role_login_links or {}
+    admin_login = links.get("admin") or login_link
+    bm_login = links.get("branch_manager") or ""
+    coach_login = links.get("coach") or ""
+    student_login = links.get("student") or ""
+    role_links_html = f"""
+      <p style="margin:16px 0 8px;color:#6b7280;font-size:12px;">Partner login pages:</p>
+      <table style="width:100%;border-collapse:collapse;margin:0 0 8px;font-size:12px;background:#f3f4f6;border-radius:6px;">
+        <tr><td style="padding:8px 10px;color:#6b7280;white-space:nowrap;">Admin</td><td style="padding:8px 10px;word-break:break-all;"><a href="{admin_login}" style="color:#111827;">{admin_login}</a></td></tr>
+        <tr><td style="padding:8px 10px;color:#6b7280;white-space:nowrap;">Branch Admin</td><td style="padding:8px 10px;word-break:break-all;"><a href="{bm_login}" style="color:#111827;">{bm_login}</a></td></tr>
+        <tr><td style="padding:8px 10px;color:#6b7280;white-space:nowrap;">Coach</td><td style="padding:8px 10px;word-break:break-all;"><a href="{coach_login}" style="color:#111827;">{coach_login}</a></td></tr>
+        <tr><td style="padding:8px 10px;color:#6b7280;white-space:nowrap;">Student</td><td style="padding:8px 10px;word-break:break-all;"><a href="{student_login}" style="color:#111827;">{student_login}</a></td></tr>
+      </table>
+"""
     subject = f"Welcome to {display} — create your partner admin password"
     html = f"""<!DOCTYPE html>
 <html>
@@ -540,8 +555,9 @@ async def send_partner_invite_email(
           Create password
         </a>
       </div>
-      <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Login after setup:</p>
+      <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Admin login after setup:</p>
       <p style="margin:0;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{login_link}</p>
+      {role_links_html}
       <p style="margin:16px 0 0;color:#9ca3af;font-size:12px;">This invite link expires in 7 days.</p>
     </div>
   </div>

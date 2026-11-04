@@ -52,6 +52,70 @@ def _normalize_phone(country_code: str, phone: str) -> tuple[str, str]:
     return cc, local
 
 
+async def _assert_coach_email_phone_available(
+    db,
+    *,
+    email: str = "",
+    country_code: str = "+91",
+    phone: str = "",
+    full_phone: str = "",
+) -> None:
+    """Block coach registration when email or mobile is already on a coach record."""
+    email_clean = (email or "").strip().lower()
+    if full_phone:
+        digits = "".join(c for c in full_phone if c.isdigit())
+        local = digits[-10:] if len(digits) >= 10 else re.sub(r"\s+", "", full_phone.strip())
+        cc = "+91"
+        if full_phone.strip().startswith("+") and len(digits) > 10:
+            cc = f"+{digits[:-10]}" if digits[:-10] else "+91"
+        resolved_full = f"{cc}{local}" if local else full_phone.strip()
+    else:
+        cc, local = _normalize_phone(country_code, phone)
+        resolved_full = f"{cc}{local}" if local else ""
+
+    or_clauses: List[Dict[str, Any]] = []
+    if email_clean:
+        or_clauses.extend(
+            [
+                {"email": email_clean},
+                {"contact_info.email": email_clean},
+                {"email": {"$regex": f"^{re.escape(email_clean)}$", "$options": "i"}},
+                {
+                    "contact_info.email": {
+                        "$regex": f"^{re.escape(email_clean)}$",
+                        "$options": "i",
+                    }
+                },
+            ]
+        )
+    if local:
+        variants = list(
+            {
+                local,
+                resolved_full,
+                f"+91{local}",
+                f"91{local}",
+                f"0{local}",
+            }
+        )
+        or_clauses.extend(
+            [
+                {"phone": {"$in": variants}},
+                {"contact_info.phone": local},
+                {"contact_info.phone": {"$in": variants}},
+            ]
+        )
+    if not or_clauses:
+        return
+
+    existing = await db[COL].find_one({"$or": or_clauses}, {"id": 1})
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Coach with this email or phone already exists",
+        )
+
+
 async def _validate_service_locations(db, location_ids: List[str]) -> List[Dict[str, str]]:
     ids = [str(i).strip() for i in (location_ids or []) if str(i).strip()]
     if not ids:
@@ -141,6 +205,16 @@ async def create_coach_registration_order(
         except (TypeError, ValueError):
             fee = 0.0
 
+    name = (body.name if body else "") or ""
+    email = (body.email if body else "") or ""
+    phone = (body.phone if body else "") or ""
+
+    # Block checkout when email/mobile already registered as a coach
+    if email.strip() or phone.strip():
+        await _assert_coach_email_phone_available(
+            db, email=email, full_phone=phone
+        )
+
     if fee <= 0:
         return {
             "fee_required": False,
@@ -153,10 +227,6 @@ async def create_coach_registration_order(
     key_id = os.getenv("RAZORPAY_KEY_ID", "").strip()
     amount_paise = int(round(fee * 100))
     receipt = f"coach_reg_{secrets.token_hex(6)}"
-
-    name = (body.name if body else "") or ""
-    email = (body.email if body else "") or ""
-    phone = (body.phone if body else "") or ""
 
     order_payload = {
         "amount": amount_paise,
@@ -217,20 +287,12 @@ async def register_coach(
     full_phone = f"{cc}{local_phone}"
     email = str(body.email).strip().lower()
 
-    existing = await db[COL].find_one(
-        {
-            "$or": [
-                {"email": email},
-                {"contact_info.email": email},
-                {"phone": full_phone},
-                {"contact_info.phone": local_phone},
-            ]
-        }
+    await _assert_coach_email_phone_available(
+        db,
+        email=email,
+        country_code=cc,
+        phone=local_phone,
     )
-    if existing:
-        raise HTTPException(
-            status_code=400, detail="Coach with this email or phone already exists"
-        )
 
     coach_fee = 0.0
     settings_doc = await db.system_settings.find_one({}) or {}
