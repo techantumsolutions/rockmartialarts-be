@@ -23,10 +23,11 @@ async def get_categories(
     include_subcategories: bool = False,
     skip: int = 0,
     limit: int = 50,
+    include_rock_master: bool = False,
     current_user: dict = Depends(get_current_user_or_superadmin)
 ):
     """Get categories with optional filtering - authenticated endpoint"""
-    return await CategoryController.get_categories(parent_id, active_only, include_subcategories, skip, limit, current_user)
+    return await CategoryController.get_categories(parent_id, active_only, include_subcategories, skip, limit, current_user, include_rock_master)
 
 @router.get("/public/all")
 async def get_public_categories(

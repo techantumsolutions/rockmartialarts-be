@@ -207,11 +207,14 @@ async def get_coaches(
     course_id: Optional[str] = Query(
         None, description="Only coaches assigned to this course"
     ),
+    all_tenants: bool = Query(
+        False, description="Super admin only: include coaches across all partner tenants"
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
     """Get coaches with filtering options"""
     return await CoachController.get_coaches(
-        skip, limit, active_only, area_of_expertise, current_user, approval_status, branch_id, course_id
+        skip, limit, active_only, area_of_expertise, current_user, approval_status, branch_id, course_id, all_tenants
     )
 
 @router.get("/me")

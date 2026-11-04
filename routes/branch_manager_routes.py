@@ -121,10 +121,11 @@ async def get_branch_managers(
     skip: int = Query(0, ge=0, description="Number of branch managers to skip"),
     limit: int = Query(50, ge=1, le=100, description="Number of branch managers to return"),
     active_only: bool = Query(True, description="Filter only active branch managers"),
+    all_tenants: bool = Query(False, description="Super admin only: include branch managers across all partner tenants"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN]))
 ):
     """Get list of branch managers with pagination"""
-    return await BranchManagerController.get_branch_managers(skip, limit, active_only, current_user)
+    return await BranchManagerController.get_branch_managers(skip, limit, active_only, current_user, all_tenants)
 
 @router.get("/{manager_id}")
 async def get_branch_manager(
