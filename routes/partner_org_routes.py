@@ -15,6 +15,7 @@ from models.partner_org_models import (
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
+    PartnerProfileUpdate,
     PartnerSetPassword,
 )
 from models.user_models import UserRole
@@ -43,6 +44,23 @@ async def public_partner_landing(slug: str):
 async def public_partner_landing_lead(slug: str, body: PartnerOrgLandingLeadCreate):
     """Capture a lead from the white-label partner landing page."""
     return await PartnerOrgBrandingController.submit_landing_lead(slug, body)
+
+
+@router.get("/me")
+async def get_my_partner_profile(
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: get own account profile."""
+    return await PartnerOrgController.get_me(current_user)
+
+
+@router.put("/me")
+async def update_my_partner_profile(
+    body: PartnerProfileUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: update own account profile."""
+    return await PartnerOrgController.update_me(body, current_user)
 
 
 @router.get("/me/branding")

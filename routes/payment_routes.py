@@ -284,3 +284,22 @@ async def revenue_by_branch(
     return await PaymentController.get_revenue_by_branch(
         current_user, start_date=start_date, end_date=end_date, branch_id=branch_id
     )
+
+
+@router.get("/{payment_id}")
+async def get_payment_by_id(
+    payment_id: str,
+    current_user: dict = Depends(
+        require_role_unified(
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.COACH,
+                UserRole.STUDENT,
+            ]
+        )
+    ),
+):
+    """Get a single payment by id (detail page / recover checks)."""
+    return await PaymentController.get_payment_by_id(payment_id, current_user)

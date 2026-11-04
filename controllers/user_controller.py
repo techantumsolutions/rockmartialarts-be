@@ -399,13 +399,18 @@ class UserController:
             )
             await assert_partner_owns_branch(get_db(), current_user, branch_for_check)
 
-        # Check if user exists
+        # Check if user exists (case/format tolerant email + mobile)
         db = get_db()
-        existing_user = await db.users.find_one({
-            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
-        })
-        if existing_user:
-            raise HTTPException(status_code=400, detail="User already exists")
+        from controllers.auth_controller import AuthController
+
+        availability = await AuthController.check_student_availability(
+            email=user_data.email, phone=user_data.phone
+        )
+        if not availability.get("available", True):
+            raise HTTPException(
+                status_code=400,
+                detail=availability.get("message") or "User already exists",
+            )
         
         # Generate password if not provided
         if not user_data.password:

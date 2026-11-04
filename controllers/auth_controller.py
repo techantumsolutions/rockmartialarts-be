@@ -164,12 +164,16 @@ class AuthController:
         """Register a new student (public endpoint)"""
         db = get_db()
         
-        # Check if user exists
-        existing_user = await db.users.find_one({
-            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
-        })
-        if existing_user:
-            raise HTTPException(status_code=400, detail="User with this email or phone already exists")
+        # Block duplicate email/mobile (case/format tolerant)
+        availability = await AuthController.check_student_availability(
+            email=user_data.email, phone=user_data.phone
+        )
+        if not availability.get("available", True):
+            raise HTTPException(
+                status_code=400,
+                detail=availability.get("message")
+                or "User with this email or phone already exists",
+            )
         
         # Generate password if not provided
         if not user_data.password:
@@ -336,11 +340,15 @@ class AuthController:
     async def create_user_silent(user_data: UserCreate):
         """Create user and optional enrollment without sending SMS. Used by bulk import."""
         db = get_db()
-        existing_user = await db.users.find_one({
-            "$or": [{"email": user_data.email}, {"phone": user_data.phone}]
-        })
-        if existing_user:
-            raise HTTPException(status_code=400, detail=f"User with email {user_data.email} or phone {user_data.phone} already exists")
+        availability = await AuthController.check_student_availability(
+            email=user_data.email, phone=user_data.phone
+        )
+        if not availability.get("available", True):
+            raise HTTPException(
+                status_code=400,
+                detail=availability.get("message")
+                or f"User with email {user_data.email} or phone {user_data.phone} already exists",
+            )
         if not user_data.password:
             user_data.password = secrets.token_urlsafe(8)
         hashed_password = hash_password(user_data.password)

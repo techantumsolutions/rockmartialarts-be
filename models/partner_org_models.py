@@ -47,6 +47,12 @@ class PartnerLogin(BaseModel):
     password: str
 
 
+class PartnerProfileUpdate(BaseModel):
+    full_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, min_length=7, max_length=20)
+
+
 class PartnerOrgUpdateStatus(BaseModel):
     is_active: bool
 
