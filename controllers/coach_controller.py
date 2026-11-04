@@ -170,6 +170,7 @@ class CoachController:
         approval_status: Optional[str] = None,
         branch_id: Optional[str] = None,
         course_id: Optional[str] = None,
+        all_tenants: bool = False,
     ):
         """Get coaches with filters. Branch managers see only coaches in their managed branches."""
         db = get_db()
@@ -240,11 +241,21 @@ class CoachController:
             and_parts.append(assigned_scope)
             filter_query["$and"] = and_parts
 
-        from utils.partner_tenant import apply_tenant_filter, assert_partner_owns_branch
+        from utils.partner_tenant import (
+            apply_tenant_filter,
+            assert_partner_owns_branch,
+            is_partner_super_admin,
+            tenant_or_rock_owned_filter,
+        )
 
         if bid:
             await assert_partner_owns_branch(db, current_user, bid)
-        filter_query = apply_tenant_filter(filter_query, current_user)
+
+        if all_tenants and not is_partner_super_admin(current_user):
+            # Super admin explicitly requested unscoped cross-tenant listing
+            pass
+        else:
+            filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
 
         coaches = await db.coaches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
         

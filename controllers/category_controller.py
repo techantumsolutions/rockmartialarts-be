@@ -20,6 +20,7 @@ from utils.course_hierarchy import (
 from utils.partner_tenant import (
     assert_tenant_doc_access,
     merge_and_clause,
+    partner_org_id_of,
     rock_owned_clause,
     stamp_tenant,
     tenant_or_rock_owned_filter,
@@ -70,7 +71,8 @@ class CategoryController:
         include_subcategories: bool = False,
         skip: int = 0,
         limit: int = 50,
-        current_user: dict = None
+        current_user: dict = None,
+        include_rock_master: bool = False,
     ):
         """Get categories with optional filtering"""
         db = get_db()
@@ -81,7 +83,19 @@ class CategoryController:
             query["parent_category_id"] = parent_id
         if active_only:
             query["is_active"] = True
-        query = tenant_or_rock_owned_filter(query, current_user)
+
+        org_id = partner_org_id_of(current_user)
+        if include_rock_master and org_id:
+            query = merge_and_clause(query, {
+                "$or": [
+                    {"partner_org_id": org_id},
+                    {"partner_org_id": {"$exists": False}},
+                    {"partner_org_id": None},
+                    {"partner_org_id": ""},
+                ]
+            })
+        else:
+            query = tenant_or_rock_owned_filter(query, current_user)
         
         # Get categories with sorting
         categories_cursor = db.categories.find(query).sort("display_order", 1).skip(skip).limit(limit)
@@ -118,7 +132,17 @@ class CategoryController:
                     "parent_category_id": category["id"],
                     "is_active": True,
                 }
-                sub_q = tenant_or_rock_owned_filter(sub_q, current_user)
+                if include_rock_master and org_id:
+                    sub_q = merge_and_clause(sub_q, {
+                        "$or": [
+                            {"partner_org_id": org_id},
+                            {"partner_org_id": {"$exists": False}},
+                            {"partner_org_id": None},
+                            {"partner_org_id": ""},
+                        ]
+                    })
+                else:
+                    sub_q = tenant_or_rock_owned_filter(sub_q, current_user)
                 subcategories = await db.categories.find(sub_q).sort("display_order", 1).to_list(100)
                 
                 subcategory_list = []
