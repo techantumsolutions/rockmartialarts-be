@@ -15,8 +15,18 @@ from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin, get_optional_current_user_or_superadmin
 from fastapi import Request, HTTPException
 from utils.razorpay_reconciliation import verify_razorpay_webhook_signature
+from utils.razorpay_client import get_razorpay_runtime_status
 
 router = APIRouter()
+
+
+@router.get("/razorpay/status", status_code=status.HTTP_200_OK)
+async def razorpay_status():
+    """
+    Public go-live readiness check (no secrets).
+    Confirms live/test mode, key presence, webhook secret, and FRONTEND_URL sanity.
+    """
+    return get_razorpay_runtime_status()
 
 @router.post("/students/payments", status_code=status.HTTP_201_CREATED)
 async def student_process_payment(

@@ -230,6 +230,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.exception("Failed to ensure billing cycle indexes")
 
+    # Razorpay go-live readiness (keys/mode/webhook/FRONTEND_URL) — logs warnings only.
+    try:
+        from utils.razorpay_client import log_razorpay_startup_warnings
+        log_razorpay_startup_warnings()
+    except Exception:
+        logging.exception("Failed to evaluate Razorpay go-live status")
+
     # Additive indexes (safe to re-run).
     try:
         from utils.family_accounts import ensure_account_indexes
@@ -524,22 +531,29 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
-# Get CORS origins from environment or use default
-cors_origins = os.getenv("CORS_ORIGINS", "*")
-if cors_origins == "*":
-    allowed_origins = ["*"]
-else:
-    allowed_origins = [origin.strip() for origin in cors_origins.split(",")]
-
-# Add specific origins for your deployment
-allowed_origins_list = [
+# Add CORS middleware — merge env + production defaults (never rely on :8003 as a browser origin)
+_default_cors_origins = [
     "http://localhost:3022",
     "http://127.0.0.1:3022",
     "https://rockmartialartsacademy.com",
+    "https://www.rockmartialartsacademy.com",
     "http://rockmartialartsacademy.com",
-    "*"  # Allow all origins as fallback
+    "http://www.rockmartialartsacademy.com",
 ]
+_cors_env = (os.getenv("CORS_ORIGINS") or "").strip()
+_allowed_origins: list[str] = []
+if _cors_env and _cors_env != "*":
+    _allowed_origins.extend(o.strip() for o in _cors_env.split(",") if o.strip())
+_allowed_origins.extend(_default_cors_origins)
+# De-dupe, drop accidental API-port origins (browsers never send Origin with :8003 for the website)
+_seen = set()
+allowed_origins_list: list[str] = []
+for origin in _allowed_origins:
+    if ":8003" in origin:
+        continue
+    if origin not in _seen:
+        _seen.add(origin)
+        allowed_origins_list.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
