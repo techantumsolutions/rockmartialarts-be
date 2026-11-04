@@ -42,5 +42,13 @@ class PartnerOrgController:
         return await svc.get_partner_public_by_slug(slug)
 
     @staticmethod
+    async def get_my_profile(current_user: dict):
+        return await svc.get_partner_admin_profile(current_user)
+
+    @staticmethod
+    async def update_my_profile(current_user: dict, body: dict):
+        return await svc.update_partner_admin_profile(current_user, body)
+
+    @staticmethod
     async def set_active(partner_org_id: str, body: PartnerOrgUpdateStatus, current_user: dict):
         return await svc.set_partner_org_active(partner_org_id, body, current_user)

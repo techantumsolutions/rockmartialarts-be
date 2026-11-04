@@ -491,6 +491,64 @@ async def get_partner_public_by_slug(slug: str) -> Dict[str, Any]:
     }
 
 
+async def get_partner_admin_profile(current_user: dict) -> Dict[str, Any]:
+    """Return the logged-in partner super admin profile for the dashboard Profile page."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    user_id = str((current_user or {}).get("id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user = await db[COL_USERS].find_one({"id": user_id})
+    if not user or str(user.get("role") or "") != UserRole.PARTNER_SUPER_ADMIN.value:
+        raise HTTPException(status_code=404, detail="Partner profile not found")
+    org_id = str(user.get("partner_org_id") or current_user.get("partner_org_id") or "").strip()
+    org = await db[COL].find_one({"id": org_id}) if org_id else None
+    data = serialize_doc(user)
+    data.pop("password_hash", None)
+    data["partner_org_id"] = org_id or None
+    data["partner_name"] = (org or {}).get("name") or current_user.get("partner_name")
+    data["partner_slug"] = (org or {}).get("slug") or current_user.get("partner_slug")
+    return {"status": "success", "data": data}
+
+
+async def update_partner_admin_profile(current_user: dict, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Update name / email / phone for the logged-in partner super admin."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+    user_id = str((current_user or {}).get("id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user = await db[COL_USERS].find_one({"id": user_id})
+    if not user or str(user.get("role") or "") != UserRole.PARTNER_SUPER_ADMIN.value:
+        raise HTTPException(status_code=404, detail="Partner profile not found")
+
+    patch: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    full_name = str((body or {}).get("full_name") or "").strip()
+    email = str((body or {}).get("email") or "").strip().lower()
+    phone = str((body or {}).get("phone") or "").strip()
+
+    if full_name:
+        patch["full_name"] = full_name
+        parts = full_name.split(None, 1)
+        patch["first_name"] = parts[0]
+        patch["last_name"] = parts[1] if len(parts) > 1 else ""
+    if email:
+        other = await db[COL_USERS].find_one(
+            {"email": email, "id": {"$ne": user_id}},
+            {"id": 1},
+        )
+        if other:
+            raise HTTPException(status_code=400, detail="Email is already in use")
+        patch["email"] = email
+    if "phone" in (body or {}):
+        patch["phone"] = phone or None
+
+    await db[COL_USERS].update_one({"id": user_id}, {"$set": patch})
+    return await get_partner_admin_profile(current_user)
+
+
 async def list_partner_orgs(
     *,
     skip: int = 0,

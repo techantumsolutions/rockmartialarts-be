@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query
 
 from controllers.partner_org_controller import PartnerOrgController
 from controllers.partner_org_branding_controller import (
@@ -43,6 +43,23 @@ async def public_partner_landing(slug: str):
 async def public_partner_landing_lead(slug: str, body: PartnerOrgLandingLeadCreate):
     """Capture a lead from the white-label partner landing page."""
     return await PartnerOrgBrandingController.submit_landing_lead(slug, body)
+
+
+@router.get("/me/profile")
+async def get_my_partner_profile(
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: get own account profile for the dashboard Profile page."""
+    return await PartnerOrgController.get_my_profile(current_user)
+
+
+@router.put("/me/profile")
+async def update_my_partner_profile(
+    body: dict = Body(default_factory=dict),
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: update own name / email / phone."""
+    return await PartnerOrgController.update_my_profile(current_user, body or {})
 
 
 @router.get("/me/branding")

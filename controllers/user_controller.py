@@ -478,9 +478,16 @@ class UserController:
         if user_data.role == UserRole.STUDENT and user_data.student_level:
             user_dict["student_level"] = user_data.student_level
 
-        from utils.partner_tenant import stamp_tenant
+        from utils.partner_tenant import resolve_staff_partner_org_id, stamp_tenant
 
-        stamp_tenant(user_dict, current_user)
+        # Non-students: stamp only for Partner SA (existing behaviour).
+        # Students: stamp from any partner staff creator (SA / BM / coach).
+        if user_data.role == UserRole.STUDENT:
+            creator_org = await resolve_staff_partner_org_id(db, current_user)
+            if creator_org:
+                user_dict["partner_org_id"] = creator_org
+        else:
+            stamp_tenant(user_dict, current_user)
 
         if user_data.role == UserRole.STUDENT and user_data.course and user_data.branch:
             from utils.branch_courses import assert_course_available_at_branch, assert_batch_has_capacity
@@ -614,11 +621,54 @@ class UserController:
                     raise HTTPException(status_code=403, detail="You can only view users from your own branch")
             filter_query["branch_id"] = branch_id
 
-        from utils.partner_tenant import apply_tenant_filter, assert_partner_owns_branch
+        from utils.partner_tenant import (
+            assert_partner_owns_branch,
+            merge_and_clause,
+            partner_branch_ids,
+            partner_org_id_of,
+            partner_student_visibility_clause,
+            resolve_staff_partner_org_id,
+            rock_owned_clause,
+            tenant_or_rock_owned_filter,
+        )
 
         if branch_id:
             await assert_partner_owns_branch(get_db(), current_user, branch_id)
-        filter_query = apply_tenant_filter(filter_query, current_user)
+
+        # Students: partner sees own + Rock students at partner branches;
+        # Rock roles never see partner-owned students.
+        if role == UserRole.STUDENT or filter_query.get("role") == UserRole.STUDENT.value:
+            db_tmp = get_db()
+            staff_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+                db_tmp, current_user
+            )
+            if staff_org:
+                p_bids = await partner_branch_ids(db_tmp, current_user)
+                if p_bids is None:
+                    p_bids = list(
+                        await db_tmp.branches.distinct("id", {"partner_org_id": staff_org}) or []
+                    )
+                enrolled_ids = await db_tmp.enrollments.distinct(
+                    "student_id",
+                    {
+                        "$or": [
+                            {"partner_org_id": staff_org},
+                            {"branch_id": {"$in": list(p_bids or [])}},
+                        ]
+                    },
+                )
+                filter_query = merge_and_clause(
+                    filter_query,
+                    partner_student_visibility_clause(
+                        staff_org,
+                        partner_branch_ids=list(p_bids or []),
+                        enrolled_student_ids=list(enrolled_ids or []),
+                    ),
+                )
+            else:
+                filter_query = merge_and_clause(filter_query, rock_owned_clause())
+        else:
+            filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
         
         db = get_db()
         users = await (
@@ -1661,12 +1711,25 @@ class UserController:
 
         # Unassigned-only: students with no active enrollment in any branch (for Assign to Branch dropdown)
         if unassigned_only:
-            if current_role not in (UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER):
+            if current_role not in (UserRole.SUPER_ADMIN, UserRole.PARTNER_SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER):
                 return {"message": "No students found", "students": [], "total": 0}
             assigned_student_ids = await db.enrollments.distinct("student_id", {"is_active": True})
             # Include all student users (active/inactive); admins may need to assign/enroll newly
             # registered students before account activation is toggled.
             query = {"role": "student", "id": {"$nin": assigned_student_ids}}
+            from utils.partner_tenant import (
+                merge_and_clause,
+                partner_org_id_of,
+                resolve_staff_partner_org_id,
+                rock_owned_clause,
+            )
+            staff_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+                db, current_user
+            )
+            if staff_org:
+                query = merge_and_clause(query, {"partner_org_id": staff_org})
+            else:
+                query = merge_and_clause(query, rock_owned_clause())
             if is_active is not None:
                 query["is_active"] = bool(is_active)
             students_cursor = db.users.find(query).sort("created_at", -1)
@@ -1729,16 +1792,57 @@ class UserController:
         if is_active is not None:
             query["is_active"] = bool(is_active)
 
-        # Apply branch filtering for non-super-admin users
-        if current_role != UserRole.SUPER_ADMIN:
+        # Tenant isolation + branch filtering
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_branch_ids,
+            partner_org_id_of,
+            partner_student_visibility_clause,
+            resolve_staff_partner_org_id,
+            rock_owned_clause,
+        )
+
+        staff_partner_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+            db, current_user
+        )
+
+        if current_role == UserRole.PARTNER_SUPER_ADMIN or staff_partner_org:
+            p_org = partner_org_id_of(current_user) or staff_partner_org
+            if not p_org:
+                return {"message": "No students found", "students": [], "total": 0}
+            # Partner SA uses org-owned branches; partner BM/coach use that same org.
+            if current_role == UserRole.PARTNER_SUPER_ADMIN:
+                p_branch_ids = await partner_branch_ids(db, current_user) or []
+            else:
+                p_branch_ids = list(
+                    await db.branches.distinct("id", {"partner_org_id": p_org}) or []
+                )
+            partner_enrolled_ids = await db.enrollments.distinct(
+                "student_id",
+                {
+                    "$or": [
+                        {"partner_org_id": p_org},
+                        {"branch_id": {"$in": list(p_branch_ids)}},
+                    ]
+                },
+            )
+            query = merge_and_clause(
+                query,
+                partner_student_visibility_clause(
+                    p_org,
+                    partner_branch_ids=list(p_branch_ids),
+                    enrolled_student_ids=list(partner_enrolled_ids or []),
+                ),
+            )
             if current_role == UserRole.BRANCH_MANAGER:
                 from utils.student_status_service import get_managed_branch_ids_for_user
 
-                managed_branch_ids_for_students = await get_managed_branch_ids_for_user(db, current_user)
+                managed_branch_ids_for_students = await get_managed_branch_ids_for_user(
+                    db, current_user
+                )
                 if not managed_branch_ids_for_students:
                     return {"message": "No students found", "students": [], "total": 0}
-            else:
-                # Coaches: students with active enrollments at the coach's branch
+            elif current_role == UserRole.COACH:
                 user_branch_id = current_user.get("branch_id")
                 if not user_branch_id:
                     raise HTTPException(status_code=403, detail="User not assigned to any branch")
@@ -1748,20 +1852,56 @@ class UserController:
                 )
                 if not coach_student_ids:
                     return {"message": "No students found", "students": [], "total": 0}
-                query["id"] = {"$in": coach_student_ids}
+                query = merge_and_clause(query, {"id": {"$in": coach_student_ids}})
+            if branch_id and branch_id != "all":
+                if p_branch_ids and branch_id not in p_branch_ids:
+                    return {"message": "No students found", "students": [], "total": 0}
+                enrolled_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {"branch_id": branch_id, "is_active": True},
+                )
+                query = merge_and_clause(query, {
+                    "$or": [
+                        {"branch_id": branch_id},
+                        {"branch.branch_id": branch_id},
+                        {"id": {"$in": enrolled_ids}},
+                    ]
+                })
+        else:
+            # Rock SA / Rock BM / Rock coach: never list partner-owned students.
+            query = merge_and_clause(query, rock_owned_clause())
+            if current_role == UserRole.BRANCH_MANAGER:
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-        if branch_id and branch_id != "all" and current_role == UserRole.SUPER_ADMIN:
-            enrolled_ids = await db.enrollments.distinct(
-                "student_id",
-                {"branch_id": branch_id, "is_active": True},
-            )
-            or_clauses = [
-                {"branch_id": branch_id},
-                {"branch.branch_id": branch_id},
-            ]
-            if enrolled_ids:
-                or_clauses.append({"id": {"$in": enrolled_ids}})
-            query["$or"] = or_clauses
+                managed_branch_ids_for_students = await get_managed_branch_ids_for_user(
+                    db, current_user
+                )
+                if not managed_branch_ids_for_students:
+                    return {"message": "No students found", "students": [], "total": 0}
+            elif current_role != UserRole.SUPER_ADMIN:
+                user_branch_id = current_user.get("branch_id")
+                if not user_branch_id:
+                    raise HTTPException(status_code=403, detail="User not assigned to any branch")
+                coach_student_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {"branch_id": user_branch_id, "is_active": True},
+                )
+                if not coach_student_ids:
+                    return {"message": "No students found", "students": [], "total": 0}
+                query = merge_and_clause(query, {"id": {"$in": coach_student_ids}})
+
+            if branch_id and branch_id != "all" and current_role == UserRole.SUPER_ADMIN:
+                enrolled_ids = await db.enrollments.distinct(
+                    "student_id",
+                    {"branch_id": branch_id, "is_active": True},
+                )
+                or_clauses = [
+                    {"branch_id": branch_id},
+                    {"branch.branch_id": branch_id},
+                ]
+                if enrolled_ids:
+                    or_clauses.append({"id": {"$in": enrolled_ids}})
+                query = merge_and_clause(query, {"$or": or_clauses})
 
         student_proj = {
             "_id": 0,

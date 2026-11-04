@@ -1228,6 +1228,12 @@ class CoachController:
             seen_student_course = set()
             restrict_to_coach_batches = bool(coach_trainer_batch_refs)
 
+            from utils.partner_tenant import resolve_staff_partner_org_id
+
+            viewer_partner_org = await resolve_staff_partner_org_id(db, current_user)
+            if viewer_partner_org is None and coach.get("partner_org_id"):
+                viewer_partner_org = str(coach.get("partner_org_id") or "").strip() or None
+
             for enrollment in enrollments:
                 student = await db.users.find_one({
                     "id": enrollment["student_id"],
@@ -1237,6 +1243,15 @@ class CoachController:
                     {"id": enrollment["course_id"]}
                 )
                 if not student or not course:
+                    continue
+
+                # Isolate partner-created students from Rock coaches, and keep
+                # partner coaches able to see Rock students enrolled at their branch.
+                student_partner_org = str(student.get("partner_org_id") or "").strip()
+                if viewer_partner_org:
+                    if student_partner_org and student_partner_org != viewer_partner_org:
+                        continue
+                elif student_partner_org:
                     continue
 
                 raw_batch_ref = str(enrollment.get("batch_ref") or "").strip()

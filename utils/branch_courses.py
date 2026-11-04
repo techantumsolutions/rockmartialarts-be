@@ -95,14 +95,48 @@ def prepare_assignments_for_write(assignments: Optional[dict]) -> Optional[dict]
 
 
 async def available_course_ids_for_branch(db, branch: dict) -> List[str]:
-    assigned = unique_course_ids((branch.get("assignments") or {}).get("courses"))
-    if not assigned:
+    branch_id = branch.get("id")
+    assigned_list = unique_course_ids((branch.get("assignments") or {}).get("courses"))
+    assigned_set = set(assigned_list)
+    out_order = list(assigned_list)
+
+    for row in _schedule_rows(branch):
+        cid = str(row.get("course_id") or row.get("courseId") or "").strip()
+        if cid and cid not in assigned_set:
+            assigned_set.add(cid)
+            out_order.append(cid)
+
+    mappings = []
+    if branch_id:
+        mappings = await db.branch_courses.find({"branch_id": branch_id}).to_list(500)
+        for m in mappings:
+            cid = str(m.get("course_id") or "").strip()
+            if cid and cid not in assigned_set:
+                assigned_set.add(cid)
+                out_order.append(cid)
+
+    op_courses = (branch.get("operational_details") or {}).get("courses_offered") or []
+    for item in op_courses:
+        val = str(item or "").strip()
+        if not val:
+            continue
+        if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val, re.I):
+            if val not in assigned_set:
+                assigned_set.add(val)
+                out_order.append(val)
+        else:
+            c_doc = await db.courses.find_one({"title": {"$regex": f"^{re.escape(val)}$", "$options": "i"}}, {"id": 1})
+            if c_doc and c_doc.get("id") and c_doc["id"] not in assigned_set:
+                assigned_set.add(c_doc["id"])
+                out_order.append(c_doc["id"])
+
+    if not out_order:
         return []
-    mappings = await db.branch_courses.find({"branch_id": branch["id"]}).to_list(500)
+
     mapped = {m.get("course_id"): m.get("is_available", True) is not False for m in mappings if m.get("course_id")}
     sched_avail = schedule_availability_map(branch)
     out = []
-    for cid in assigned:
+    for cid in out_order:
         if cid in mapped:
             if mapped[cid]:
                 out.append(cid)
@@ -138,6 +172,10 @@ async def assert_course_available_at_branch(
         raise HTTPException(status_code=400, detail="Please select a valid course")
     if require_active_course and course.get("settings", {}).get("active", True) is False:
         raise HTTPException(status_code=400, detail="Selected course is inactive")
+
+    available_course_ids = await available_course_ids_for_branch(db, branch)
+    if cid in available_course_ids:
+        return branch, course
 
     assigned = unique_course_ids((branch.get("assignments") or {}).get("courses"))
     mapping = await db.branch_courses.find_one({"branch_id": branch["id"], "course_id": cid})

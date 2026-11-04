@@ -6,7 +6,7 @@ import uuid
 
 from models.branch_manager_models import (
     BranchManagerCreate, BranchManagerUpdate, BranchManager, BranchManagerResponse,
-    BranchManagerLogin, BranchManagerLoginResponse, BranchAssignment
+    BranchManagerLogin, BranchManagerLoginResponse, BranchAssignment, BranchManagerResetPassword
 )
 from models.user_models import UserRole
 from utils.auth import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
@@ -402,6 +402,14 @@ class BranchManagerController:
                 if branch_location:
                     branch_info += f" ({branch_location})"
 
+        # Determine frontend URL for password setup and login (use port 3022)
+        import os
+        frontend_url = (os.getenv("FRONTEND_URL") or "http://localhost:3022").strip().rstrip("/")
+        if ":8003" in frontend_url:
+            frontend_url = frontend_url.replace(":8003", ":3022")
+        reset_link = f"{frontend_url}/branch-manager/reset-password?token={reset_token}"
+        login_link = f"{frontend_url}/branch-manager/login"
+
         # Prepare email content (same structure as coach credentials email)
         subject = "Your Branch Manager Login Credentials - Rock Martial Arts Academy"
 
@@ -417,12 +425,12 @@ Account Details:
 {f"- {branch_info}" if branch_info else ""}
 
 To set up your password and access your account, please click the link below:
-{request.base_url}branch-manager/reset-password?token={reset_token}
+{reset_link}
 
 This link will expire in 24 hours for security reasons.
 
 Once you've set your password, you can log in at:
-{request.base_url}branch-manager/login
+{login_link}
 
 If you have any questions or need assistance, please contact our support team.
 
@@ -461,7 +469,7 @@ This is an automated message. Please do not reply to this email.
         <p style="font-size: 16px; margin: 20px 0;">To set up your password and access your account, please click the button below:</p>
 
         <div style="text-align: center; margin: 30px 0;">
-            <a href="{request.base_url}branch-manager/reset-password?token={reset_token}"
+            <a href="{reset_link}"
                style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
                 Set Up Password
             </a>
@@ -470,7 +478,7 @@ This is an automated message. Please do not reply to this email.
         <p style="font-size: 14px; color: #666; margin: 20px 0;">This link will expire in 24 hours for security reasons.</p>
 
         <p style="font-size: 16px; margin: 20px 0;">Once you've set your password, you can log in at:</p>
-        <p style="font-size: 16px; margin: 10px 0;"><a href="{request.base_url}branch-manager/login" style="color: #667eea;">{request.base_url}branch-manager/login</a></p>
+        <p style="font-size: 16px; margin: 10px 0;"><a href="{login_link}" style="color: #667eea;">{login_link}</a></p>
 
         <p style="font-size: 16px; margin: 20px 0;">If you have any questions or need assistance, please contact our support team.</p>
     </div>
@@ -522,6 +530,63 @@ This is an automated message. Please do not reply to this email.
             import logging
             logging.error(f"Error sending branch manager credentials email: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to send credentials email: {str(e)}")
+
+    @staticmethod
+    async def reset_password(reset_password_data: BranchManagerResetPassword):
+        """Reset branch manager password using a token"""
+        token = (reset_password_data.token or "").strip()
+        new_password = reset_password_data.new_password
+        if not token:
+            raise HTTPException(status_code=400, detail="Reset token is required")
+        if not new_password or len(new_password) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+        db = get_db()
+        manager = await db.branch_managers.find_one({"reset_token": token})
+        if not manager:
+            try:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                if payload.get("sub"):
+                    manager = await db.branch_managers.find_one({"id": payload["sub"]})
+            except Exception:
+                pass
+
+        if not manager:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+        expiry = manager.get("reset_token_expiry")
+        if expiry and isinstance(expiry, datetime) and expiry < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Reset token has expired. Please request a new one.")
+
+        new_hashed_password = hash_password(new_password)
+        await db.branch_managers.update_one(
+            {"id": manager["id"]},
+            {
+                "$set": {
+                    "password_hash": new_hashed_password,
+                    "password": new_hashed_password,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$unset": {
+                    "reset_token": "",
+                    "reset_token_expiry": "",
+                },
+            },
+        )
+
+        manager_email = manager.get("email") or manager.get("contact_info", {}).get("email")
+        if manager_email:
+            await db.users.update_many(
+                {"email": manager_email},
+                {
+                    "$set": {
+                        "password_hash": new_hashed_password,
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            )
+
+        return {"message": "Password has been set successfully. You can now log in."}
 
     @staticmethod
     async def login_branch_manager(login_data: BranchManagerLogin):

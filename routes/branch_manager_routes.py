@@ -26,9 +26,7 @@ async def forgot_password(forgot_password_data: BranchManagerForgotPassword):
 @router.post("/reset-password")
 async def reset_password(reset_password_data: BranchManagerResetPassword):
     """Reset branch manager password using a token"""
-    # TODO: Implement reset password functionality similar to coach
-    from fastapi import HTTPException
-    raise HTTPException(status_code=501, detail="Branch manager reset password not yet implemented")
+    return await BranchManagerController.reset_password(reset_password_data)
 
 @router.get("/me")
 async def get_branch_manager_profile(
