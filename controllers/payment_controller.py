@@ -62,21 +62,31 @@ async def _enforce_student_assigned_branch(
     student_id: str,
     requested_branch_id: str,
     current_user: dict,
+    course_id: Optional[str] = None,
 ) -> None:
-    """Existing students must checkout at their assigned branch (renewal or new course)."""
-    assigned = await get_student_assigned_branch_id(db, student_id)
-    if not assigned or str(requested_branch_id or "") == assigned:
-        return
+    """Enforces branch rules: renewals must match current enrollment branch; new course enrollments can be at any branch offering the course."""
+    if not requested_branch_id:
+        raise HTTPException(status_code=400, detail="Branch is required")
     user_role = str(current_user.get("role") or "").lower()
     if user_role in ("super_admin", "superadmin"):
         return
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "You cannot change the branch when renewing or enrolling in a course. "
-            "Please use your assigned branch or contact admin for a branch transfer."
-        ),
-    )
+
+    # If course_id is provided, check if the student has an active paid enrollment in this course (renewal)
+    if course_id:
+        active_paid = await _latest_active_paid_enrollment(db, student_id, course_id)
+        if active_paid and active_paid.get("branch_id"):
+            orig_branch = str(active_paid["branch_id"])
+            if str(requested_branch_id) != orig_branch:
+                raise HTTPException(
+                    status_code=400,
+                    detail="When renewing this course, please renew at your enrolled branch or contact admin for a branch transfer."
+                )
+            return
+
+    # For new courses or unassigned students, verify the requested branch is active
+    branch = await db.branches.find_one({"id": str(requested_branch_id), "is_active": True})
+    if not branch:
+        raise HTTPException(status_code=404, detail="Selected branch not found or inactive")
 
 
 def _course_fee_per_duration_map(course: dict) -> dict:
@@ -854,7 +864,7 @@ class PaymentController:
             raise HTTPException(status_code=403, detail="Only students can use this endpoint")
 
         student_id = current_user["id"]
-        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
+        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user, course_id=body.course_id)
         branch = await db.branches.find_one({"id": body.branch_id})
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
@@ -871,6 +881,9 @@ class PaymentController:
             student_id=student_id,
             duration_keys=_duration_price_keys(body.duration, duration_info),
         )
+        if br:
+            from utils.branch_courses import assert_student_no_batch_schedule_conflict
+            await assert_student_no_batch_schedule_conflict(db, student_id, body.branch_id, body.course_id, br)
         beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
         should_charge_admission = await should_charge_admission_fee_for_checkout(
             db,
@@ -1804,7 +1817,7 @@ class PaymentController:
             raise HTTPException(status_code=403, detail="Only students can use this endpoint")
 
         student_id = current_user["id"]
-        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user)
+        await _enforce_student_assigned_branch(db, student_id, body.branch_id, current_user, course_id=body.course_id)
 
         active_paid = await _latest_active_paid_enrollment(db, student_id, body.course_id)
 
@@ -1827,6 +1840,11 @@ class PaymentController:
             student_id=student_id,
             duration_keys=_duration_price_keys(body.duration, duration_row),
         )
+
+        if batch_ref:
+            from utils.branch_courses import assert_batch_has_capacity, assert_student_no_batch_schedule_conflict
+            await assert_batch_has_capacity(db, body.branch_id, body.course_id, batch_ref)
+            await assert_student_no_batch_schedule_conflict(db, student_id, body.branch_id, body.course_id, batch_ref)
 
         beneficiary_payload = body.beneficiary.dict() if body.beneficiary else {"beneficiary_type": "self"}
         info = await PaymentController.get_course_payment_info(
@@ -2591,6 +2609,10 @@ class PaymentController:
                 if existing_phone:
                     raise HTTPException(status_code=400, detail="This mobile number is already registered. Please use a different number.")
         db = get_db()
+        from utils.branch_courses import assert_batch_has_capacity
+        await assert_batch_has_capacity(
+            db, order_data.branch_id, order_data.course_id, order_data.batch_ref
+        )
         payment_info = await PaymentController.get_course_payment_info(
             order_data.course_id,
             order_data.branch_id,
@@ -2663,6 +2685,10 @@ class PaymentController:
             creator_dict = dict(payment_data.created_by)
 
         active_batch_ref = payment_data.batch_ref or payment_data.batch_id
+        from utils.branch_courses import assert_batch_has_capacity
+        await assert_batch_has_capacity(
+            db, payment_data.branch_id, payment_data.course_id, active_batch_ref
+        )
 
         # Enforce role-based restrictions
         if creator_dict and creator_dict.get("role"):

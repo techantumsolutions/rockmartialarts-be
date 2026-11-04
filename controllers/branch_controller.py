@@ -32,13 +32,14 @@ from utils.collaboration_partner import (
 
 
 async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
-    """Add trainer_name to each batch in assignments.course_schedule (mutates branch)."""
+    """Add trainer_name and batch capacity to each batch in assignments.course_schedule (mutates branch)."""
     asg = branch.get("assignments")
     if not isinstance(asg, dict):
         return
     sched = asg.get("course_schedule")
     if not isinstance(sched, list) or not sched:
         return
+    branch_id = str(branch.get("id") or "").strip()
     ids = set()
     for entry in sched:
         if not isinstance(entry, dict):
@@ -49,22 +50,22 @@ async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
             cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
             if cid:
                 ids.add(cid)
-    if not ids:
-        return
-    users = await db.users.find({"id": {"$in": list(ids)}}).to_list(length=300)
     name_map = {}
-    for u in users:
-        fn = (u.get("first_name") or "").strip()
-        ln = (u.get("last_name") or "").strip()
-        name_map[u["id"]] = (
-            f"{fn} {ln}".strip()
-            or (u.get("full_name") or "").strip()
-            or (u.get("email") or "").strip()
-            or "Trainer"
-        )
+    if ids:
+        users = await db.users.find({"id": {"$in": list(ids)}}).to_list(length=300)
+        for u in users:
+            fn = (u.get("first_name") or "").strip()
+            ln = (u.get("last_name") or "").strip()
+            name_map[u["id"]] = (
+                f"{fn} {ln}".strip()
+                or (u.get("full_name") or "").strip()
+                or (u.get("email") or "").strip()
+                or "Trainer"
+            )
     for entry in sched:
         if not isinstance(entry, dict):
             continue
+        cid_entry = str(entry.get("course_id") or entry.get("courseId") or "").strip()
         batches = entry.get("batches")
         if not isinstance(batches, list):
             continue
@@ -74,6 +75,27 @@ async def _enrich_course_schedule_trainers(db, branch: dict) -> None:
             cid = str(b.get("coach_id") or b.get("coachId") or "").strip()
             if cid and name_map.get(cid):
                 b["trainer_name"] = name_map[cid]
+
+            # Capacity enrichment
+            bid = str(b.get("batch_id") or b.get("id") or "").strip()
+            max_stu = b.get("max_students")
+            if max_stu is not None:
+                try:
+                    max_stu = int(max_stu)
+                except (ValueError, TypeError):
+                    max_stu = None
+            b["max_students"] = max_stu
+
+            active_count = 0
+            if branch_id and cid_entry and bid:
+                active_count = await db.enrollments.count_documents({
+                    "branch_id": branch_id,
+                    "course_id": cid_entry,
+                    "$or": [{"batch_id": bid}, {"batch_ref": bid}, {"slot_id": bid}],
+                    "is_active": True
+                })
+            b["enrolled_students"] = active_count
+            b["is_full"] = bool(max_stu is not None and max_stu > 0 and active_count >= max_stu)
 
 
 def _pydantic_dump(model) -> dict:
@@ -171,6 +193,9 @@ class BranchController:
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
         if not include_stats:
+            for branch in branches:
+                await _enrich_course_schedule_trainers(db, branch)
+                enrich_collaboration_flag(branch)
             return {"branches": serialize_doc(branches)}
 
         # Enhance branches with coach and student counts
@@ -216,6 +241,7 @@ class BranchController:
                     "active_courses": len(branch.get("assignments", {}).get("courses", []))
                 }
             }
+            await _enrich_course_schedule_trainers(db, branch_with_stats)
             enrich_collaboration_flag(branch_with_stats)
             enhanced_branches.append(branch_with_stats)
 
