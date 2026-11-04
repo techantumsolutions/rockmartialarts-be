@@ -132,6 +132,11 @@ class SystemSettingsFlatCreate(BaseModel):
     registration_fee: float = Field(default=500.0, ge=0, description="Default registration fee (INR)")
     coach_registration_fee: float = Field(default=0.0, ge=0, description="Coach registration fee (INR)")
     coach_registration_fee_note: Optional[str] = Field(default="", description="Subtext note for coach registration fee card")
+    partner_registration_fee: float = Field(
+        default=999.0,
+        ge=0,
+        description="White-label partner onboarding / registration fee (INR)",
+    )
     home_training_fee: float = Field(default=0.0, ge=0, description="Home training fee (INR)")
     school_training_fee: float = Field(default=0.0, ge=0, description="School training fee (INR)")
     college_training_fee: float = Field(default=0.0, ge=0, description="College training fee (INR)")
@@ -196,6 +201,7 @@ class SystemSettingsFlatResponse(BaseModel):
     registration_fee: float
     coach_registration_fee: float = 0.0
     coach_registration_fee_note: Optional[str] = ""
+    partner_registration_fee: float = 999.0
     home_training_fee: float = 0.0
     school_training_fee: float = 0.0
     college_training_fee: float = 0.0

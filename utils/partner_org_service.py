@@ -167,14 +167,26 @@ async def resolve_partner_role_login_urls(db, partner_org_id: Optional[str]) -> 
     }
 
 
-def _onboarding_fee_paise() -> int:
+async def _onboarding_fee_paise() -> int:
+    """Partner online onboarding fee in paise — prefers system_settings, else env."""
+    inr: Optional[float] = None
     try:
-        inr = float(os.getenv("PARTNER_ONBOARDING_FEE_INR", "999") or "999")
-    except ValueError:
-        inr = 999.0
+        from controllers.settings_controller import SettingsController
+
+        inr = float(await SettingsController.get_default_partner_registration_fee())
+    except Exception:
+        inr = None
+    if inr is None:
+        try:
+            inr = float(os.getenv("PARTNER_ONBOARDING_FEE_INR", "999") or "999")
+        except ValueError:
+            inr = 999.0
     paise = int(round(inr * 100))
     if paise < 100:
-        raise HTTPException(status_code=500, detail="PARTNER_ONBOARDING_FEE_INR must be at least ₹1")
+        raise HTTPException(
+            status_code=500,
+            detail="Partner registration fee must be at least ₹1",
+        )
     return paise
 
 
@@ -398,7 +410,7 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
         allow_pending_partner_email=True,
     )
 
-    amount_paise = _onboarding_fee_paise()
+    amount_paise = await _onboarding_fee_paise()
     now = datetime.utcnow()
     existing_pending = await db[COL].find_one(
         {"email": email, "status": PartnerOrgStatus.PENDING_PAYMENT.value}
