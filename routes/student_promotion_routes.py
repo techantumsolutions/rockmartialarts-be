@@ -54,6 +54,7 @@ async def api_list_promotions(
         limit=limit,
         include_archived=include_archived,
         live_only=live_only,
+        current_user=current_user,
     )
 
 
@@ -89,7 +90,7 @@ async def api_eligibility_preview(
     """
     target = body.target
     if body.promotion_id and target is None:
-        data = await get_student_promotion(body.promotion_id)
+        data = await get_student_promotion(body.promotion_id, current_user=current_user)
         target = (data.get("promotion") or {}).get("target")
     return await preview_eligibility(
         target.model_dump(mode="json") if hasattr(target, "model_dump") else target,
@@ -105,7 +106,7 @@ async def api_eligibility_check(
     """Check whether a single student matches a promotion / target."""
     target = body.target
     if body.promotion_id and target is None:
-        data = await get_student_promotion(body.promotion_id)
+        data = await get_student_promotion(body.promotion_id, current_user=current_user)
         target = (data.get("promotion") or {}).get("target")
     elif body.promotion_id and target is not None:
         pass
@@ -167,7 +168,7 @@ async def api_promotion_eligibility(
     sample_limit: int = Query(20, ge=0, le=50),
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    data = await get_student_promotion(promotion_id)
+    data = await get_student_promotion(promotion_id, current_user=current_user)
     promo = data.get("promotion") or {}
     preview = await preview_eligibility(
         promo.get("target"),
@@ -182,7 +183,7 @@ async def api_get_promotion(
     promotion_id: str,
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    return await get_student_promotion(promotion_id)
+    return await get_student_promotion(promotion_id, current_user=current_user)
 
 
 @router.patch("/{promotion_id}")

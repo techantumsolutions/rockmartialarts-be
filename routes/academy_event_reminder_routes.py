@@ -61,6 +61,7 @@ async def admin_list_reminder_logs(
         status=status,
         skip=skip,
         limit=limit,
+        current_user=current_user,
     )
 
 
@@ -75,4 +76,5 @@ async def admin_trigger_reminders(
         event_id,
         offset_hours=body.offset_hours,
         dry_run=body.dry_run,
+        current_user=current_user,
     )

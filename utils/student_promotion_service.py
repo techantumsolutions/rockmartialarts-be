@@ -23,6 +23,11 @@ from models.student_promotion_models import (
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    is_partner_super_admin,
+    merge_and_clause,
+    partner_org_id_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +108,94 @@ def enrich_student_promotion(doc: Optional[dict]) -> Optional[dict]:
     return out
 
 
+def _rock_admin(user: Optional[dict]) -> bool:
+    role = str((user or {}).get("role") or "").lower()
+    return role in {"super_admin", "superadmin", "coach_admin"}
+
+
+async def _partner_creator_ids(db, org_id: str) -> List[str]:
+    ids = await db.users.distinct("id", {"partner_org_id": org_id})
+    return [str(i) for i in (ids or []) if i]
+
+
+async def partner_promotion_scope(db, user: Optional[dict]) -> Dict[str, Any]:
+    """Promotions created by the logged-in partner organization."""
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    creators = await _partner_creator_ids(db, org_id)
+    uid = str((user or {}).get("id") or "")
+    if uid and uid not in creators:
+        creators.append(uid)
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+    if creators:
+        clauses.append({"created_by": {"$in": creators}})
+    return {"$or": clauses}
+
+
+async def rock_promotion_scope(db) -> Dict[str, Any]:
+    """Rock promotions: exclude rows stamped to or created by a partner."""
+    partner_users = [
+        str(i)
+        for i in await db.users.distinct(
+            "id",
+            {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+        )
+        if i
+    ]
+    nor: List[Dict[str, Any]] = [
+        {"partner_org_id": {"$exists": True, "$nin": [None, ""]}}
+    ]
+    if partner_users:
+        nor.append({"created_by": {"$in": partner_users}})
+    return {"$nor": nor}
+
+
+async def promotion_belongs_to_partner(db, doc: Optional[dict], user: Optional[dict]) -> bool:
+    org_id = partner_org_id_of(user)
+    if not doc or not org_id:
+        return False
+    if str(doc.get("partner_org_id") or "") == org_id:
+        return True
+    creators = set(await _partner_creator_ids(db, org_id))
+    uid = str((user or {}).get("id") or "")
+    if uid:
+        creators.add(uid)
+    return str(doc.get("created_by") or "") in creators
+
+
+async def promotion_is_partner_owned(db, doc: Optional[dict]) -> bool:
+    if not doc:
+        return False
+    if str(doc.get("partner_org_id") or "").strip():
+        return True
+    created_by = str(doc.get("created_by") or "").strip()
+    if not created_by:
+        return False
+    creator = await db.users.find_one(
+        {"id": created_by},
+        {"partner_org_id": 1, "role": 1},
+    )
+    if not creator:
+        return False
+    return bool(str(creator.get("partner_org_id") or "").strip()) or str(
+        creator.get("role") or ""
+    ) == "partner_super_admin"
+
+
+async def assert_promotion_access(db, doc: Optional[dict], user: Optional[dict]) -> None:
+    if not doc:
+        raise HTTPException(status_code=404, detail="Promotion not found")
+    if not user:
+        return
+    if is_partner_super_admin(user):
+        if not await promotion_belongs_to_partner(db, doc, user):
+            raise HTTPException(status_code=404, detail="Promotion not found")
+        return
+    if _rock_admin(user) and await promotion_is_partner_owned(db, doc):
+        raise HTTPException(status_code=404, detail="Promotion not found")
+
+
 async def _unique_slug(db, base: str, *, exclude_id: Optional[str] = None) -> str:
     slug = slugify_promotion(base)
     candidate = slug
@@ -128,6 +221,7 @@ async def list_student_promotions(
     limit: int = 50,
     include_archived: bool = False,
     live_only: bool = False,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -140,14 +234,24 @@ async def list_student_promotions(
     elif not include_archived:
         q["status"] = {"$ne": PromotionStatus.ARCHIVED.value}
 
+    if is_partner_super_admin(current_user):
+        q = merge_and_clause(q, await partner_promotion_scope(db, current_user))
+    elif _rock_admin(current_user):
+        q = merge_and_clause(q, await rock_promotion_scope(db))
+
     if search and search.strip():
         term = search.strip()
-        q["$or"] = [
-            {"title": {"$regex": term, "$options": "i"}},
-            {"slug": {"$regex": term, "$options": "i"}},
-            {"short_description": {"$regex": term, "$options": "i"}},
-            {"cta_label": {"$regex": term, "$options": "i"}},
-        ]
+        q = merge_and_clause(
+            q,
+            {
+                "$or": [
+                    {"title": {"$regex": term, "$options": "i"}},
+                    {"slug": {"$regex": term, "$options": "i"}},
+                    {"short_description": {"$regex": term, "$options": "i"}},
+                    {"cta_label": {"$regex": term, "$options": "i"}},
+                ]
+            },
+        )
 
     skip = max(0, skip)
     limit = max(1, min(limit, 200))
@@ -172,7 +276,11 @@ async def list_student_promotions(
     }
 
 
-async def get_student_promotion(promotion_id: str) -> Dict[str, Any]:
+async def get_student_promotion(
+    promotion_id: str,
+    *,
+    current_user: Optional[dict] = None,
+) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
@@ -181,6 +289,7 @@ async def get_student_promotion(promotion_id: str) -> Dict[str, Any]:
         doc = await db[COL].find_one({"slug": promotion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Promotion not found")
+    await assert_promotion_access(db, doc, current_user)
     return {"promotion": enrich_student_promotion(doc)}
 
 
@@ -222,6 +331,9 @@ async def create_student_promotion(
         "created_at": now,
         "updated_at": now,
     }
+    org_id = partner_org_id_of(current_user)
+    if org_id:
+        doc["partner_org_id"] = org_id
     await db[COL].insert_one(doc)
     return {
         "message": "Promotion created",
@@ -241,11 +353,15 @@ async def update_student_promotion(
     doc = await db[COL].find_one({"id": promotion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Promotion not found")
+    await assert_promotion_access(db, doc, current_user)
 
     data = body.model_dump(exclude_unset=True)
     patch: Dict[str, Any] = {"updated_at": datetime.utcnow()}
     if current_user and current_user.get("id"):
         patch["updated_by"] = current_user["id"]
+    org_id = partner_org_id_of(current_user)
+    if org_id and not doc.get("partner_org_id"):
+        patch["partner_org_id"] = org_id
 
     if data.pop("clear_banner", None):
         patch["banner_url"] = None
@@ -340,6 +456,7 @@ async def archive_student_promotion(
     doc = await db[COL].find_one({"id": promotion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Promotion not found")
+    await assert_promotion_access(db, doc, current_user)
     patch = {
         "status": PromotionStatus.ARCHIVED.value,
         "is_active": False,

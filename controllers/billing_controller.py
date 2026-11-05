@@ -12,6 +12,12 @@ from utils.billing_cycle_service import (
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    is_partner_super_admin,
+    partner_branch_ids,
+    partner_org_id_of,
+    partner_payments_match_clause,
+)
 
 
 def _role(user: dict) -> str:
@@ -23,6 +29,26 @@ def _managed_branch_ids(user: dict) -> List[str]:
     if isinstance(raw, str):
         return [raw]
     return [str(x) for x in raw if x]
+
+
+async def _partner_billing_scope(db, user: dict) -> Dict[str, Any]:
+    """Billing cycles for one partner org. Empty match when the caller has no org."""
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+        enr_ids = await db.enrollments.distinct("id", {"branch_id": {"$in": bids}})
+        enr_ids = [str(e) for e in (enr_ids or []) if e]
+        if enr_ids:
+            clauses.append({"enrollment_id": {"$in": enr_ids}})
+    pay_ids = await db.payments.distinct("id", partner_payments_match_clause(org_id, bids))
+    pay_ids = [str(p) for p in (pay_ids or []) if p]
+    if pay_ids:
+        clauses.append({"payment_id": {"$in": pay_ids}})
+    return {"$or": clauses}
 
 
 class BillingController:
@@ -54,6 +80,8 @@ class BillingController:
             if not branches:
                 return {"billing_cycles": [], "total": 0, "skip": skip, "limit": limit}
             query["branch_id"] = {"$in": branches}
+        elif is_partner_super_admin(current_user):
+            query = await _partner_billing_scope(db, current_user)
         elif role not in (UserRole.SUPER_ADMIN.value, "superadmin"):
             raise HTTPException(status_code=403, detail="Not allowed")
 
@@ -128,7 +156,7 @@ class BillingController:
         doc = await refresh_cycle_status(cycle_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Billing cycle not found")
-        BillingController._assert_access(doc, current_user)
+        await BillingController._assert_access(doc, current_user)
         return {"billing_cycle": doc}
 
     @staticmethod
@@ -139,7 +167,7 @@ class BillingController:
         enrollment = await db.enrollments.find_one({"id": enrollment_id})
         if not enrollment:
             raise HTTPException(status_code=404, detail="Enrollment not found")
-        BillingController._assert_enrollment_access(enrollment, current_user)
+        await BillingController._assert_enrollment_access(enrollment, current_user)
         cycle = await get_active_cycle_for_enrollment(enrollment_id)
         return {
             "enrollment_id": enrollment_id,
@@ -149,10 +177,20 @@ class BillingController:
         }
 
     @staticmethod
-    def _assert_access(doc: dict, current_user: dict) -> None:
+    async def _assert_access(doc: dict, current_user: dict) -> None:
         role = _role(current_user)
         if role in (UserRole.SUPER_ADMIN.value, "superadmin"):
             return
+        if is_partner_super_admin(current_user):
+            db = get_db()
+            scope = await _partner_billing_scope(db, current_user)
+            owned = await db.billing_cycles.find_one(
+                {"$and": [{"id": doc.get("id")}, scope]},
+                {"id": 1},
+            )
+            if owned:
+                return
+            raise HTTPException(status_code=403, detail="Not allowed")
         uid = current_user.get("id")
         if role == UserRole.STUDENT.value and (
             doc.get("student_id") == uid or doc.get("account_user_id") == uid
@@ -164,10 +202,19 @@ class BillingController:
         raise HTTPException(status_code=403, detail="Not allowed")
 
     @staticmethod
-    def _assert_enrollment_access(enrollment: dict, current_user: dict) -> None:
+    async def _assert_enrollment_access(enrollment: dict, current_user: dict) -> None:
         role = _role(current_user)
         if role in (UserRole.SUPER_ADMIN.value, "superadmin"):
             return
+        if is_partner_super_admin(current_user):
+            org_id = partner_org_id_of(current_user)
+            if org_id and str(enrollment.get("partner_org_id") or "") == org_id:
+                return
+            db = get_db()
+            bids = {str(i) for i in (await partner_branch_ids(db, current_user) or []) if i}
+            if str(enrollment.get("branch_id") or "") in bids:
+                return
+            raise HTTPException(status_code=403, detail="Not allowed")
         uid = current_user.get("id")
         if role == UserRole.STUDENT.value and enrollment.get("student_id") == uid:
             return

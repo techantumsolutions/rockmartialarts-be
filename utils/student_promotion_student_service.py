@@ -108,9 +108,26 @@ async def list_eligible_promotions_for_student(
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
+    from utils.student_promotion_service import rock_promotion_scope
+
+    student_org = str(student.get("partner_org_id") or "").strip()
+    status_q: Dict[str, Any] = {"status": PromotionStatus.ACTIVE.value}
+    if student_org:
+        creator_ids = [
+            str(i)
+            for i in await db.users.distinct("id", {"partner_org_id": student_org})
+            if i
+        ]
+        clauses: List[Dict[str, Any]] = [{"partner_org_id": student_org}]
+        if creator_ids:
+            clauses.append({"created_by": {"$in": creator_ids}})
+        promo_q: Dict[str, Any] = {"$and": [status_q, {"$or": clauses}]}
+    else:
+        promo_q = {"$and": [status_q, await rock_promotion_scope(db)]}
+
     rows = (
         await db[COL]
-        .find({"status": PromotionStatus.ACTIVE.value})
+        .find(promo_q)
         .sort([("priority", 1), ("updated_at", -1)])
         .to_list(length=200)
     )

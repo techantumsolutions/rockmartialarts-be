@@ -3337,6 +3337,11 @@ class PaymentController:
 
         ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
         match: dict = PaymentController._merge_collected_revenue_filters({})
+        from utils.partner_tenant import apply_payment_list_partner_scope, assert_partner_owns_branch
+
+        match = await apply_payment_list_partner_scope(db, match, current_user)
+        if branch_id and branch_id not in ("all", "unassigned"):
+            await assert_partner_owns_branch(db, current_user, branch_id)
         if ps and pe:
             match["$or"] = [
                 {"payment_date": {"$gte": ps, "$lte": pe}},

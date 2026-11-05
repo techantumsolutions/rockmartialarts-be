@@ -804,6 +804,17 @@ class CourseController:
         if not update_data:
             raise HTTPException(status_code=400, detail="No update data provided")
 
+        # Course edit UI does not collect max students. Keep the stored value
+        # when the payload omits it so the update is not rejected.
+        reqs = update_data.get("student_requirements")
+        if isinstance(reqs, dict) and reqs.get("max_students") is None:
+            existing_reqs = existing_course.get("student_requirements") or {}
+            existing_max = existing_reqs.get("max_students")
+            if existing_max is not None:
+                reqs["max_students"] = existing_max
+            else:
+                reqs.pop("max_students", None)
+
         # Check for duplicate course title on update
         if "title" in update_data and update_data["title"]:
             title_conflict = await db.courses.find_one({
