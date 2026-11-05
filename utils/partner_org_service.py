@@ -238,7 +238,7 @@ async def assert_partner_org_active(db, partner_org_id: str) -> dict:
     return org
 
 
-async def _send_invite_email(org: dict, invite_token: str) -> None:
+async def _send_invite_email(org: dict, invite_token: str) -> bool:
     slug = org.get("slug") or "partner"
     fe = _frontend_url()
     set_link = f"{fe}/partners/{slug}/set-password?token={invite_token}"
@@ -252,7 +252,8 @@ async def _send_invite_email(org: dict, invite_token: str) -> None:
     name = org.get("name") or "Partner"
     email = org.get("email")
     if not email:
-        return
+        logger.error("Partner invite skipped: org %s has no email", org.get("id"))
+        return False
     sent = await send_partner_invite_email(
         to_email=str(email),
         partner_name=str(name),
@@ -266,9 +267,11 @@ async def _send_invite_email(org: dict, invite_token: str) -> None:
     )
     if not sent:
         logger.error(
-            "Partner invite email was not delivered to %s (check Resend logs / FROM domain)",
+            "Partner invite email was not delivered to %s (check Resend logs / FROM domain). Link: %s",
             email,
+            set_link,
         )
+    return bool(sent)
 
 
 async def _finalize_paid_org(
@@ -343,7 +346,19 @@ async def _finalize_paid_org(
 
     await db[COL].update_one({"id": org["id"]}, {"$set": patch})
     updated = await db[COL].find_one({"id": org["id"]})
-    await _send_invite_email(updated, invite_token)
+    email_sent = await _send_invite_email(updated, invite_token)
+    await db[COL].update_one(
+        {"id": org["id"]},
+        {
+            "$set": {
+                "invite_email_sent": email_sent,
+                "invite_email_sent_at": datetime.utcnow() if email_sent else None,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+    updated = await db[COL].find_one({"id": org["id"]})
+    updated["_invite_email_sent"] = email_sent
     return updated
 
 
@@ -388,8 +403,14 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         payment_status="offline_recorded",
         current_user=current_user,
     )
+    email_sent = bool(updated.get("_invite_email_sent"))
     return {
-        "message": "Partner created. Invitation email sent to set password.",
+        "message": (
+            "Partner created. Invitation email sent to set password."
+            if email_sent
+            else "Partner created, but the invitation email could not be delivered. Use Resend invite from Partner Profiles."
+        ),
+        "invite_email_sent": email_sent,
         "partner": partner_org_public(updated),
     }
 
@@ -518,8 +539,93 @@ async def verify_partner_online_payment(
         razorpay_signature=body.razorpay_signature,
         current_user=current_user,
     )
+    email_sent = bool(updated.get("_invite_email_sent"))
     return {
-        "message": "Payment verified. Invitation email sent to set password.",
+        "message": (
+            "Payment verified. Invitation email sent to set password."
+            if email_sent
+            else "Payment verified and partner created, but the invitation email could not be delivered. Use Resend invite from Partner Profiles."
+        ),
+        "invite_email_sent": email_sent,
+        "partner": partner_org_public(updated),
+    }
+
+
+async def resend_partner_invite(partner_org_id: str, current_user: dict) -> Dict[str, Any]:
+    """Rotate invite token and re-send set-password email (Rock SA only)."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+
+    status = org.get("status")
+    if status == PartnerOrgStatus.PENDING_PAYMENT.value:
+        raise HTTPException(
+            status_code=400,
+            detail="Partner payment is still pending. Complete payment before sending invite.",
+        )
+    if status == PartnerOrgStatus.DISABLED.value or org.get("is_active") is False:
+        raise HTTPException(status_code=400, detail="Enable the partner before resending the invite.")
+
+    admin = None
+    if org.get("admin_user_id"):
+        admin = await db[COL_USERS].find_one({"id": org["admin_user_id"]})
+    if not admin and org.get("email"):
+        admin = await db[COL_USERS].find_one(
+            {"email": str(org["email"]).lower(), "role": UserRole.PARTNER_SUPER_ADMIN.value}
+        )
+
+    if admin and admin.get("password_hash") and not admin.get("must_set_password"):
+        raise HTTPException(
+            status_code=400,
+            detail="Partner admin already set a password. Ask them to use Forgot password instead.",
+        )
+
+    now = datetime.utcnow()
+    invite_token = secrets.token_urlsafe(32)
+    invite_expires = now + timedelta(days=7)
+    await db[COL].update_one(
+        {"id": partner_org_id},
+        {
+            "$set": {
+                "invite_token": invite_token,
+                "invite_expires_at": invite_expires,
+                "status": PartnerOrgStatus.INVITED.value,
+                "updated_at": now,
+                "updated_by": current_user.get("id"),
+            }
+        },
+    )
+    if admin:
+        await db[COL_USERS].update_one(
+            {"id": admin["id"]},
+            {"$set": {"must_set_password": True, "updated_at": now}},
+        )
+
+    updated = await db[COL].find_one({"id": partner_org_id})
+    email_sent = await _send_invite_email(updated, invite_token)
+    await db[COL].update_one(
+        {"id": partner_org_id},
+        {
+            "$set": {
+                "invite_email_sent": email_sent,
+                "invite_email_sent_at": now if email_sent else None,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+    updated = await db[COL].find_one({"id": partner_org_id})
+    if not email_sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not deliver the invitation email. Check Resend configuration and try again.",
+        )
+    return {
+        "message": "Invitation email resent successfully.",
+        "invite_email_sent": True,
         "partner": partner_org_public(updated),
     }
 

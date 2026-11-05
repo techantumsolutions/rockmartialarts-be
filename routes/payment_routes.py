@@ -6,6 +6,7 @@ from models.student_models import (
     ConfirmRazorpayPayment,
     PrepareStudentCheckoutBody,
     CreateStudentRazorpayOrderBody,
+    CancelPendingCheckoutBody,
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
 )
@@ -78,6 +79,15 @@ async def prepare_student_renewal_checkout(
 ):
     """M07-S04: prepare pending renewal checkout from eligible enrollment + quote."""
     return await PaymentController.prepare_student_renewal_checkout(body, current_user)
+
+
+@router.post("/cancel-pending-checkout", status_code=status.HTTP_200_OK)
+async def cancel_pending_student_checkout(
+    body: CancelPendingCheckoutBody,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Cancel a pending student checkout after Razorpay fail/dismiss (does not touch paid rows)."""
+    return await PaymentController.cancel_pending_student_checkout(body, current_user)
 
 
 @router.get("/renewal-history", status_code=status.HTTP_200_OK)
