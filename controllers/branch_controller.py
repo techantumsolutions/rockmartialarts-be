@@ -325,6 +325,7 @@ class BranchController:
                 "address": branch_info.get("address", {}),
             },
             "location_id": branch.get("location_id"),
+            "partner_org_id": branch.get("partner_org_id"),
             "slug": branch.get("slug") or BranchController._name_to_slug(
                 str(branch_info.get("name") or "")
             ),
