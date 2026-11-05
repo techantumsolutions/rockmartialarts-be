@@ -162,7 +162,14 @@ async def finalize_renewal_after_payment(
             patch["end_date"] = recomputed
         await db.enrollments.update_one(
             {"id": enrollment["id"]},
-            {"$set": patch, "$unset": {"status": ""}},
+            {
+                "$set": patch,
+                "$unset": {
+                    "status": "",
+                    "checkout_pending": "",
+                    "renewal_checkout_pending": "",
+                },
+            },
         )
         return {"renewal": False, "end_date": recomputed or enrollment.get("end_date")}
 
@@ -185,7 +192,10 @@ async def finalize_renewal_after_payment(
 
     await db.enrollments.update_one(
         {"id": enrollment["id"]},
-        {"$set": patch, "$unset": {"status": "", "renewal_checkout_pending": ""}},
+        {
+            "$set": patch,
+            "$unset": {"status": "", "renewal_checkout_pending": "", "checkout_pending": ""},
+        },
     )
 
     # Soft-deactivate superseded prior enrollment when renewal created a new row.

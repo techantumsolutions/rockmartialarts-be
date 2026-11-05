@@ -458,8 +458,8 @@ async def send_custom_email_webhook(to_email: str, subject: str, html_message: s
             "html_message": html_message
         }
 
-        # Send request to webhook
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Send request to webhook (host cert often mismatches; verify=False for this fallback only)
+        async with httpx.AsyncClient(timeout=30.0, verify=False, trust_env=False) as client:
             response = await client.post(
                 webhook_url,
                 json=webhook_payload,

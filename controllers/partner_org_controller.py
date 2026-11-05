@@ -31,6 +31,10 @@ class PartnerOrgController:
         return await svc.verify_partner_online_payment(body, current_user)
 
     @staticmethod
+    async def resend_invite(partner_org_id: str, current_user: dict):
+        return await svc.resend_partner_invite(partner_org_id, current_user)
+
+    @staticmethod
     async def set_password(body: PartnerSetPassword):
         return await svc.set_partner_password(body)
 
