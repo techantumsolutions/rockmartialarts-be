@@ -33,6 +33,11 @@ def _period(start_date: Optional[str], end_date: Optional[str]) -> Tuple[Optiona
 async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[str, Any]:
     role = current_user.get("role")
     db = get_db()
+    from utils.partner_tenant import partner_report_branch_ids
+
+    partner_ids = await partner_report_branch_ids(db, current_user, branch_id)
+    if partner_ids is not None:
+        return {"branch_id": {"$in": partner_ids}}
     if role == "branch_manager":
         from utils.student_status_service import get_managed_branch_ids_for_user
 
