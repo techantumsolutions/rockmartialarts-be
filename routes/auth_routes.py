@@ -116,6 +116,14 @@ async def list_linked_profiles(current_user: dict = Depends(get_current_student_
     return await AuthController.list_linked_profiles(current_user)
 
 
+@router.get("/branch-options")
+async def student_branch_options(current_user: dict = Depends(require_role([UserRole.STUDENT]))):
+    """Branches for the add-student picker, scoped to the student's partner or Rock."""
+    from controllers.branch_controller import BranchController
+
+    return await BranchController.list_branches_for_student(current_user)
+
+
 @router.get("/linked-students")
 async def list_linked_students(current_user: dict = Depends(require_role([UserRole.STUDENT]))):
     """Alias of GET /auth/profiles."""

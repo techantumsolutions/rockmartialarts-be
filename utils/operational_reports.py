@@ -50,6 +50,23 @@ async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[st
     return {}
 
 
+def _apply_lead_tenant_scope(
+    collection: str, current_user: dict, query: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Rock lead reports exclude white-label partner contact leads."""
+    if collection != "leads":
+        return query
+    from utils.partner_tenant import (
+        is_partner_super_admin,
+        merge_and_clause,
+        rock_owned_clause,
+    )
+
+    if is_partner_super_admin(current_user):
+        return query
+    return merge_and_clause(query, rock_owned_clause())
+
+
 def _to_csv(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
@@ -207,6 +224,7 @@ async def list_operational(
     ps, pe = _period(start_date, end_date)
     if ps and pe:
         q["created_at"] = {"$gte": ps, "$lte": pe}
+    q = _apply_lead_tenant_scope(collection, current_user, q)
     coll = db[collection]
     total = await coll.count_documents(q)
     rows = await coll.find(q).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
@@ -238,6 +256,7 @@ async def export_operational(
     ps, pe = _period(start_date, end_date)
     if ps and pe:
         q["created_at"] = {"$gte": ps, "$lte": pe}
+    q = _apply_lead_tenant_scope(collection, current_user, q)
 
     coll = db[collection]
     total = await coll.count_documents(q)

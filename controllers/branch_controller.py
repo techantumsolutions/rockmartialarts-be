@@ -306,6 +306,38 @@ class BranchController:
         }
 
     @staticmethod
+    async def list_branches_for_student(current_user: dict):
+        """Branches a student may pick when adding a linked profile.
+
+        Partner students see only their organization's branches.
+        Rock students see only Rock branches.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not initialized")
+
+        org = str((current_user or {}).get("partner_org_id") or "").strip()
+        uid = str((current_user or {}).get("id") or "").strip()
+        if not org and uid:
+            student = await db.users.find_one({"id": uid}, {"partner_org_id": 1})
+            org = str((student or {}).get("partner_org_id") or "").strip()
+
+        from utils.partner_tenant import merge_and_clause, rock_owned_clause
+
+        query: dict = {"is_active": True}
+        if org:
+            query["partner_org_id"] = org
+        else:
+            query = merge_and_clause(query, rock_owned_clause())
+
+        branches = await db.branches.find(query).limit(100).to_list(length=100)
+        formatted = [BranchController._public_list_item(branch) for branch in branches]
+        return {
+            "branches": formatted,
+            "total": len(formatted),
+        }
+
+    @staticmethod
     def _public_list_item(branch: dict) -> dict:
         branch_info = branch.get("branch") or {}
         operational = branch.get("operational_details") or {}

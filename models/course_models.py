@@ -4,7 +4,8 @@ from typing import Optional, Dict, Any, List
 import uuid
 
 class StudentRequirements(BaseModel):
-    max_students: int
+    # Capacity is set on branch batches. Course edit does not collect this field.
+    max_students: Optional[int] = None
     min_age: int
     max_age: int
     prerequisites: List[str]

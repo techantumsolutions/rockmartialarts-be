@@ -212,6 +212,7 @@ class CoachController:
         if bid.lower() == "all":
             bid = ""
         is_branch_manager = role in {"branch_manager", "branch_admin", "branchmanager"}
+        managed_branch_ids: list = []
 
         if current_user and is_branch_manager:
             from utils.student_status_service import get_managed_branch_ids_for_user
@@ -245,14 +246,33 @@ class CoachController:
             apply_tenant_filter,
             assert_partner_owns_branch,
             is_partner_super_admin,
+            resolve_staff_partner_org_id,
             tenant_or_rock_owned_filter,
         )
 
         if bid:
             await assert_partner_owns_branch(db, current_user, bid)
 
+        # Partner branch managers already see only their managed branches.
+        # rock-owned filtering would hide coaches created for that partner org.
+        partner_branch_manager = False
+        if is_branch_manager and current_user:
+            viewer_org = await resolve_staff_partner_org_id(db, current_user)
+            if not viewer_org and managed_branch_ids:
+                stamped_branch = await db.branches.find_one(
+                    {
+                        "id": {"$in": managed_branch_ids},
+                        "partner_org_id": {"$exists": True, "$nin": [None, ""]},
+                    },
+                    {"partner_org_id": 1},
+                )
+                viewer_org = str((stamped_branch or {}).get("partner_org_id") or "").strip() or None
+            partner_branch_manager = bool(viewer_org)
+
         if all_tenants and not is_partner_super_admin(current_user):
             # Super admin explicitly requested unscoped cross-tenant listing
+            pass
+        elif partner_branch_manager:
             pass
         else:
             filter_query = tenant_or_rock_owned_filter(filter_query, current_user)

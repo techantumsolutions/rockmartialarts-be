@@ -2127,8 +2127,28 @@ class AttendanceController:
 
             if user_type == "student":
                 # Verify permissions for student attendance
-                if user_role not in ["super_admin", "superadmin", "coach", "branch_manager"]:
+                if user_role not in [
+                    "super_admin",
+                    "superadmin",
+                    "coach",
+                    "branch_manager",
+                    "partner_super_admin",
+                ]:
                     raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+                if user_role == "partner_super_admin":
+                    from utils.partner_tenant import assert_partner_owns_branch, partner_org_id_of
+
+                    if not partner_org_id_of(current_user):
+                        raise HTTPException(status_code=403, detail="Insufficient permissions")
+                    if not attendance_request.branch_id:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You can only mark attendance for your organization's branches",
+                        )
+                    await assert_partner_owns_branch(
+                        db, current_user, attendance_request.branch_id
+                    )
 
                 # Verify course_id is provided for students
                 if not attendance_request.course_id:
@@ -2351,6 +2371,8 @@ class AttendanceController:
             else:
                 raise HTTPException(status_code=400, detail="Invalid user type")
 
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to mark attendance: {str(e)}")
 
