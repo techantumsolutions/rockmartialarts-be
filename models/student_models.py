@@ -74,6 +74,12 @@ class CreateStudentRazorpayOrderBody(BaseModel):
     """Create a Razorpay order for an existing pending enrollment (amount is taken from enrollment server-side)."""
     enrollment_id: str
 
+
+class CancelPendingCheckoutBody(BaseModel):
+    """Student cancels an abandoned Razorpay checkout (failed / dismissed)."""
+
+    enrollment_id: str
+
 # New models for registration payment flow
 class StudentRegistrationPayment(BaseModel):
     student_id: str

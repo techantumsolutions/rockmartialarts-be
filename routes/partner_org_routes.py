@@ -148,6 +148,15 @@ async def verify_partner_online_payment(
     return await PartnerOrgController.verify_online(body, current_user)
 
 
+@router.post("/{partner_org_id}/resend-invite")
+async def resend_partner_invite(
+    partner_org_id: str,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Re-send partner set-password invitation email."""
+    return await PartnerOrgController.resend_invite(partner_org_id, current_user)
+
+
 @router.patch("/{partner_org_id}/status")
 async def set_partner_status(
     partner_org_id: str,

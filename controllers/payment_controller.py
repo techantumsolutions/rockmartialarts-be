@@ -30,6 +30,7 @@ from models.student_models import (
     ConfirmRazorpayPayment,
     PrepareStudentCheckoutBody,
     CreateStudentRazorpayOrderBody,
+    CancelPendingCheckoutBody,
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
 )
@@ -1144,6 +1145,8 @@ class PaymentController:
         arrear_amount = float(arrear.get("arrear_amount") or 0)
         total_amount = round(course_fee + admission_fee + arrear_amount, 2)
 
+        # Pending renewals must stay inactive until Razorpay verify succeeds.
+        # Otherwise a failed/dismissed payment still looks like a created renewal.
         enrollment = EnrollmentModel(
             student_id=student_id,
             course_id=course_id,
@@ -1153,7 +1156,7 @@ class PaymentController:
             fee_amount=course_fee,
             admission_fee=admission_fee,
             payment_status=EnrollmentPaymentStatus.PENDING,
-            is_active=True,
+            is_active=False,
         )
         enrollment_doc = enrollment.dict()
         enrollment_doc["duration_id"] = duration
@@ -1197,6 +1200,104 @@ class PaymentController:
             "arrear": arrear,
             "message": (
                 "Renewal checkout ready. Validity updates only after verified payment."
+            ),
+        }
+
+    @staticmethod
+    async def cancel_pending_student_checkout(
+        body: CancelPendingCheckoutBody,
+        current_user: dict,
+    ):
+        """
+        Remove a student-owned pending checkout enrollment after Razorpay fail/dismiss.
+        Never deletes paid enrollments. Safe no-op if already gone / already paid.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database connection not available")
+        if current_user.get("role") != "student":
+            raise HTTPException(status_code=403, detail="Only students can use this endpoint")
+
+        student_id = current_user["id"]
+        enrollment_id = (body.enrollment_id or "").strip()
+        if not enrollment_id:
+            raise HTTPException(status_code=400, detail="enrollment_id is required")
+
+        enrollment = await db.enrollments.find_one(
+            {"id": enrollment_id, "student_id": student_id}
+        )
+        if not enrollment:
+            return {
+                "cancelled": False,
+                "message": "No pending checkout found (already cleared).",
+            }
+
+        pay_status = str(enrollment.get("payment_status") or "").strip().lower()
+        if pay_status in {
+            EnrollmentPaymentStatus.PAID.value,
+            "paid",
+            "completed",
+            "success",
+        }:
+            return {
+                "cancelled": False,
+                "message": "Enrollment is already paid; not cancelled.",
+            }
+        if pay_status not in {
+            EnrollmentPaymentStatus.PENDING.value,
+            "pending",
+            "processing",
+            "failed",
+        }:
+            return {
+                "cancelled": False,
+                "message": f"Enrollment status '{pay_status or 'unknown'}' is not a cancellable checkout.",
+            }
+
+        now = datetime.utcnow()
+        await db.payments.update_many(
+            {
+                "student_id": student_id,
+                "enrollment_id": enrollment_id,
+                "payment_status": {
+                    "$in": [
+                        PaymentStatus.PENDING.value,
+                        "pending",
+                        "processing",
+                        "failed",
+                    ]
+                },
+            },
+            {
+                "$set": {
+                    "payment_status": "cancelled",
+                    "status": "cancelled",
+                    "updated_at": now,
+                    "notes": "Auto-cancelled: Razorpay checkout failed or dismissed",
+                }
+            },
+        )
+        delete_result = await db.enrollments.delete_one(
+            {
+                "id": enrollment_id,
+                "student_id": student_id,
+                "payment_status": {
+                    "$in": [
+                        EnrollmentPaymentStatus.PENDING.value,
+                        "pending",
+                        "processing",
+                        "failed",
+                    ]
+                },
+            }
+        )
+        return {
+            "cancelled": delete_result.deleted_count > 0,
+            "enrollment_id": enrollment_id,
+            "message": (
+                "Pending checkout cancelled."
+                if delete_result.deleted_count > 0
+                else "Pending checkout was already cleared."
             ),
         }
 
@@ -1552,7 +1653,14 @@ class PaymentController:
 
             enr_upd = await db.enrollments.update_one(
                 {"id": enrollment["id"]},
-                {"$set": update_enrollment, "$unset": {"status": ""}},
+                {
+                    "$set": update_enrollment,
+                    "$unset": {
+                        "status": "",
+                        "checkout_pending": "",
+                        "renewal_checkout_pending": "",
+                    },
+                },
             )
             if enr_upd.matched_count == 0:
                 raise HTTPException(status_code=500, detail="Failed to activate enrollment after payment.")
@@ -1919,6 +2027,7 @@ class PaymentController:
             }
         )
 
+        # Inactive until verified payment — failed Razorpay must not look like enrollment succeeded.
         enrollment = EnrollmentModel(
             student_id=student_id,
             course_id=body.course_id,
@@ -1928,13 +2037,14 @@ class PaymentController:
             fee_amount=effective_course_fee,
             admission_fee=effective_admission_fee,
             payment_status=EnrollmentPaymentStatus.PENDING,
-            is_active=True,
+            is_active=False,
             duration_id=body.duration,
             batch_ref=batch_ref,
         )
         enrollment_doc = enrollment.dict()
         enrollment_doc["duration_id"] = body.duration
         enrollment_doc["enrollment_date"] = start_date
+        enrollment_doc["checkout_pending"] = True
         if batch_ref:
             enrollment_doc["batch_ref"] = batch_ref
         # Store beneficiary info if provided

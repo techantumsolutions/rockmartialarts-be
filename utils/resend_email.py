@@ -6,6 +6,62 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Shared ops webhook (SSL on this host is often broken; verify=False is intentional fallback).
+_EMAIL_WEBHOOK_URL = "https://ai.alviongs.com/webhook/de77d8d6-ae98-471d-ba19-8d7f58ec8449"
+
+
+def _resend_from_header() -> str:
+    raw = (
+        (os.getenv("RESEND_FROM_EMAIL") or "").strip()
+        or (os.getenv("EMAIL_FROM") or "").strip()
+        or "onboarding@resend.dev"
+    )
+    name = (os.getenv("RESEND_FROM_NAME") or "Rock Martial Arts Academy").strip()
+    if "<" in raw and ">" in raw:
+        return raw
+    return f"{name} <{raw}>"
+
+
+def _resend_headers(api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _send_via_email_webhook(
+    *,
+    to_email: str,
+    subject: str,
+    html_message: str,
+    plain_message: str,
+) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=30.0, verify=False, trust_env=False) as client:
+            resp = await client.post(
+                _EMAIL_WEBHOOK_URL,
+                json={
+                    "to_email": to_email,
+                    "subject": subject,
+                    "message": plain_message,
+                    "html_message": html_message,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code == 200:
+                logger.info("Email webhook accepted message to %s subject=%s", to_email, subject)
+                return True
+            logger.error(
+                "Email webhook failed for %s: HTTP %s %s",
+                to_email,
+                resp.status_code,
+                resp.text[:300],
+            )
+            return False
+    except Exception:
+        logger.exception("Email webhook exception for %s", to_email)
+        return False
+
 
 def build_student_welcome_email_html(
     student_name: str,
@@ -497,20 +553,12 @@ async def send_partner_invite_email(
     login_link: str,
     role_login_links: Optional[dict] = None,
 ) -> bool:
-    """Send partner admin invite (create password) via Resend."""
+    """Send partner admin invite (create password) via Resend, with webhook fallback."""
     api_key = (os.getenv("RESEND_API_KEY") or "").strip()
-    from_email = (
-        (os.getenv("RESEND_FROM_EMAIL") or "").strip()
-        or (os.getenv("EMAIL_FROM") or "").strip()
-        or "onboarding@resend.dev"
-    )
-
-    if not api_key:
-        logger.warning(
-            "RESEND_API_KEY not configured. Partner invite not sent. Link for %s: %s",
-            to_email,
-            set_password_link,
-        )
+    from_email = _resend_from_header()
+    to_clean = (to_email or "").strip()
+    if not to_clean:
+        logger.error("Partner invite skipped: empty recipient")
         return False
 
     display = (partner_name or "Partner").strip()
@@ -528,7 +576,8 @@ async def send_partner_invite_email(
         <tr><td style="padding:8px 10px;color:#6b7280;white-space:nowrap;">Student</td><td style="padding:8px 10px;word-break:break-all;"><a href="{student_login}" style="color:#111827;">{student_login}</a></td></tr>
       </table>
 """
-    subject = f"Welcome to {display} — create your partner admin password"
+    # ASCII hyphen in subject — some filters mishandle unicode dashes
+    subject = f"Welcome to {display} - create your partner admin password"
     html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
@@ -545,16 +594,18 @@ async def send_partner_invite_email(
       </p>
       <table style="width:100%;border-collapse:collapse;margin:12px 0 20px;font-size:14px;">
         <tr><td style="padding:6px 0;color:#6b7280;">Partner</td><td style="padding:6px 0;"><b>{display}</b></td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">{to_email}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="padding:6px 0;">{phone or "—"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Address</td><td style="padding:6px 0;">{address or "—"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Payment</td><td style="padding:6px 0;">{payment_method or "—"} / {payment_status or "—"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">{to_clean}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="padding:6px 0;">{phone or "-"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Address</td><td style="padding:6px 0;">{address or "-"}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Payment</td><td style="padding:6px 0;">{payment_method or "-"} / {payment_status or "-"}</td></tr>
       </table>
       <div style="text-align:center;margin:24px 0;">
         <a href="{set_password_link}" style="display:inline-block;background:#FFC403;color:#1a2332;font-size:15px;font-weight:600;text-decoration:none;padding:12px 28px;border-radius:8px;">
           Create password
         </a>
       </div>
+      <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Or paste this link in your browser:</p>
+      <p style="margin:0 0 16px;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{set_password_link}</p>
       <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Admin login after setup:</p>
       <p style="margin:0;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{login_link}</p>
       {role_links_html}
@@ -563,39 +614,67 @@ async def send_partner_invite_email(
   </div>
 </body>
 </html>"""
+    plain = (
+        f"Hello {display},\n\n"
+        f"Your partner organization has been created.\n"
+        f"Create your password here (expires in 7 days):\n{set_password_link}\n\n"
+        f"Admin login after setup:\n{login_link}\n"
+    )
 
-    payload = {
-        "from": from_email,
-        "to": [to_email.strip()],
-        "subject": subject,
-        "html": html,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            if 200 <= resp.status_code < 300:
-                logger.info(
-                    "Partner invite email sent via Resend to %s (status=%d)",
-                    to_email,
-                    resp.status_code,
+    if api_key:
+        payload = {
+            "from": from_email,
+            "to": [to_clean],
+            "subject": subject,
+            "html": html,
+            "text": plain,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
+                resp = await client.post(
+                    "https://api.resend.com/emails",
+                    headers=_resend_headers(api_key),
+                    json=payload,
                 )
-                return True
-            logger.error(
-                "Resend API error sending partner invite to %s: HTTP %d: %s",
-                to_email,
-                resp.status_code,
-                resp.text,
-            )
-            return False
-    except Exception as exc:
-        logger.exception("Failed to send partner invite via Resend to %s: %s", to_email, exc)
-        return False
+                if 200 <= resp.status_code < 300:
+                    msg_id = ""
+                    try:
+                        msg_id = (resp.json() or {}).get("id") or ""
+                    except Exception:
+                        pass
+                    logger.info(
+                        "Partner invite email sent via Resend to %s (status=%d id=%s)",
+                        to_clean,
+                        resp.status_code,
+                        msg_id,
+                    )
+                    return True
+                logger.error(
+                    "Resend API error sending partner invite to %s: HTTP %d: %s",
+                    to_clean,
+                    resp.status_code,
+                    resp.text[:500],
+                )
+        except Exception as exc:
+            logger.exception("Failed to send partner invite via Resend to %s: %s", to_clean, exc)
+    else:
+        logger.warning(
+            "RESEND_API_KEY not configured. Trying webhook fallback for partner invite to %s",
+            to_clean,
+        )
+
+    # Fallback when Resend is missing or rejected the send
+    ok = await _send_via_email_webhook(
+        to_email=to_clean,
+        subject=subject,
+        html_message=html,
+        plain_message=plain,
+    )
+    if not ok:
+        logger.error(
+            "Partner invite NOT delivered to %s. Manual link: %s",
+            to_clean,
+            set_password_link,
+        )
+    return ok
 

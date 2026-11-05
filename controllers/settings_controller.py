@@ -159,6 +159,7 @@ class SettingsController:
             "registration_fee": 500.0,
             "coach_registration_fee": 0.0,
             "coach_registration_fee_note": "",
+            "partner_registration_fee": 999.0,
             "home_training_fee": 0.0,
             "school_training_fee": 0.0,
             "college_training_fee": 0.0,
@@ -214,6 +215,11 @@ class SettingsController:
             "registration_fee": float(flat_data.registration_fee),
             "coach_registration_fee": float(flat_data.coach_registration_fee or 0.0),
             "coach_registration_fee_note": (flat_data.coach_registration_fee_note or "").strip(),
+            "partner_registration_fee": float(
+                flat_data.partner_registration_fee
+                if flat_data.partner_registration_fee is not None
+                else 999.0
+            ),
             "home_training_fee": float(flat_data.home_training_fee or 0.0),
             "school_training_fee": float(flat_data.school_training_fee or 0.0),
             "college_training_fee": float(flat_data.college_training_fee or 0.0),
@@ -259,6 +265,7 @@ class SettingsController:
             registration_fee=float(serialized_doc.get("registration_fee", 500.0)),
             coach_registration_fee=float(serialized_doc.get("coach_registration_fee", 0.0)),
             coach_registration_fee_note=serialized_doc.get("coach_registration_fee_note", ""),
+            partner_registration_fee=float(serialized_doc.get("partner_registration_fee", 999.0)),
             home_training_fee=float(serialized_doc.get("home_training_fee", 0.0)),
             school_training_fee=float(serialized_doc.get("school_training_fee", 0.0)),
             college_training_fee=float(serialized_doc.get("college_training_fee", 0.0)),
@@ -287,6 +294,7 @@ class SettingsController:
             fee = _get_f("registration_fee", 500.0)
             coach_fee = _get_f("coach_registration_fee", 0.0)
             coach_fee_note = str(doc.get("coach_registration_fee_note") or "").strip()
+            partner_fee = _get_f("partner_registration_fee", 999.0)
             home_fee = _get_f("home_training_fee", 0.0)
             school_fee = _get_f("school_training_fee", 0.0)
             college_fee = _get_f("college_training_fee", 0.0)
@@ -297,6 +305,7 @@ class SettingsController:
                 "registrationFee": fee,
                 "coachRegistrationFee": coach_fee,
                 "coachRegistrationFeeNote": coach_fee_note,
+                "partnerRegistrationFee": partner_fee,
                 "homeTrainingFee": home_fee,
                 "schoolTrainingFee": school_fee,
                 "collegeTrainingFee": college_fee,
@@ -305,6 +314,7 @@ class SettingsController:
                 "registration_fee": fee,
                 "coach_registration_fee": coach_fee,
                 "coach_registration_fee_note": coach_fee_note,
+                "partner_registration_fee": partner_fee,
                 "home_training_fee": home_fee,
                 "school_training_fee": school_fee,
                 "college_training_fee": college_fee,
@@ -316,6 +326,7 @@ class SettingsController:
                 "registrationFee": 500.0,
                 "coachRegistrationFee": 0.0,
                 "coachRegistrationFeeNote": "",
+                "partnerRegistrationFee": 999.0,
                 "homeTrainingFee": 0.0,
                 "schoolTrainingFee": 0.0,
                 "collegeTrainingFee": 0.0,
@@ -324,6 +335,7 @@ class SettingsController:
                 "registration_fee": 500.0,
                 "coach_registration_fee": 0.0,
                 "coach_registration_fee_note": "",
+                "partner_registration_fee": 999.0,
                 "home_training_fee": 0.0,
                 "school_training_fee": 0.0,
                 "college_training_fee": 0.0,
@@ -342,6 +354,23 @@ class SettingsController:
         except Exception:
             pass
         return 0.0
+
+    @staticmethod
+    async def get_default_partner_registration_fee() -> float:
+        """Read partner_registration_fee from system_settings (fallback env / 999)."""
+        try:
+            db = get_db()
+            doc = await db.system_settings.find_one({})
+            if doc and doc.get("partner_registration_fee") is not None:
+                return float(doc["partner_registration_fee"])
+        except Exception:
+            pass
+        try:
+            import os
+
+            return float(os.getenv("PARTNER_ONBOARDING_FEE_INR", "999") or "999")
+        except (TypeError, ValueError):
+            return 999.0
 
     @staticmethod
     async def get_default_registration_fee() -> float:

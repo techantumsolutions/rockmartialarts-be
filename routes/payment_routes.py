@@ -6,6 +6,7 @@ from models.student_models import (
     ConfirmRazorpayPayment,
     PrepareStudentCheckoutBody,
     CreateStudentRazorpayOrderBody,
+    CancelPendingCheckoutBody,
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
 )
@@ -15,8 +16,18 @@ from utils.auth import require_role
 from utils.unified_auth import require_role_unified, get_current_user_or_superadmin, get_optional_current_user_or_superadmin
 from fastapi import Request, HTTPException
 from utils.razorpay_reconciliation import verify_razorpay_webhook_signature
+from utils.razorpay_client import get_razorpay_runtime_status
 
 router = APIRouter()
+
+
+@router.get("/razorpay/status", status_code=status.HTTP_200_OK)
+async def razorpay_status():
+    """
+    Public go-live readiness check (no secrets).
+    Confirms live/test mode, key presence, webhook secret, and FRONTEND_URL sanity.
+    """
+    return get_razorpay_runtime_status()
 
 @router.post("/students/payments", status_code=status.HTTP_201_CREATED)
 async def student_process_payment(
@@ -68,6 +79,15 @@ async def prepare_student_renewal_checkout(
 ):
     """M07-S04: prepare pending renewal checkout from eligible enrollment + quote."""
     return await PaymentController.prepare_student_renewal_checkout(body, current_user)
+
+
+@router.post("/cancel-pending-checkout", status_code=status.HTTP_200_OK)
+async def cancel_pending_student_checkout(
+    body: CancelPendingCheckoutBody,
+    current_user: dict = Depends(require_role([UserRole.STUDENT])),
+):
+    """Cancel a pending student checkout after Razorpay fail/dismiss (does not touch paid rows)."""
+    return await PaymentController.cancel_pending_student_checkout(body, current_user)
 
 
 @router.get("/renewal-history", status_code=status.HTTP_200_OK)
