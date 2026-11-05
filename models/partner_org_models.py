@@ -77,6 +77,8 @@ def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
         "is_active": doc.get("is_active", True),
         "admin_user_id": doc.get("admin_user_id"),
         "login_path": f"/partners/{doc.get('slug')}/login" if doc.get("slug") else None,
+        "invite_email_sent": doc.get("invite_email_sent"),
+        "invite_email_sent_at": doc.get("invite_email_sent_at"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "activated_at": doc.get("activated_at"),
