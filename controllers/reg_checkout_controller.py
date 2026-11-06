@@ -605,6 +605,19 @@ class RegCheckoutController:
             name = str(user.get("name") or "Student").strip() or "Student"
             validity = end.strftime("%d-%m-%Y")
 
+            # Additive email reminder (does not replace SMS)
+            try:
+                from utils.ops_email_hooks import fire_renewal_reminder
+
+                await fire_renewal_reminder(
+                    student_email=user.get("email"),
+                    student_name=name,
+                    course_name=str(sub.get("plan_name") or sub.get("course_name") or "Plan"),
+                    end_date=end,
+                )
+            except Exception:
+                logger.exception("ops email renewal reminder failed")
+
             msg = _reminder_sms_text(name, validity)
             tid = _sms_dlt_template_id("reminder")
             ok, err = send_registration_sms(phone, msg, template_id=tid)

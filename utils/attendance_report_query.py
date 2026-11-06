@@ -17,6 +17,7 @@ from fastapi import HTTPException
 
 EXPORT_FIELDS = [
     "attendance_date",
+    "record_type",
     "student_name",
     "course_name",
     "branch_name",

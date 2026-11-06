@@ -50,10 +50,41 @@ async def _get_coach(db, coach_id: str) -> dict:
     return coach
 
 
+async def _partner_owns_coach(db, coach: dict, current_user: dict) -> bool:
+    """True when a partner super admin may manage this coach's availability."""
+    from utils.partner_tenant import is_partner_super_admin, partner_branch_ids, partner_org_id_of
+
+    if not is_partner_super_admin(current_user):
+        return False
+    org_id = partner_org_id_of(current_user)
+    if not org_id:
+        return False
+    if str(coach.get("partner_org_id") or "").strip() == org_id:
+        return True
+    owned = {str(x) for x in (await partner_branch_ids(db, current_user) or []) if x}
+    if not owned:
+        return False
+    locs = set()
+    if coach.get("branch_id"):
+        locs.add(str(coach.get("branch_id")))
+    for key in ("service_location_ids", "assigned_branches", "branch_ids"):
+        for item in coach.get(key) or []:
+            if item:
+                locs.add(str(item))
+    return bool(locs.intersection(owned))
+
+
 async def _assert_can_view(db, coach: dict, current_user: dict) -> None:
     role = _role(current_user)
     if role in {"superadmin", "super_admin", "coach_admin", "coachadmin"}:
         return
+    if role == "partner_super_admin":
+        if await _partner_owns_coach(db, coach, current_user):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="You can only view coaches in your organization.",
+        )
     if role == "coach":
         if current_user.get("id") != coach.get("id"):
             raise HTTPException(status_code=403, detail="You can only view your own availability")
@@ -95,7 +126,7 @@ async def _assert_can_edit(db, coach: dict, current_user: dict) -> None:
                 detail="Inactive coaches cannot update availability.",
             )
         return
-    if role in {"branch_manager", "branch_admin", "branchmanager"}:
+    if role in {"branch_manager", "branch_admin", "branchmanager", "partner_super_admin"}:
         await _assert_can_view(db, coach, current_user)
         return
     raise HTTPException(status_code=403, detail="Not allowed to update availability")
@@ -227,11 +258,17 @@ async def get_availability_options(
         "branch_manager",
         "branch_admin",
         "branchmanager",
+        "partner_super_admin",
     }:
         q: Dict[str, Any] = {"is_active": {"$ne": False}}
         if role in {"branch_manager", "branch_admin", "branchmanager"}:
             managed = await get_managed_branch_ids_for_user(db, current_user)
             q["id"] = {"$in": managed or []}
+        elif role == "partner_super_admin":
+            from utils.partner_tenant import partner_branch_ids
+
+            owned = await partner_branch_ids(db, current_user) or []
+            q["id"] = {"$in": list(owned)}
         branches = await db.branches.find(q).sort([("branch.name", 1)]).to_list(length=300)
     elif allowed:
         branches = (
@@ -346,6 +383,16 @@ async def update_availability(
                         + ", ".join(bad)
                     ),
                 )
+    elif role == "partner_super_admin":
+        from utils.partner_tenant import partner_branch_ids
+
+        owned = {str(x) for x in (await partner_branch_ids(db, current_user) or []) if x}
+        bad = [x for x in location_ids if str(x) not in owned]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail="Service locations must belong to your organization.",
+            )
 
     resolved = await _resolve_locations(db, location_ids) if location_ids else []
     resolved_ids = [r["id"] for r in resolved]

@@ -253,6 +253,15 @@ async def create_demo_booking(
     except Exception:
         logger.exception("Lead hook after demo booking failed")
 
+    try:
+        from utils.ops_email_hooks import fire_demo_booking
+
+        await fire_demo_booking(
+            db, doc, confirmed=(status == DemoBookingStatus.CONFIRMED.value)
+        )
+    except Exception:
+        logger.exception("ops email after demo booking failed")
+
     return {
         "message": "Demo booking reserved"
         if needs_payment
@@ -423,6 +432,12 @@ async def verify_demo_booking_payment(
         },
     )
     updated = await db[COL].find_one({"id": booking_id})
+    try:
+        from utils.ops_email_hooks import fire_demo_booking
+
+        await fire_demo_booking(db, updated or doc, confirmed=True)
+    except Exception:
+        logger.exception("ops email after demo payment verify failed")
     return {
         "message": "Demo booking confirmed",
         "booking": serialize_doc(updated),

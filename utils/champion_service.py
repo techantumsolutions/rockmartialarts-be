@@ -20,6 +20,13 @@ from models.champion_models import (
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    assert_partner_owns_branch,
+    is_partner_super_admin,
+    merge_and_clause,
+    partner_branch_ids,
+    partner_org_id_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,165 @@ def enrich_champion(doc: Optional[dict]) -> Optional[dict]:
     out["display_order"] = int(out.get("display_order") or 100)
     out["published_at"] = out.get("published_at") or None
     return out
+
+
+def _rock_admin(user: Optional[dict]) -> bool:
+    role = str((user or {}).get("role") or "").lower()
+    return role in {"super_admin", "superadmin", "coach_admin"}
+
+
+async def _partner_creator_ids(db, org_id: str) -> List[str]:
+    ids = await db.users.distinct("id", {"partner_org_id": org_id})
+    return [str(i) for i in (ids or []) if i]
+
+
+async def partner_champion_scope(db, user: Optional[dict]) -> Dict[str, Any]:
+    """Champions for one partner: stamp, their branches, or created by their staff."""
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+    creators = await _partner_creator_ids(db, org_id)
+    uid = str((user or {}).get("id") or "")
+    if uid and uid not in creators:
+        creators.append(uid)
+    if creators:
+        clauses.append({"created_by": {"$in": creators}})
+    return {"$or": clauses}
+
+
+async def rock_champion_scope(db) -> Dict[str, Any]:
+    """Rock champions: exclude partner-stamped, partner-branch, and partner-created rows."""
+    partner_bids = [
+        str(i)
+        for i in await db.branches.distinct(
+            "id",
+            {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+        )
+        if i
+    ]
+    partner_users = [
+        str(i)
+        for i in await db.users.distinct(
+            "id",
+            {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+        )
+        if i
+    ]
+    nor: List[Dict[str, Any]] = [
+        {"partner_org_id": {"$exists": True, "$nin": [None, ""]}}
+    ]
+    if partner_bids:
+        nor.append({"branch_id": {"$in": partner_bids}})
+    if partner_users:
+        nor.append({"created_by": {"$in": partner_users}})
+    return {"$nor": nor}
+
+
+async def champion_belongs_to_partner(db, doc: Optional[dict], user: Optional[dict]) -> bool:
+    org_id = partner_org_id_of(user)
+    if not doc or not org_id:
+        return False
+    if str(doc.get("partner_org_id") or "") == org_id:
+        return True
+    bids = {str(i) for i in (await partner_branch_ids(db, user) or []) if i}
+    if str(doc.get("branch_id") or "") in bids:
+        return True
+    creators = set(await _partner_creator_ids(db, org_id))
+    uid = str((user or {}).get("id") or "")
+    if uid:
+        creators.add(uid)
+    return str(doc.get("created_by") or "") in creators
+
+
+async def champion_is_partner_owned(db, doc: Optional[dict]) -> bool:
+    if not doc:
+        return False
+    if str(doc.get("partner_org_id") or "").strip():
+        return True
+    bid = str(doc.get("branch_id") or "").strip()
+    if bid:
+        branch = await db.branches.find_one({"id": bid}, {"partner_org_id": 1})
+        if branch and str(branch.get("partner_org_id") or "").strip():
+            return True
+    created_by = str(doc.get("created_by") or "").strip()
+    if created_by:
+        creator = await db.users.find_one(
+            {"id": created_by},
+            {"partner_org_id": 1, "role": 1},
+        )
+        if creator and (
+            str(creator.get("partner_org_id") or "").strip()
+            or str(creator.get("role") or "") == "partner_super_admin"
+        ):
+            return True
+    return False
+
+
+async def assert_champion_access(db, doc: Optional[dict], user: Optional[dict]) -> None:
+    """Partner sees only their champions. Rock admin does not see partner champions. Branch managers unchanged."""
+    if not doc:
+        raise HTTPException(status_code=404, detail="Champion not found")
+    role = str((user or {}).get("role") or "").lower()
+    if role == "branch_manager" or not user:
+        return
+    if is_partner_super_admin(user):
+        if not await champion_belongs_to_partner(db, doc, user):
+            raise HTTPException(status_code=404, detail="Champion not found")
+        return
+    if _rock_admin(user) and await champion_is_partner_owned(db, doc):
+        raise HTTPException(status_code=404, detail="Champion not found")
+
+
+async def assert_champion_branch_for_actor(
+    db, user: Optional[dict], branch_id: Optional[str]
+) -> None:
+    if not branch_id:
+        return
+    if is_partner_super_admin(user):
+        await assert_partner_owns_branch(db, user, branch_id)
+        return
+    if not _rock_admin(user):
+        return
+    branch = await db.branches.find_one({"id": branch_id}, {"partner_org_id": 1})
+    if branch and str(branch.get("partner_org_id") or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail="This branch belongs to a partner organization",
+        )
+
+
+async def _assert_partner_can_link_student(
+    db, user: Optional[dict], student_id: Optional[str]
+) -> None:
+    if not student_id or not is_partner_super_admin(user):
+        return
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Partner organization missing")
+    student = await db.users.find_one(
+        {"id": student_id, "role": "student"},
+        {"partner_org_id": 1},
+    )
+    if not student:
+        raise HTTPException(status_code=400, detail="Linked student not found")
+    if str(student.get("partner_org_id") or "") == org_id:
+        return
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    if bids:
+        enrolled = await db.enrollments.find_one(
+            {"student_id": student_id, "branch_id": {"$in": bids}},
+            {"id": 1},
+        )
+        if enrolled:
+            return
+    raise HTTPException(
+        status_code=403,
+        detail="You can only link students in your organization",
+    )
 
 
 async def _unique_slug(db, base: str, *, exclude_id: Optional[str] = None) -> str:
@@ -121,22 +287,31 @@ async def list_champions(
     elif not include_archived:
         q["status"] = {"$ne": ChampionStatus.ARCHIVED.value}
 
-    if search and search.strip():
-        term = search.strip()
-        q["$or"] = [
-            {"name": {"$regex": term, "$options": "i"}},
-            {"slug": {"$regex": term, "$options": "i"}},
-            {"headline": {"$regex": term, "$options": "i"}},
-            {"student_name": {"$regex": term, "$options": "i"}},
-            {"short_bio": {"$regex": term, "$options": "i"}},
-        ]
-
     role = str((current_user or {}).get("role") or "").lower()
     if role == "branch_manager":
         from utils.student_status_service import get_managed_branch_ids_for_user
 
         allowed = await get_managed_branch_ids_for_user(db, current_user)
         q["branch_id"] = {"$in": allowed or ["__none__"]}
+    elif is_partner_super_admin(current_user):
+        q = merge_and_clause(q, await partner_champion_scope(db, current_user))
+    elif _rock_admin(current_user):
+        q = merge_and_clause(q, await rock_champion_scope(db))
+
+    if search and search.strip():
+        term = search.strip()
+        q = merge_and_clause(
+            q,
+            {
+                "$or": [
+                    {"name": {"$regex": term, "$options": "i"}},
+                    {"slug": {"$regex": term, "$options": "i"}},
+                    {"headline": {"$regex": term, "$options": "i"}},
+                    {"student_name": {"$regex": term, "$options": "i"}},
+                    {"short_bio": {"$regex": term, "$options": "i"}},
+                ]
+            },
+        )
 
     skip = max(0, skip)
     limit = max(1, min(limit, 200))
@@ -173,6 +348,8 @@ async def get_champion(champion_id: str, current_user: Optional[dict] = None) ->
         allowed = await get_managed_branch_ids_for_user(db, current_user or {})
         if str(doc.get("branch_id") or "") not in allowed:
             raise HTTPException(status_code=404, detail="Champion not found")
+    else:
+        await assert_champion_access(db, doc, current_user)
     return {"champion": enrich_champion(doc)}
 
 
@@ -196,6 +373,8 @@ async def create_champion(
         if not body.branch_id or body.branch_id not in allowed:
             raise HTTPException(status_code=403, detail="You can only manage champions for your selected branch")
 
+    await assert_champion_branch_for_actor(db, current_user, body.branch_id)
+    await _assert_partner_can_link_student(db, current_user, body.student_id)
     student_name = await _resolve_student_name(db, body.student_id)
     # If linked, prefer student display name when name omitted is same — name is required
     slug = await _unique_slug(db, body.slug or body.name)
@@ -221,6 +400,9 @@ async def create_champion(
         "created_at": now,
         "updated_at": now,
     }
+    org_id = partner_org_id_of(current_user)
+    if org_id:
+        doc["partner_org_id"] = org_id
     await db[COL].insert_one(doc)
     return {
         "message": "Champion created",
@@ -240,11 +422,15 @@ async def update_champion(
     doc = await db[COL].find_one({"id": champion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Champion not found")
+    await assert_champion_access(db, doc, current_user)
 
     data = body.model_dump(exclude_unset=True)
     patch: Dict[str, Any] = {"updated_at": datetime.utcnow()}
     if current_user and current_user.get("id"):
         patch["updated_by"] = current_user["id"]
+    org_id = partner_org_id_of(current_user)
+    if org_id and not doc.get("partner_org_id"):
+        patch["partner_org_id"] = org_id
 
     if data.pop("clear_photo", None):
         patch["photo_url"] = None
@@ -266,6 +452,9 @@ async def update_champion(
         if key in data:
             patch[key] = data[key]
 
+    if "branch_id" in patch:
+        await assert_champion_branch_for_actor(db, current_user, patch.get("branch_id"))
+
     if "slug" in data and data["slug"]:
         patch["slug"] = await _unique_slug(
             db, data["slug"], exclude_id=champion_id
@@ -274,6 +463,7 @@ async def update_champion(
     if "student_id" in data:
         sid = data["student_id"]
         if sid:
+            await _assert_partner_can_link_student(db, current_user, sid)
             patch["student_id"] = sid
             patch["student_name"] = await _resolve_student_name(db, sid)
         else:
@@ -310,6 +500,7 @@ async def publish_champion(
     doc = await db[COL].find_one({"id": champion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Champion not found")
+    await assert_champion_access(db, doc, current_user)
     if doc.get("status") == ChampionStatus.ARCHIVED.value:
         raise HTTPException(status_code=400, detail="Cannot publish an archived champion")
 
@@ -348,6 +539,7 @@ async def archive_champion(
     doc = await db[COL].find_one({"id": champion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Champion not found")
+    await assert_champion_access(db, doc, current_user)
     patch = {
         "status": ChampionStatus.ARCHIVED.value,
         "updated_at": datetime.utcnow(),
@@ -381,7 +573,26 @@ async def search_students_for_link(
     q: Dict[str, Any] = {"role": "student"}
 
     role = str((current_user or {}).get("role") or "").lower()
-    if role == "branch_manager":
+    if is_partner_super_admin(current_user):
+        org_id = partner_org_id_of(current_user)
+        if not org_id:
+            return {"students": []}
+        bids = [str(i) for i in (await partner_branch_ids(db, current_user) or []) if i]
+        enrolled_ids = []
+        if bids:
+            enrolled_ids = [
+                str(sid)
+                for sid in await db.enrollments.distinct(
+                    "student_id",
+                    {"branch_id": {"$in": bids}},
+                )
+                if sid
+            ]
+        student_or: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+        if enrolled_ids:
+            student_or.append({"id": {"$in": enrolled_ids}})
+        q = merge_and_clause(q, {"$or": student_or})
+    elif role == "branch_manager":
         from utils.student_status_service import get_managed_branch_ids_for_user
 
         allowed = await get_managed_branch_ids_for_user(db, current_user or {})
@@ -399,15 +610,20 @@ async def search_students_for_link(
 
     if search and search.strip():
         term = search.strip()
-        q["$or"] = [
-            {"full_name": {"$regex": term, "$options": "i"}},
-            {"name": {"$regex": term, "$options": "i"}},
-            {"first_name": {"$regex": term, "$options": "i"}},
-            {"last_name": {"$regex": term, "$options": "i"}},
-            {"email": {"$regex": term, "$options": "i"}},
-            {"phone": {"$regex": term, "$options": "i"}},
-            {"id": term},
-        ]
+        q = merge_and_clause(
+            q,
+            {
+                "$or": [
+                    {"full_name": {"$regex": term, "$options": "i"}},
+                    {"name": {"$regex": term, "$options": "i"}},
+                    {"first_name": {"$regex": term, "$options": "i"}},
+                    {"last_name": {"$regex": term, "$options": "i"}},
+                    {"email": {"$regex": term, "$options": "i"}},
+                    {"phone": {"$regex": term, "$options": "i"}},
+                    {"id": term},
+                ]
+            },
+        )
     limit = max(1, min(int(limit or 500), 500))
     rows = (
         await db.users.find(
@@ -485,14 +701,20 @@ async def list_public_champions(
     await ensure_champion_indexes(db)
 
     q: Dict[str, Any] = {"status": ChampionStatus.PUBLISHED.value}
+    q = merge_and_clause(q, await rock_champion_scope(db))
     if search and search.strip():
         term = search.strip()
-        q["$or"] = [
-            {"name": {"$regex": term, "$options": "i"}},
-            {"slug": {"$regex": term, "$options": "i"}},
-            {"headline": {"$regex": term, "$options": "i"}},
-            {"short_bio": {"$regex": term, "$options": "i"}},
-        ]
+        q = merge_and_clause(
+            q,
+            {
+                "$or": [
+                    {"name": {"$regex": term, "$options": "i"}},
+                    {"slug": {"$regex": term, "$options": "i"}},
+                    {"headline": {"$regex": term, "$options": "i"}},
+                    {"short_bio": {"$regex": term, "$options": "i"}},
+                ]
+            },
+        )
 
     skip = max(0, skip)
     limit = max(1, min(limit, 100))
@@ -550,6 +772,8 @@ async def get_public_champion(slug_or_id: str) -> Dict[str, Any]:
             {"id": key, "status": ChampionStatus.PUBLISHED.value}
         )
     if not doc:
+        raise HTTPException(status_code=404, detail="Champion not found")
+    if await champion_is_partner_owned(db, doc):
         raise HTTPException(status_code=404, detail="Champion not found")
 
     from models.champion_achievement_models import ChampionAchievementStatus

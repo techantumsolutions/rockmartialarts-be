@@ -269,6 +269,14 @@ async def create_academy_event_registration(
     except Exception:
         logger.exception("Lead hook after academy event registration failed")
 
+    try:
+        if status == AcademyEventRegistrationStatus.CONFIRMED.value:
+            from utils.ops_email_hooks import fire_event_registration
+
+            await fire_event_registration(db, doc, event=event)
+    except Exception:
+        logger.exception("ops email after academy event registration failed")
+
     return {
         "message": "Registration reserved" if needs_payment else "Registration confirmed",
         "registration": _public_registration(doc),
@@ -457,6 +465,15 @@ async def verify_academy_event_registration_payment(
     updated = await db[COL].find_one({"id": registration_id})
     if updated and updated.get("event_id"):
         await _sync_event_registrations_count(db, updated["event_id"])
+    try:
+        from utils.ops_email_hooks import fire_event_registration
+
+        event_doc = None
+        if updated and updated.get("event_id"):
+            event_doc = await db[COL_EVENTS].find_one({"id": updated["event_id"]})
+        await fire_event_registration(db, updated or doc, event=event_doc)
+    except Exception:
+        logger.exception("ops email after academy event payment verify failed")
     return {
         "message": "Registration confirmed",
         "registration": _public_registration(updated),

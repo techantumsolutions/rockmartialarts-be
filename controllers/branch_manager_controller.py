@@ -63,10 +63,16 @@ class BranchManagerController:
             await assert_partner_owns_branch(db, current_admin, manager_data.branch_id)
             branch = await db.branches.find_one({"id": manager_data.branch_id})
             if branch:
+                b_info = branch.get("branch") if isinstance(branch.get("branch"), dict) else {}
+                b_name = b_info.get("name") or branch.get("name", "")
+                b_addr = b_info.get("address") or branch.get("address") or {}
+                city = b_addr.get("city") or branch.get("city", "")
+                state = b_addr.get("state") or branch.get("state", "")
+                loc = f"{city}, {state}".strip(", ")
                 branch_assignment = BranchAssignment(
                     branch_id=manager_data.branch_id,
-                    branch_name=branch.get("branch", {}).get("name", ""),
-                    branch_location=f"{branch.get('branch', {}).get('address', {}).get('city', '')}, {branch.get('branch', {}).get('address', {}).get('state', '')}"
+                    branch_name=b_name,
+                    branch_location=loc
                 )
         
         # Create branch manager object
@@ -98,6 +104,13 @@ class BranchManagerController:
         
         # Insert into branch_managers collection
         result = await db.branch_managers.insert_one(manager_dict)
+        
+        # Keep branch.manager_id in sync if branch_id is provided
+        if manager_data.branch_id:
+            await db.branches.update_one(
+                {"id": manager_data.branch_id},
+                {"$set": {"manager_id": branch_manager.id}}
+            )
         
         # Log activity
         await log_activity(
@@ -155,6 +168,32 @@ class BranchManagerController:
         
         # Serialize and clean up response
         serialized_managers = []
+        manager_ids = [m["id"] for m in managers if m.get("id")]
+        branch_id_candidates = [
+            m.get("branch_assignment", {}).get("branch_id")
+            for m in managers
+            if isinstance(m.get("branch_assignment"), dict) and m.get("branch_assignment", {}).get("branch_id")
+        ]
+
+        branches_by_manager_id = {}
+        branches_by_id = {}
+        if manager_ids or branch_id_candidates:
+            query = {
+                "is_active": True,
+                "$or": [
+                    {"manager_id": {"$in": manager_ids}},
+                    {"id": {"$in": branch_id_candidates}}
+                ]
+            }
+            matched_branches = await db.branches.find(query).to_list(length=200)
+            for b in matched_branches:
+                b_mid = b.get("manager_id")
+                b_id = b.get("id")
+                if b_mid and b_mid not in branches_by_manager_id:
+                    branches_by_manager_id[b_mid] = b
+                if b_id:
+                    branches_by_id[b_id] = b
+
         for manager in managers:
             manager_data = serialize_doc(manager)
             # Remove sensitive information
@@ -162,6 +201,27 @@ class BranchManagerController:
                 del manager_data["password_hash"]
             if "contact_info" in manager_data and "password" in manager_data["contact_info"]:
                 del manager_data["contact_info"]["password"]
+
+            ba = manager_data.get("branch_assignment")
+            assigned_branch = None
+            if isinstance(ba, dict) and ba.get("branch_id"):
+                assigned_branch = branches_by_id.get(ba.get("branch_id"))
+            if not assigned_branch and manager.get("id"):
+                assigned_branch = branches_by_manager_id.get(manager.get("id"))
+
+            if assigned_branch:
+                b_info = assigned_branch.get("branch") if isinstance(assigned_branch.get("branch"), dict) else {}
+                b_name = b_info.get("name") or assigned_branch.get("name") or ""
+                b_addr = b_info.get("address") or assigned_branch.get("address") or {}
+                city = b_addr.get("city") or assigned_branch.get("city") or ""
+                state = b_addr.get("state") or assigned_branch.get("state") or ""
+                loc = f"{city}, {state}".strip(", ")
+                manager_data["branch_assignment"] = {
+                    "branch_id": assigned_branch.get("id"),
+                    "branch_name": b_name,
+                    "branch_location": loc
+                }
+
             serialized_managers.append(manager_data)
         
         return {
@@ -194,6 +254,26 @@ class BranchManagerController:
             del manager_data["password_hash"]
         if "contact_info" in manager_data and "password" in manager_data["contact_info"]:
             del manager_data["contact_info"]["password"]
+
+        # Enrich branch_assignment if missing or incomplete
+        ba = manager_data.get("branch_assignment")
+        assigned_branch = None
+        if isinstance(ba, dict) and ba.get("branch_id"):
+            assigned_branch = await db.branches.find_one({"id": ba.get("branch_id"), "is_active": True})
+        if not assigned_branch:
+            assigned_branch = await db.branches.find_one({"manager_id": manager_id, "is_active": True})
+        if assigned_branch:
+            b_info = assigned_branch.get("branch") if isinstance(assigned_branch.get("branch"), dict) else {}
+            b_name = b_info.get("name") or assigned_branch.get("name") or ""
+            b_addr = b_info.get("address") or assigned_branch.get("address") or {}
+            city = b_addr.get("city") or assigned_branch.get("city") or ""
+            state = b_addr.get("state") or assigned_branch.get("state") or ""
+            loc = f"{city}, {state}".strip(", ")
+            manager_data["branch_assignment"] = {
+                "branch_id": assigned_branch.get("id"),
+                "branch_name": b_name,
+                "branch_location": loc
+            }
         
         return manager_data
 
@@ -261,6 +341,18 @@ class BranchManagerController:
         # Update branch assignment
         if manager_data.branch_assignment:
             update_data["branch_assignment"] = manager_data.branch_assignment.dict()
+            new_bid = getattr(manager_data.branch_assignment, "branch_id", None)
+            if new_bid:
+                # Remove manager from any other branch
+                await db.branches.update_many(
+                    {"manager_id": manager_id, "id": {"$ne": new_bid}},
+                    {"$set": {"manager_id": None}}
+                )
+                # Assign manager to the new branch
+                await db.branches.update_one(
+                    {"id": new_bid},
+                    {"$set": {"manager_id": manager_id}}
+                )
 
         # Update emergency contact
         if manager_data.emergency_contact:

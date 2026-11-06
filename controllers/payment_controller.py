@@ -257,12 +257,13 @@ async def resolve_checkout_batch_ref(
     set in super admin — never leftover course-level catalog amounts (e.g. ₹1500).
     """
     requested = (requested_batch_ref or "").strip()
-    if requested:
-        if not batches or _resolve_branch_batch(batches, requested) is not None:
-            return requested
-    if student_id:
+    # Only a batch that still exists on this branch can be priced.
+    # A removed batch (common on expired enrollments) must not block course-level fees.
+    if requested and batches and _resolve_branch_batch(batches, requested) is not None:
+        return requested
+    if student_id and batches:
         prior = await _latest_student_batch_ref(db, student_id, course_id, branch_id)
-        if prior and (not batches or _resolve_branch_batch(batches, prior) is not None):
+        if prior and _resolve_branch_batch(batches, prior) is not None:
             return prior
     if len(batches) == 1:
         return _batch_identity(batches[0], 0)
@@ -1092,7 +1093,21 @@ class PaymentController:
             )
             await db.enrollments.delete_many({"id": {"$in": stale_ids}})
 
-        batch_ref = (body.batch_ref or source.get("batch_ref") or "").strip() or None
+        requested_batch_ref = (body.batch_ref or source.get("batch_ref") or "").strip() or None
+        branch = await db.branches.find_one({"id": branch_id})
+        batches = _batches_for_course_on_branch(branch or {}, course_id)
+        duration_row_for_batch = await db.durations.find_one({"id": duration})
+        if not duration_row_for_batch:
+            duration_row_for_batch = await db.durations.find_one({"code": duration})
+        batch_ref = await resolve_checkout_batch_ref(
+            db,
+            course_id=course_id,
+            branch_id=branch_id,
+            batches=batches,
+            requested_batch_ref=requested_batch_ref,
+            student_id=student_id,
+            duration_keys=_duration_price_keys(duration, duration_row_for_batch),
+        )
         beneficiary_payload = (
             body.beneficiary.dict()
             if body.beneficiary
@@ -1291,6 +1306,22 @@ class PaymentController:
                 },
             }
         )
+        if delete_result.deleted_count > 0:
+            try:
+                from utils.ops_email_hooks import fire_payment_failed
+
+                await fire_payment_failed(
+                    student_email=current_user.get("email"),
+                    student_name=current_user.get("full_name")
+                    or current_user.get("name")
+                    or "Student",
+                    amount=enrollment.get("fee_amount")
+                    or enrollment.get("amount")
+                    or "",
+                    failure_reason="Payment was not completed or checkout was dismissed",
+                )
+            except Exception:
+                logger.exception("ops email after cancel pending checkout failed")
         return {
             "cancelled": delete_result.deleted_count > 0,
             "enrollment_id": enrollment_id,
@@ -1706,6 +1737,43 @@ class PaymentController:
             out["new_end_date"] = renewal_meta.get("end_date")
             out["prior_end_date"] = renewal_meta.get("prior_end_date")
             out["message"] = "Renewal payment recorded successfully"
+        try:
+            from utils.ops_email_hooks import fire_payment_success
+
+            student_doc = await db.users.find_one({"id": student_id}) or {}
+            await fire_payment_success(
+                db,
+                student_email=student_doc.get("email") or payment_doc.get("student_email"),
+                student_name=(
+                    student_doc.get("full_name")
+                    or payment_doc.get("student_name")
+                    or "Student"
+                ),
+                amount=payment_doc.get("amount"),
+                course_or_plan=payment_doc.get("course_name")
+                or enrollment.get("course_name")
+                or "Course",
+                txn_id=payment_doc.get("transaction_id")
+                or payment_doc.get("razorpay_payment_id")
+                or payment_doc.get("id")
+                or "",
+                payment_date=payment_doc.get("payment_date") or now,
+                invoice_id=(invoice or {}).get("id") or "",
+                invoice_no=(invoice or {}).get("invoice_number") or "",
+                enrollment_course=enrollment.get("course_name")
+                or payment_doc.get("course_name")
+                or "",
+                branch_name=enrollment.get("branch_name")
+                or payment_doc.get("branch_name")
+                or "",
+                branch_id=enrollment.get("branch_id") or payment_doc.get("branch_id"),
+                start_date=enrollment.get("start_date"),
+                partner_org_id=enrollment.get("partner_org_id")
+                or payment_doc.get("partner_org_id")
+                or student_doc.get("partner_org_id"),
+            )
+        except Exception:
+            logger.exception("ops email after razorpay confirm failed")
         return out
 
     @staticmethod
@@ -2687,6 +2755,24 @@ class PaymentController:
                 },
             )
 
+        try:
+            from utils.ops_email_hooks import fire_payment_success
+
+            await fire_payment_success(
+                db,
+                student_email=holder.get("email"),
+                student_name=first_payload.get("full_name") or "Student",
+                amount=total_amount,
+                course_or_plan=(last_info.course_name if last_info else None) or "Course",
+                txn_id=transaction_id or "",
+                payment_date=datetime.utcnow(),
+                enrollment_course=(last_info.course_name if last_info else None) or "",
+                branch_name=(last_info.branch_name if last_info else None) or "",
+                branch_id=first.branch_id,
+            )
+        except Exception:
+            logger.exception("ops email after family registration failed")
+
         return RegistrationPaymentResponse(
             payment_id=last_payment_id,
             student_id=first_student_id,
@@ -3145,6 +3231,30 @@ class PaymentController:
                 message = f"Welcome! Your registration is complete. Payment of ₹{payment_info.pricing.total_amount} received. Transaction ID: {transaction_id}"
                 await send_whatsapp(phone, message)
 
+            try:
+                from utils.ops_email_hooks import fire_payment_success
+
+                await fire_payment_success(
+                    db,
+                    student_email=payment_data.student_data.get("email"),
+                    student_name=payment_data.student_data.get("full_name")
+                    or payment_data.student_data.get("first_name")
+                    or "Student",
+                    amount=payment_info.pricing.total_amount,
+                    course_or_plan=payment_info.course_name or "Course",
+                    txn_id=transaction_id or "",
+                    payment_date=datetime.utcnow(),
+                    invoice_id=inv_id or "",
+                    invoice_no=inv_number or "",
+                    enrollment_course=payment_info.course_name or "",
+                    branch_name=payment_info.branch_name or "",
+                    branch_id=payment_data.branch_id,
+                    partner_org_id=getattr(payment_data, "partner_org_id", None)
+                    or (creator_dict or {}).get("partner_org_id"),
+                )
+            except Exception:
+                logger.exception("ops email after registration payment failed")
+
             return RegistrationPaymentResponse(
                 payment_id=payment.id,
                 student_id=student_id,
@@ -3337,6 +3447,11 @@ class PaymentController:
 
         ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
         match: dict = PaymentController._merge_collected_revenue_filters({})
+        from utils.partner_tenant import apply_payment_list_partner_scope, assert_partner_owns_branch
+
+        match = await apply_payment_list_partner_scope(db, match, current_user)
+        if branch_id and branch_id not in ("all", "unassigned"):
+            await assert_partner_owns_branch(db, current_user, branch_id)
         if ps and pe:
             match["$or"] = [
                 {"payment_date": {"$gte": ps, "$lte": pe}},

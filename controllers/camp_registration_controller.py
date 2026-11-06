@@ -290,6 +290,27 @@ class CampRegistrationController:
         )
         saved = await db[CampRegistrationController.COLLECTION].find_one({"_id": doc["_id"]})
         saved = await CampRegistrationController._ensure_registration_code(saved or doc)
+        try:
+            from utils.ops_email_hooks import fire_camp_registration
+
+            event = (saved or {}).get("event") or {}
+            participant = (saved or {}).get("participant") or {}
+            await fire_camp_registration(
+                db,
+                {
+                    "participant_name": participant.get("full_name") or "",
+                    "participant_phone": participant.get("phone") or "",
+                    "participant_email": participant.get("email") or "",
+                    "camp_name": event.get("event_name") or "",
+                    "camp_dates": event.get("event_dates") or "",
+                },
+                camp={
+                    "name": event.get("event_name") or "",
+                    "start_date": event.get("event_dates") or "",
+                },
+            )
+        except Exception:
+            logger.exception("ops email after camp payment verify failed")
         return CampRegistrationController._payment_result(saved)
 
     @staticmethod

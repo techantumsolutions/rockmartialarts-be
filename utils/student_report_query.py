@@ -74,6 +74,15 @@ async def resolve_authorized_branch_scope(
     if role in {"super_admin", "superadmin"}:
         return (None, req or None)
 
+    if role == "partner_super_admin":
+        from utils.partner_tenant import partner_report_branch_ids
+
+        allowed = await partner_report_branch_ids(db, current_user, req or None)
+        allowed = list(allowed or [])
+        # Requested branch outside the partner org is already collapsed to [].
+        effective = req if req and req in allowed else None
+        return (allowed, effective)
+
     if role == "coach_admin":
         own = current_user.get("branch_id")
         allowed = [str(own)] if own else await get_managed_branch_ids_for_user(db, current_user)

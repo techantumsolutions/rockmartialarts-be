@@ -189,6 +189,26 @@ async def partner_branch_ids(db, user: Optional[dict]):
     return await db.branches.distinct("id", {"partner_org_id": org_id})
 
 
+async def partner_report_branch_ids(
+    db,
+    user: Optional[dict],
+    requested_branch_id: Optional[str] = None,
+):
+    """Branch ids a partner may see in reports.
+
+    None when the caller is not a partner (reports stay unchanged).
+    A list (possibly empty) for partner super admins. A requested branch
+    outside the org yields an empty list so Rock rows are never returned.
+    """
+    if not is_partner_super_admin(user):
+        return None
+    owned = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    req = str(requested_branch_id or "").strip()
+    if req and req.lower() not in {"all", ""}:
+        return [req] if req in owned else []
+    return owned
+
+
 async def resolve_partner_org_id_for_branch(db, branch_id: Optional[str]) -> Optional[str]:
     """Return partner_org_id stamped on a branch, or None for Rock-owned / unknown branches."""
     bid = str(branch_id or "").strip()

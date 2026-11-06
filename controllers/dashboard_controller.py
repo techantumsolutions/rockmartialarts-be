@@ -4,7 +4,12 @@ from datetime import datetime, timedelta
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.student_status_service import get_managed_branch_ids_for_user
-from utils.partner_tenant import apply_tenant_filter, tenant_match_clause
+from utils.partner_tenant import (
+    apply_tenant_filter,
+    merge_and_clause,
+    rock_owned_clause,
+    tenant_match_clause,
+)
 from models.user_models import UserRole
 
 
@@ -518,6 +523,8 @@ class DashboardController:
                         q["branch_id"] = branch_scope
                     if tenant_clause:
                         q.update(tenant_clause)
+                    elif name == "leads":
+                        q = merge_and_clause(q, rock_owned_clause())
                     return await coll.count_documents(q)
                 except Exception:
                     return 0

@@ -334,6 +334,17 @@ class AuthController:
             response_data["enrollment_id"] = enrollment_id
             response_data["message"] = "User registered and enrolled successfully"
 
+        try:
+            if user_data.role == UserRole.STUDENT:
+                from utils.ops_email_hooks import fire_student_self_welcome
+
+                await fire_student_self_welcome(
+                    student_email=user_dict.get("email"),
+                    student_name=user_dict.get("full_name") or "Student",
+                )
+        except Exception:
+            logger.exception("ops email after self registration failed")
+
         return response_data
 
     @staticmethod
@@ -621,6 +632,17 @@ class AuthController:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         await sync_account_password(db, user, new_hashed_password)
+
+        try:
+            if str(user.get("role") or "").lower() == "student":
+                from utils.ops_email_hooks import fire_student_account_ready
+
+                await fire_student_account_ready(
+                    student_email=user.get("email"),
+                    student_name=user.get("full_name") or user.get("first_name") or "Student",
+                )
+        except Exception:
+            logger.exception("ops email after password reset failed")
 
         return {"message": "Password has been reset successfully."}
 
@@ -1224,6 +1246,7 @@ class AuthController:
         course=None,
         branch=None,
         send_welcome_sms: bool = False,
+        partner_org_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Insert a student user that shares login credentials with an existing account."""
         db = get_db()
@@ -1249,6 +1272,8 @@ class AuthController:
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
+        if partner_org_id:
+            user_dict["partner_org_id"] = partner_org_id
         if course:
             user_dict["course"] = {
                 "category_id": getattr(course, "category_id", None) or (course.get("category_id") if isinstance(course, dict) else None),
@@ -1289,6 +1314,8 @@ class AuthController:
                 )
                 enrollment_doc = enrollment.dict()
                 enrollment_doc["duration_id"] = user_dict["course"]["duration"]
+                if partner_org_id:
+                    enrollment_doc["partner_org_id"] = partner_org_id
                 await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
             except Exception:
@@ -1302,6 +1329,17 @@ class AuthController:
                 )
             except Exception:
                 logger.exception("Failed sending linked-student SMS")
+
+        try:
+            from utils.ops_email_hooks import fire_family_profile_added
+
+            await fire_family_profile_added(
+                parent_email=acc.get("email") or user_dict.get("email"),
+                parent_name=acc.get("full_name") or acc.get("name") or "Parent",
+                student_name=full_name or "Student",
+            )
+        except Exception:
+            logger.exception("ops email after linked student create failed")
 
         return {"user_id": user_dict["id"], "enrollment_id": enrollment_id, "user": user_dict}
 
@@ -1386,6 +1424,32 @@ class AuthController:
             raise HTTPException(status_code=403, detail="Only students can add linked profiles")
         db = get_db()
         acc = await ensure_account_for_student(db, current_user)
+        org = str(current_user.get("partner_org_id") or "").strip()
+        if not org and current_user.get("id"):
+            parent = await db.users.find_one(
+                {"id": current_user["id"]}, {"partner_org_id": 1}
+            )
+            org = str((parent or {}).get("partner_org_id") or "").strip()
+        branch_id = None
+        if body.branch is not None:
+            branch_id = getattr(body.branch, "branch_id", None) or (
+                body.branch.get("branch_id") if isinstance(body.branch, dict) else None
+            )
+        if branch_id:
+            branch_doc = await db.branches.find_one(
+                {"id": branch_id}, {"partner_org_id": 1}
+            )
+            branch_org = str((branch_doc or {}).get("partner_org_id") or "").strip()
+            if org and branch_org != org:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only add a student at your organization's branches",
+                )
+            if not org and branch_org:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only add a student at Rock Martial Arts branches",
+                )
         created = await AuthController.create_student_under_account(
             acc,
             first_name=body.first_name,
@@ -1396,6 +1460,7 @@ class AuthController:
             course=body.course,
             branch=body.branch,
             send_welcome_sms=True,
+            partner_org_id=org or None,
         )
         try:
             await log_activity(

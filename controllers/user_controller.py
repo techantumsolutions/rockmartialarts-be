@@ -2,8 +2,11 @@ from fastapi import HTTPException, Depends, Request
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
 from collections import defaultdict
+import logging
 import secrets
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from models.user_models import UserCreate, UserUpdate, BaseUser, UserRole
 from utils.auth import hash_password, require_role, get_current_active_user
@@ -1339,19 +1342,49 @@ class UserController:
         ok_wa = await send_whatsapp(phone, msg)
         ok_sms = await send_sms(phone, msg)
 
+        email_ok = False
+        try:
+            if kind == "payment_reminder" and user.get("email"):
+                from utils.ops_email_hooks import fire_payment_reminder
+
+                await fire_payment_reminder(
+                    student_email=user.get("email"),
+                    student_name=name,
+                    amount="",
+                    due_date=None,
+                )
+                email_ok = True
+            elif kind == "welcome" and user.get("email"):
+                from utils.ops_email_hooks import fire_student_self_welcome
+
+                await fire_student_self_welcome(
+                    student_email=user.get("email"),
+                    student_name=name,
+                )
+                email_ok = True
+        except Exception:
+            logger.exception("ops email admin student notify failed")
+
         await log_activity(
             request=request,
             action="admin_student_notify",
             user_id=current_user["id"],
             user_name=current_user.get("full_name"),
-            details={"target_student_id": user_id, "kind": kind, "whatsapp_ok": ok_wa, "sms_ok": ok_sms},
+            details={
+                "target_student_id": user_id,
+                "kind": kind,
+                "whatsapp_ok": ok_wa,
+                "sms_ok": ok_sms,
+                "email_ok": email_ok,
+            },
         )
 
         label = "Welcome message sent" if kind == "welcome" else "Payment reminder sent"
         return {
-            "message": f"{label} (SMS and WhatsApp channels).",
+            "message": f"{label} (SMS, WhatsApp, and email channels).",
             "whatsapp": ok_wa,
             "sms": ok_sms,
+            "email": email_ok,
         }
 
     @staticmethod
@@ -1459,7 +1492,7 @@ class UserController:
         )
 
         role = str(current_user.get("role") or "").lower()
-        if role == "branch_manager":
+        if role in {"branch_manager", "partner_super_admin"}:
             await assert_can_manage_student_status(db, student, current_user)
         elif role not in {"super_admin", "coach_admin"}:
             raise HTTPException(status_code=403, detail="Not allowed")
