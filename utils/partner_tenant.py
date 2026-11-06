@@ -129,6 +129,17 @@ def rock_owned_clause() -> Dict[str, Any]:
     }
 
 
+def rock_dashboard_branch_clause() -> Dict[str, Any]:
+    """Branches visible on Rock SA/BM dashboards (excludes partner tenants + collaboration partners)."""
+    return {
+        "$and": [
+            rock_owned_clause(),
+            {"is_collaboration_partner": {"$ne": True}},
+            {"allows_collaboration": {"$ne": True}},
+        ]
+    }
+
+
 def student_rock_owned_clause() -> Dict[str, Any]:
     """Students not owned by a partner tenant (visible to Rock dashboards)."""
     return rock_owned_clause()

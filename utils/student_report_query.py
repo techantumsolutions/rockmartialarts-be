@@ -72,7 +72,19 @@ async def resolve_authorized_branch_scope(
         req = ""
 
     if role in {"super_admin", "superadmin"}:
-        return (None, req or None)
+        from utils.partner_tenant import rock_dashboard_branch_clause
+
+        # Rock SA: never include partner-tenant or collaboration-partner branches.
+        rock_ids = [
+            str(b)
+            for b in (
+                await db.branches.distinct("id", rock_dashboard_branch_clause()) or []
+            )
+            if b
+        ]
+        if req and req not in set(rock_ids):
+            return ([], None)
+        return (rock_ids, req or None)
 
     if role == "partner_super_admin":
         from utils.partner_tenant import partner_report_branch_ids
@@ -160,6 +172,27 @@ async def query_student_report_rows(
     student_filter: Dict[str, Any] = {"role": "student"}
     if is_active is not None:
         student_filter["is_active"] = bool(is_active)
+
+    role = _role(current_user)
+    if role in {"super_admin", "superadmin"}:
+        from utils.partner_tenant import merge_and_clause, rock_owned_clause
+
+        # Rock SA: exclude partner-stamped student accounts.
+        student_filter = merge_and_clause(student_filter, rock_owned_clause())
+    elif role == "branch_manager":
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_org_id_of,
+            resolve_staff_partner_org_id,
+            rock_owned_clause,
+        )
+
+        # Rock BM only — partner BM is tenant-scoped via branch ids.
+        staff_org = partner_org_id_of(current_user) or await resolve_staff_partner_org_id(
+            db, current_user
+        )
+        if not staff_org:
+            student_filter = merge_and_clause(student_filter, rock_owned_clause())
 
     # Text search is applied in Python below. Atlas blocks $regex / $regexMatch
     # on this cluster, so Mongo regex filters return empty results.

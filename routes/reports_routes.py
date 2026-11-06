@@ -152,6 +152,7 @@ async def get_branch_report_filters(
 @router.get("/courses")
 async def get_course_reports(
     branch_id: Optional[str] = Query(None, description="Filter by branch ID"),
+    course_id: Optional[str] = Query(None, description="Filter by course ID"),
     category_id: Optional[str] = Query(None, description="Filter by category ID"),
     difficulty_level: Optional[str] = Query(None, description="Filter by difficulty level"),
     active_only: bool = Query(True, description="Filter only active courses"),
@@ -162,7 +163,15 @@ async def get_course_reports(
 ):
     """Get comprehensive course reports with filtering and search"""
     return await ReportsController.get_course_reports(
-        current_user, branch_id, category_id, difficulty_level, active_only, search, skip, limit
+        current_user,
+        branch_id,
+        category_id,
+        difficulty_level,
+        active_only,
+        search,
+        skip,
+        limit,
+        course_id=course_id,
     )
 
 @router.get("/filters")
@@ -403,10 +412,15 @@ async def get_master_report_filters(
 
 @router.get("/courses/filters")
 async def get_course_report_filters(
+    branch_id: Optional[str] = Query(
+        None, description="When set, courses list is scoped to this branch"
+    ),
     current_user: dict = Depends(get_current_user_or_superadmin)
 ):
     """Get available filter options for course reports"""
-    return await ReportsController.get_course_report_filters(current_user)
+    return await ReportsController.get_course_report_filters(
+        current_user, branch_id=branch_id
+    )
 
 
 # ---- M23-S04 operational reports + M23-S05 export jobs ----

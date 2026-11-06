@@ -50,10 +50,11 @@ async def ensure_student_status_indexes(db=None) -> None:
 
 
 async def get_assigned_branch_ids_for_user(db, current_user: dict) -> List[str]:
-    """Every live branch this manager is assigned to (branches.manager_id).
+    """Every live *active* branch this manager is assigned to (branches.manager_id).
 
     Used by the header switch. Data queries use get_managed_branch_ids_for_user,
     which narrows this list to the selected branch.
+    Never reintroduces inactive branches from JWT / cached managed_branches.
     """
     manager_id = (current_user or {}).get("id")
     ids: List[str] = []
@@ -62,16 +63,26 @@ async def get_assigned_branch_ids_for_user(db, current_user: dict) -> List[str]:
             {"manager_id": manager_id, "is_active": True}, {"id": 1}
         ).to_list(length=None)
         ids = [str(r["id"]) for r in rows if r.get("id")]
-    if not ids:
-        raw = (current_user or {}).get("managed_branches") or (current_user or {}).get("branch_ids") or []
+    if not ids and db is not None:
+        # Prefer live-resolved managed_branches already filtered to active ids.
+        raw = (current_user or {}).get("managed_branches") or []
         if isinstance(raw, str):
             raw = [raw]
-        ids = [str(x) for x in raw if x]
-    if not ids:
+        candidate_ids = [str(x) for x in raw if x]
+        if candidate_ids:
+            active_rows = await db.branches.find(
+                {"id": {"$in": candidate_ids}, "is_active": True}, {"id": 1}
+            ).to_list(length=None)
+            ids = [str(r["id"]) for r in active_rows if r.get("id")]
+    if not ids and db is not None:
         ba = (current_user or {}).get("branch_assignment") or {}
         bid = ba.get("branch_id") or (current_user or {}).get("branch_id")
         if bid:
-            ids = [str(bid)]
+            fallback = await db.branches.find_one(
+                {"id": str(bid), "is_active": True}, {"id": 1}
+            )
+            if fallback and fallback.get("id"):
+                ids = [str(fallback["id"])]
     return ids
 
 
