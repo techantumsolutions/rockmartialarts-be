@@ -164,6 +164,25 @@ class BranchController:
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
+
+        mid = branch_dict.get("manager_id")
+        if mid:
+            b_info = branch_dict.get("branch") if isinstance(branch_dict.get("branch"), dict) else {}
+            b_name = b_info.get("name") or branch_dict.get("name") or ""
+            b_addr = b_info.get("address") or branch_dict.get("address") or {}
+            city = b_addr.get("city") or branch_dict.get("city") or ""
+            state = b_addr.get("state") or branch_dict.get("state") or ""
+            loc = f"{city}, {state}".strip(", ")
+            await db.branch_managers.update_one(
+                {"id": mid},
+                {"$set": {
+                    "branch_assignment": {
+                        "branch_id": branch.id,
+                        "branch_name": b_name,
+                        "branch_location": loc
+                    }
+                }}
+            )
         return {"message": "Branch created successfully", "branch_id": branch.id}
 
     @staticmethod
@@ -309,6 +328,38 @@ class BranchController:
         }
 
     @staticmethod
+    async def list_branches_for_student(current_user: dict):
+        """Branches a student may pick when adding a linked profile.
+
+        Partner students see only their organization's branches.
+        Rock students see only Rock branches.
+        """
+        db = get_db()
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not initialized")
+
+        org = str((current_user or {}).get("partner_org_id") or "").strip()
+        uid = str((current_user or {}).get("id") or "").strip()
+        if not org and uid:
+            student = await db.users.find_one({"id": uid}, {"partner_org_id": 1})
+            org = str((student or {}).get("partner_org_id") or "").strip()
+
+        from utils.partner_tenant import merge_and_clause, rock_owned_clause
+
+        query: dict = {"is_active": True}
+        if org:
+            query["partner_org_id"] = org
+        else:
+            query = merge_and_clause(query, rock_owned_clause())
+
+        branches = await db.branches.find(query).limit(100).to_list(length=100)
+        formatted = [BranchController._public_list_item(branch) for branch in branches]
+        return {
+            "branches": formatted,
+            "total": len(formatted),
+        }
+
+    @staticmethod
     def _public_list_item(branch: dict) -> dict:
         branch_info = branch.get("branch") or {}
         operational = branch.get("operational_details") or {}
@@ -328,6 +379,7 @@ class BranchController:
                 "address": branch_info.get("address", {}),
             },
             "location_id": branch.get("location_id"),
+            "partner_org_id": branch.get("partner_org_id"),
             "slug": branch.get("slug") or BranchController._name_to_slug(
                 str(branch_info.get("name") or "")
             ),
@@ -865,6 +917,33 @@ class BranchController:
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Branch not found")
+
+        if "manager_id" in update_data:
+            new_mid = update_data.get("manager_id")
+            old_mid = existing_for_geo.get("manager_id")
+            if old_mid and old_mid != new_mid:
+                await db.branch_managers.update_one(
+                    {"id": old_mid, "branch_assignment.branch_id": branch_id},
+                    {"$set": {"branch_assignment": None}}
+                )
+            if new_mid:
+                branch_payload = update_data.get("branch") if isinstance(update_data.get("branch"), dict) else {}
+                existing_branch = existing_for_geo.get("branch") if isinstance(existing_for_geo.get("branch"), dict) else {}
+                b_name = branch_payload.get("name") or existing_branch.get("name") or update_data.get("name") or existing_for_geo.get("name") or ""
+                b_addr = branch_payload.get("address") or existing_branch.get("address") or {}
+                city = b_addr.get("city") or ""
+                state = b_addr.get("state") or ""
+                loc = f"{city}, {state}".strip(", ")
+                await db.branch_managers.update_one(
+                    {"id": new_mid},
+                    {"$set": {
+                        "branch_assignment": {
+                            "branch_id": branch_id,
+                            "branch_name": b_name,
+                            "branch_location": loc
+                        }
+                    }}
+                )
 
         if "assignments" in update_data:
             refreshed = await db.branches.find_one({"id": branch_id})

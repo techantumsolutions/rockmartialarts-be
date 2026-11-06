@@ -9,6 +9,12 @@ from fastapi.responses import HTMLResponse
 from models.user_models import UserRole
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    is_partner_super_admin,
+    partner_branch_ids,
+    partner_org_id_of,
+    partner_payments_match_clause,
+)
 from utils.invoice_service import (
     ensure_invoice_indexes,
     generate_invoice_for_payment,
@@ -25,6 +31,23 @@ async def _managed_branch_ids(user: dict) -> List[str]:
     from utils.student_status_service import get_managed_branch_ids_for_user
 
     return await get_managed_branch_ids_for_user(get_db(), user)
+
+
+async def _partner_invoice_scope(db, user: dict) -> Dict[str, Any]:
+    """Invoices for one partner org. Empty match when the caller has no org."""
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+        clauses.append({"line_items.branch_id": {"$in": bids}})
+    pay_ids = await db.payments.distinct("id", partner_payments_match_clause(org_id, bids))
+    pay_ids = [str(p) for p in (pay_ids or []) if p]
+    if pay_ids:
+        clauses.append({"payment_id": {"$in": pay_ids}})
+    return {"$or": clauses}
 
 
 _OFFLINE_PAYMENT_METHODS = ("physical_cash", "cash", "hand_cash", "offline")
@@ -94,6 +117,8 @@ class InvoiceController:
                     {"created_by.user_id": current_user.get("id")},
                     {"student_id": current_user.get("id")},
                 ]
+        elif is_partner_super_admin(current_user):
+            query = _and_clause(query, await _partner_invoice_scope(db, current_user))
         elif role != UserRole.SUPER_ADMIN.value:
             raise HTTPException(status_code=403, detail="Not allowed to list invoices")
 
@@ -327,6 +352,9 @@ class InvoiceController:
         role = _role(current_user)
         if role == UserRole.SUPER_ADMIN.value:
             return
+        if is_partner_super_admin(current_user):
+            await InvoiceController._assert_can_access(doc, current_user)
+            return
         if role == UserRole.BRANCH_MANAGER.value:
             await InvoiceController._assert_can_access(doc, current_user)
             return
@@ -346,7 +374,7 @@ class InvoiceController:
             # Best-effort generate if payment is paid (covers historical rows)
             pay = await db.payments.find_one({"id": payment_id})
             if pay and str(pay.get("payment_status") or "").lower() in {"paid", "completed"}:
-                InvoiceController._assert_can_access_payment(pay, current_user)
+                await InvoiceController._assert_can_access_payment(pay, current_user)
                 doc = await generate_invoice_for_payment(payment_doc=pay)
             if not doc:
                 raise HTTPException(status_code=404, detail="Invoice not found for this payment")
@@ -390,6 +418,16 @@ class InvoiceController:
         role = _role(current_user)
         if role == UserRole.SUPER_ADMIN.value:
             return
+        if is_partner_super_admin(current_user):
+            db = get_db()
+            scope = await _partner_invoice_scope(db, current_user)
+            owned = await db.invoices.find_one(
+                {"$and": [{"id": doc.get("id")}, scope]},
+                {"id": 1},
+            )
+            if owned:
+                return
+            raise HTTPException(status_code=403, detail="Not allowed to view this invoice")
         uid = current_user.get("id")
         if role == UserRole.STUDENT.value:
             if doc.get("student_id") == uid or doc.get("account_user_id") == uid:
@@ -405,10 +443,21 @@ class InvoiceController:
         raise HTTPException(status_code=403, detail="Not allowed")
 
     @staticmethod
-    def _assert_can_access_payment(pay: dict, current_user: dict) -> None:
+    async def _assert_can_access_payment(pay: dict, current_user: dict) -> None:
         role = _role(current_user)
         if role == UserRole.SUPER_ADMIN.value:
             return
+        if is_partner_super_admin(current_user):
+            org_id = partner_org_id_of(current_user)
+            if org_id and str(pay.get("partner_org_id") or "") == org_id:
+                return
+            db = get_db()
+            bids = {str(i) for i in (await partner_branch_ids(db, current_user) or []) if i}
+            branch_id = str(pay.get("branch_id") or "")
+            detail_branch = str((pay.get("branch_details") or {}).get("branch_id") or "")
+            if branch_id in bids or detail_branch in bids:
+                return
+            raise HTTPException(status_code=403, detail="Not allowed")
         uid = current_user.get("id")
         if role == UserRole.STUDENT.value and (
             pay.get("student_id") == uid or pay.get("user_id") == uid

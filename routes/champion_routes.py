@@ -114,6 +114,7 @@ async def api_list_champion_achievements(
         champion_id,
         include_archived=include_archived,
         status=status,
+        current_user=current_user,
     )
 
 
@@ -134,7 +135,9 @@ async def api_get_champion_achievement(
     achievement_id: str,
     current_user: dict = Depends(require_role_unified(_ADMIN)),
 ):
-    return await get_champion_achievement(champion_id, achievement_id)
+    return await get_champion_achievement(
+        champion_id, achievement_id, current_user=current_user
+    )
 
 
 @router.patch("/{champion_id}/achievements/{achievement_id}")

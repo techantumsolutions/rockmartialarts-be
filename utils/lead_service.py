@@ -205,6 +205,31 @@ def lead_to_response_dict(ser: Dict[str, Any], fallback_now: Optional[datetime] 
     }
 
 
+def _lead_visibility_clause(current_user: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Partner SA sees only their org. Rock SA / coach admin hide partner-org leads.
+
+    Branch managers stay on the managed-branch filter only.
+    """
+    if not current_user:
+        return None
+    try:
+        from utils.partner_tenant import partner_org_id_of, rock_owned_clause
+
+        partner_org = partner_org_id_of(current_user)
+        if partner_org:
+            return {"partner_org_id": partner_org}
+        if _role(current_user) in {
+            "superadmin",
+            "super_admin",
+            "coach_admin",
+            "coachadmin",
+        }:
+            return rock_owned_clause()
+    except Exception:
+        return None
+    return None
+
+
 async def _bm_branch_filter(db, current_user: Optional[dict]) -> Optional[Dict[str, Any]]:
     if not current_user:
         return None
@@ -486,15 +511,10 @@ async def list_leads_service(
     if scope:
         clauses.append(scope)
 
-    # White-label partner SA: only their org's leads
-    try:
-        from utils.partner_tenant import partner_org_id_of
-
-        partner_org = partner_org_id_of(current_user)
-        if partner_org:
-            clauses.append({"partner_org_id": partner_org})
-    except Exception:
-        pass
+    # Partner SA: own org only. Rock SA / coach admin: hide partner contact leads.
+    visibility = _lead_visibility_clause(current_user)
+    if visibility:
+        clauses.append(visibility)
 
     if search and search.strip():
         s = search.strip()
@@ -641,15 +661,11 @@ async def list_lead_source_options(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
-    try:
-        from utils.partner_tenant import partner_org_id_of
+    visibility = _lead_visibility_clause(current_user)
+    if visibility:
+        from utils.partner_tenant import merge_and_clause
 
-        partner_org = partner_org_id_of(current_user)
-        if partner_org:
-            tenant_clause = {"partner_org_id": partner_org}
-            match = {**match, **tenant_clause} if match else tenant_clause
-    except Exception:
-        pass
+        match = merge_and_clause(match, visibility) if match else visibility
     pipeline: List[Dict[str, Any]] = []
     if match:
         pipeline.append({"$match": match})
@@ -705,6 +721,8 @@ async def _assert_lead_access(db, doc: dict, current_user: Optional[dict]) -> No
         return
     role = _role(current_user)
     if role in {"superadmin", "super_admin", "coach_admin", "coachadmin"}:
+        if str(doc.get("partner_org_id") or "").strip():
+            raise HTTPException(status_code=404, detail="Lead not found")
         return
     if role in {"partner_super_admin", "partnersuperadmin"}:
         from utils.partner_tenant import partner_org_id_of
@@ -720,7 +738,12 @@ async def _assert_lead_access(db, doc: dict, current_user: Optional[dict]) -> No
         raise HTTPException(status_code=403, detail="Not allowed")
     managed = await get_managed_branch_ids_for_user(db, current_user)
     bid = doc.get("branch_id")
-    if bid and str(bid) not in {str(m) for m in managed}:
+    managed_ids = {str(m) for m in managed}
+    if str(doc.get("partner_org_id") or "").strip() and (
+        not bid or str(bid) not in managed_ids
+    ):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if bid and str(bid) not in managed_ids:
         raise HTTPException(
             status_code=403,
             detail="You can only manage leads for your managed branches.",
@@ -1002,15 +1025,11 @@ async def lead_pipeline_summary(
     scope = await _bm_branch_filter(db, current_user)
     if scope:
         match = scope
-    try:
-        from utils.partner_tenant import partner_org_id_of
+    visibility = _lead_visibility_clause(current_user)
+    if visibility:
+        from utils.partner_tenant import merge_and_clause
 
-        partner_org = partner_org_id_of(current_user)
-        if partner_org:
-            tenant_clause = {"partner_org_id": partner_org}
-            match = {**match, **tenant_clause} if match else tenant_clause
-    except Exception:
-        pass
+        match = merge_and_clause(match, visibility) if match else visibility
 
     pipeline: List[Dict[str, Any]] = []
     if match:

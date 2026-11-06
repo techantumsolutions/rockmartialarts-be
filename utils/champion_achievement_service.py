@@ -70,10 +70,14 @@ def enrich_champion_achievement(doc: Optional[dict]) -> Optional[dict]:
     return out
 
 
-async def _require_champion(db, champion_id: str) -> dict:
+async def _require_champion(db, champion_id: str, current_user: Optional[dict] = None) -> dict:
     doc = await db[CHAMPIONS_COL].find_one({"id": champion_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Champion not found")
+    if current_user:
+        from utils.champion_service import assert_champion_access
+
+        await assert_champion_access(db, doc, current_user)
     return doc
 
 
@@ -82,12 +86,13 @@ async def list_champion_achievements(
     *,
     include_archived: bool = False,
     status: Optional[str] = None,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     await ensure_champion_achievement_indexes(db)
-    await _require_champion(db, champion_id)
+    await _require_champion(db, champion_id, current_user)
 
     q: Dict[str, Any] = {"champion_id": champion_id}
     if status and status != "all":
@@ -110,12 +115,15 @@ async def list_champion_achievements(
 
 
 async def get_champion_achievement(
-    champion_id: str, achievement_id: str
+    champion_id: str,
+    achievement_id: str,
+    *,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
-    await _require_champion(db, champion_id)
+    await _require_champion(db, champion_id, current_user)
     doc = await db[COL].find_one(
         {"id": achievement_id, "champion_id": champion_id}
     )
@@ -134,7 +142,7 @@ async def create_champion_achievement(
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     await ensure_champion_achievement_indexes(db)
-    await _require_champion(db, champion_id)
+    await _require_champion(db, champion_id, current_user)
 
     now = datetime.utcnow()
     doc = {
@@ -174,7 +182,7 @@ async def update_champion_achievement(
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
-    await _require_champion(db, champion_id)
+    await _require_champion(db, champion_id, current_user)
     doc = await db[COL].find_one(
         {"id": achievement_id, "champion_id": champion_id}
     )
@@ -234,7 +242,7 @@ async def archive_champion_achievement(
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
-    await _require_champion(db, champion_id)
+    await _require_champion(db, champion_id, current_user)
     doc = await db[COL].find_one(
         {"id": achievement_id, "champion_id": champion_id}
     )

@@ -33,6 +33,11 @@ def _period(start_date: Optional[str], end_date: Optional[str]) -> Tuple[Optiona
 async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[str, Any]:
     role = current_user.get("role")
     db = get_db()
+    from utils.partner_tenant import partner_report_branch_ids
+
+    partner_ids = await partner_report_branch_ids(db, current_user, branch_id)
+    if partner_ids is not None:
+        return {"branch_id": {"$in": partner_ids}}
     if role == "branch_manager":
         from utils.student_status_service import get_managed_branch_ids_for_user
 
@@ -43,6 +48,23 @@ async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[st
     if branch_id:
         return {"branch_id": branch_id}
     return {}
+
+
+def _apply_lead_tenant_scope(
+    collection: str, current_user: dict, query: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Rock lead reports exclude white-label partner contact leads."""
+    if collection != "leads":
+        return query
+    from utils.partner_tenant import (
+        is_partner_super_admin,
+        merge_and_clause,
+        rock_owned_clause,
+    )
+
+    if is_partner_super_admin(current_user):
+        return query
+    return merge_and_clause(query, rock_owned_clause())
 
 
 def _to_csv(rows: List[Dict[str, Any]], fieldnames: List[str]) -> str:
@@ -202,6 +224,7 @@ async def list_operational(
     ps, pe = _period(start_date, end_date)
     if ps and pe:
         q["created_at"] = {"$gte": ps, "$lte": pe}
+    q = _apply_lead_tenant_scope(collection, current_user, q)
     coll = db[collection]
     total = await coll.count_documents(q)
     rows = await coll.find(q).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
@@ -233,6 +256,7 @@ async def export_operational(
     ps, pe = _period(start_date, end_date)
     if ps and pe:
         q["created_at"] = {"$gte": ps, "$lte": pe}
+    q = _apply_lead_tenant_scope(collection, current_user, q)
 
     coll = db[collection]
     total = await coll.count_documents(q)

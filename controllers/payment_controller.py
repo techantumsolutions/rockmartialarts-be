@@ -257,12 +257,13 @@ async def resolve_checkout_batch_ref(
     set in super admin — never leftover course-level catalog amounts (e.g. ₹1500).
     """
     requested = (requested_batch_ref or "").strip()
-    if requested:
-        if not batches or _resolve_branch_batch(batches, requested) is not None:
-            return requested
-    if student_id:
+    # Only a batch that still exists on this branch can be priced.
+    # A removed batch (common on expired enrollments) must not block course-level fees.
+    if requested and batches and _resolve_branch_batch(batches, requested) is not None:
+        return requested
+    if student_id and batches:
         prior = await _latest_student_batch_ref(db, student_id, course_id, branch_id)
-        if prior and (not batches or _resolve_branch_batch(batches, prior) is not None):
+        if prior and _resolve_branch_batch(batches, prior) is not None:
             return prior
     if len(batches) == 1:
         return _batch_identity(batches[0], 0)
@@ -1092,7 +1093,21 @@ class PaymentController:
             )
             await db.enrollments.delete_many({"id": {"$in": stale_ids}})
 
-        batch_ref = (body.batch_ref or source.get("batch_ref") or "").strip() or None
+        requested_batch_ref = (body.batch_ref or source.get("batch_ref") or "").strip() or None
+        branch = await db.branches.find_one({"id": branch_id})
+        batches = _batches_for_course_on_branch(branch or {}, course_id)
+        duration_row_for_batch = await db.durations.find_one({"id": duration})
+        if not duration_row_for_batch:
+            duration_row_for_batch = await db.durations.find_one({"code": duration})
+        batch_ref = await resolve_checkout_batch_ref(
+            db,
+            course_id=course_id,
+            branch_id=branch_id,
+            batches=batches,
+            requested_batch_ref=requested_batch_ref,
+            student_id=student_id,
+            duration_keys=_duration_price_keys(duration, duration_row_for_batch),
+        )
         beneficiary_payload = (
             body.beneficiary.dict()
             if body.beneficiary
@@ -3432,6 +3447,11 @@ class PaymentController:
 
         ps, pe = PaymentController._payment_stats_parse_period(start_date, end_date)
         match: dict = PaymentController._merge_collected_revenue_filters({})
+        from utils.partner_tenant import apply_payment_list_partner_scope, assert_partner_owns_branch
+
+        match = await apply_payment_list_partner_scope(db, match, current_user)
+        if branch_id and branch_id not in ("all", "unassigned"):
+            await assert_partner_owns_branch(db, current_user, branch_id)
         if ps and pe:
             match["$or"] = [
                 {"payment_date": {"$gte": ps, "$lte": pe}},

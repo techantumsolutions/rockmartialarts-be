@@ -22,6 +22,11 @@ from models.academy_event_registration_models import (
 )
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    is_partner_super_admin,
+    merge_and_clause,
+    partner_org_id_of,
+)
 from utils.student_status_service import get_managed_branch_ids_for_user
 
 logger = logging.getLogger(__name__)
@@ -47,8 +52,40 @@ def _public(doc: Optional[dict]) -> Dict[str, Any]:
     return out
 
 
+async def _partner_registration_scope(db, user: dict) -> Dict[str, Any]:
+    """Registrations for one partner: their events, their branches, or a partner stamp."""
+    from utils.academy_event_service import partner_event_scope
+    from utils.partner_tenant import partner_branch_ids
+
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org_id}]
+    event_ids = await db.academy_events.distinct("id", await partner_event_scope(db, user))
+    event_ids = [str(i) for i in (event_ids or []) if i]
+    if event_ids:
+        clauses.append({"event_id": {"$in": event_ids}})
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+    return {"$or": clauses}
+
+
 async def _assert_admin_access(db, current_user: dict, doc: Optional[dict] = None) -> None:
     role = _role(current_user)
+    if is_partner_super_admin(current_user):
+        if not partner_org_id_of(current_user):
+            raise HTTPException(status_code=403, detail="Not authorized for event registrations")
+        if doc is None:
+            return
+        scope = await _partner_registration_scope(db, current_user)
+        owned = await db[COL].find_one(
+            {"$and": [{"id": doc.get("id")}, scope]},
+            {"id": 1},
+        )
+        if not owned:
+            raise HTTPException(status_code=404, detail="Registration not found")
+        return
     if role in {"super_admin", "superadmin", "coach_admin"}:
         return
     if role == "branch_manager":
@@ -95,7 +132,9 @@ async def _scoped_registration_query(
     q: Dict[str, Any] = {}
     role = _role(current_user)
     managed: List[str] = []
-    if role == "branch_manager":
+    if is_partner_super_admin(current_user):
+        q = await _partner_registration_scope(db, current_user)
+    elif role == "branch_manager":
         managed = await get_managed_branch_ids_for_user(db, current_user)
         if not managed:
             return {"__empty__": True}
@@ -163,6 +202,8 @@ async def _scoped_registration_query(
             ]
             if "$and" in q:
                 q["$and"].append({"$or": search_or})
+            elif "$or" in q:
+                q = merge_and_clause(q, {"$or": search_or})
             else:
                 q["$or"] = search_or
     return q

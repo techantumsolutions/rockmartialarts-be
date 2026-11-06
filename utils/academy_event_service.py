@@ -26,6 +26,13 @@ from models.academy_event_models import (
 from models.academy_event_registration_models import normalize_registration_fields
 from utils.database import get_db
 from utils.helpers import serialize_doc
+from utils.partner_tenant import (
+    assert_partner_owns_branch,
+    is_partner_super_admin,
+    merge_and_clause,
+    partner_branch_ids,
+    partner_org_id_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +133,130 @@ async def _validate_branch(db, branch_id: Optional[str]) -> Optional[str]:
     return branch_id
 
 
+def _rock_role(role: str) -> bool:
+    return role in {"super_admin", "superadmin", "coach_admin"}
+
+
+async def _partner_creator_ids(db, org_id: str) -> list:
+    ids = await db.users.distinct(
+        "id",
+        {"partner_org_id": org_id},
+    )
+    return [str(i) for i in (ids or []) if i]
+
+
+async def partner_event_scope(db, user: Optional[dict]) -> Dict[str, Any]:
+    """Events owned by one partner: stamp, their branches, or created by their staff."""
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return {"_id": {"$exists": False}}
+    clauses: list = [{"partner_org_id": org_id}]
+    bids = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    if bids:
+        clauses.append({"branch_id": {"$in": bids}})
+    creators = await _partner_creator_ids(db, org_id)
+    if creators:
+        clauses.append({"created_by": {"$in": creators}})
+    return {"$or": clauses}
+
+
+async def rock_event_scope(db) -> Dict[str, Any]:
+    """Rock admin events: exclude partner-stamped, partner-branch, and partner-created rows."""
+    partner_bids = [
+        str(i)
+        for i in await db[COL_BRANCHES].distinct(
+            "id",
+            {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+        )
+        if i
+    ]
+    partner_users = [
+        str(i)
+        for i in await db.users.distinct(
+            "id",
+            {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+        )
+        if i
+    ]
+    nor: list = [{"partner_org_id": {"$exists": True, "$nin": [None, ""]}}]
+    if partner_bids:
+        nor.append({"branch_id": {"$in": partner_bids}})
+    if partner_users:
+        nor.append({"created_by": {"$in": partner_users}})
+    return {"$nor": nor}
+
+
+async def event_belongs_to_partner(db, doc: Optional[dict], user: Optional[dict]) -> bool:
+    if not doc or not partner_org_id_of(user):
+        return False
+    org_id = partner_org_id_of(user)
+    if str(doc.get("partner_org_id") or "") == org_id:
+        return True
+    bids = {str(i) for i in (await partner_branch_ids(db, user) or []) if i}
+    if str(doc.get("branch_id") or "") in bids:
+        return True
+    created_by = str(doc.get("created_by") or "")
+    if created_by and created_by in set(await _partner_creator_ids(db, org_id or "")):
+        return True
+    return False
+
+
+async def event_is_partner_owned(db, doc: Optional[dict]) -> bool:
+    if not doc:
+        return False
+    if str(doc.get("partner_org_id") or "").strip():
+        return True
+    bid = str(doc.get("branch_id") or "").strip()
+    if bid:
+        branch = await db[COL_BRANCHES].find_one({"id": bid}, {"partner_org_id": 1})
+        if branch and str(branch.get("partner_org_id") or "").strip():
+            return True
+    created_by = str(doc.get("created_by") or "").strip()
+    if created_by:
+        creator = await db.users.find_one(
+            {"id": created_by},
+            {"partner_org_id": 1, "role": 1},
+        )
+        if creator and (
+            str(creator.get("partner_org_id") or "").strip()
+            or str(creator.get("role") or "") == "partner_super_admin"
+        ):
+            return True
+    return False
+
+
+async def assert_event_tenant_access(db, doc: Optional[dict], user: Optional[dict]) -> None:
+    """Partner sees only their events. Rock admin does not see partner events. Branch managers unchanged."""
+    if not doc:
+        raise HTTPException(status_code=404, detail="Event not found")
+    role = str((user or {}).get("role") or "").lower()
+    if role == "branch_manager":
+        return
+    if is_partner_super_admin(user):
+        if not await event_belongs_to_partner(db, doc, user):
+            raise HTTPException(status_code=404, detail="Event not found")
+        return
+    if _rock_role(role) and await event_is_partner_owned(db, doc):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+
+async def assert_event_branch_for_actor(db, user: Optional[dict], branch_id: Optional[str]) -> None:
+    if not branch_id:
+        return
+    if is_partner_super_admin(user):
+        await assert_partner_owns_branch(db, user, branch_id)
+        return
+    role = str((user or {}).get("role") or "").lower()
+    if not _rock_role(role):
+        return
+    branch = await db[COL_BRANCHES].find_one({"id": branch_id}, {"partner_org_id": 1})
+    if branch and str(branch.get("partner_org_id") or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail="This branch belongs to a partner organization",
+        )
+
+
 async def _enrich(db, doc: dict) -> Dict[str, Any]:
     out = _public(doc)
     out["registration_fields"] = normalize_registration_fields(
@@ -172,15 +303,28 @@ async def list_academy_events(
 
         allowed = await get_managed_branch_ids_for_user(db, current_user or {})
         q["branch_id"] = {"$in": allowed or ["__none__"]}
+    elif is_partner_super_admin(current_user):
+        q = merge_and_clause(q, await partner_event_scope(db, current_user))
+        if branch_id and branch_id != "all":
+            q = merge_and_clause(q, {"branch_id": branch_id})
+    elif _rock_role(role):
+        q = merge_and_clause(q, await rock_event_scope(db))
+        if branch_id and branch_id != "all":
+            q = merge_and_clause(q, {"branch_id": branch_id})
     elif branch_id and branch_id != "all":
         q["branch_id"] = branch_id
     if search and search.strip():
         s = search.strip()
-        q["$or"] = [
-            {"title": {"$regex": s, "$options": "i"}},
-            {"slug": {"$regex": s, "$options": "i"}},
-            {"venue": {"$regex": s, "$options": "i"}},
-        ]
+        q = merge_and_clause(
+            q,
+            {
+                "$or": [
+                    {"title": {"$regex": s, "$options": "i"}},
+                    {"slug": {"$regex": s, "$options": "i"}},
+                    {"venue": {"$regex": s, "$options": "i"}},
+                ]
+            },
+        )
 
     total = await db[COL].count_documents(q)
     rows = (
@@ -211,6 +355,8 @@ async def get_academy_event(event_id: str, current_user: Optional[dict] = None) 
         allowed = await get_managed_branch_ids_for_user(db, current_user or {})
         if str(doc.get("branch_id") or "") not in allowed:
             raise HTTPException(status_code=404, detail="Event not found")
+    else:
+        await assert_event_tenant_access(db, doc, current_user)
     return {"event": await _enrich(db, doc)}
 
 
@@ -324,6 +470,7 @@ async def create_academy_event(
         elif not body.branch_id or body.branch_id not in allowed:
             raise HTTPException(status_code=403, detail="You can only manage events for your selected branch")
     branch_id = await _validate_branch(db, body.branch_id)
+    await assert_event_branch_for_actor(db, current_user, branch_id)
     now = datetime.utcnow()
     status = (
         body.status.value
@@ -371,6 +518,9 @@ async def create_academy_event(
         "created_by": current_user.get("id"),
         "updated_by": current_user.get("id"),
     }
+    org_id = partner_org_id_of(current_user)
+    if org_id:
+        doc["partner_org_id"] = org_id
     await db[COL].insert_one(doc)
     return {"message": "Event created", "event": await _enrich(db, doc)}
 
@@ -384,6 +534,7 @@ async def update_academy_event(
     existing = await db[COL].find_one({"id": event_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Event not found")
+    await assert_event_tenant_access(db, existing, current_user)
 
     data = body.model_dump(exclude_unset=True)
     patch: Dict[str, Any] = {
@@ -427,6 +578,11 @@ async def update_academy_event(
 
     if "branch_id" in data:
         patch["branch_id"] = await _validate_branch(db, data["branch_id"])
+        await assert_event_branch_for_actor(db, current_user, patch["branch_id"])
+
+    org_id = partner_org_id_of(current_user)
+    if org_id and not existing.get("partner_org_id"):
+        patch["partner_org_id"] = org_id
 
     if "slug" in data and data["slug"] is not None:
         patch["slug"] = await _unique_slug(db, data["slug"], exclude_id=event_id)
@@ -469,6 +625,7 @@ async def archive_academy_event(
     existing = await db[COL].find_one({"id": event_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Event not found")
+    await assert_event_tenant_access(db, existing, current_user)
     await db[COL].update_one(
         {"id": event_id},
         {

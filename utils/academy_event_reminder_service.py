@@ -408,11 +408,18 @@ async def list_academy_event_reminder_logs(
     status: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
     q: Dict[str, Any] = {}
+    if current_user:
+        from utils.academy_event_service import assert_event_tenant_access
+
+        if event_id:
+            event = await db[COL_EVENTS].find_one({"id": event_id})
+            await assert_event_tenant_access(db, event, current_user)
     if event_id:
         q["event_id"] = event_id
     if registration_id:
@@ -443,6 +450,7 @@ async def admin_trigger_event_reminders(
     *,
     offset_hours: Optional[List[int]] = None,
     dry_run: bool = False,
+    current_user: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Admin-triggered send for one event (bypasses cron secret; auth via route)."""
     db = get_db()
@@ -451,6 +459,10 @@ async def admin_trigger_event_reminders(
     event = await db[COL_EVENTS].find_one({"id": event_id})
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
+    if current_user:
+        from utils.academy_event_service import assert_event_tenant_access
+
+        await assert_event_tenant_access(db, event, current_user)
     return await process_academy_event_reminders(
         dry_run=dry_run,
         event_id=event_id,
