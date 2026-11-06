@@ -99,23 +99,53 @@ async def assert_can_manage_student_status(
     """Raise HTTPException-compatible dict via caller — returns None if allowed."""
     from fastapi import HTTPException
     from models.user_models import UserRole
+    from utils.partner_tenant import partner_branch_ids, partner_org_id_of
 
     role = str(current_user.get("role") or "").lower()
     if role == UserRole.SUPER_ADMIN.value:
         return
     if role == UserRole.COACH_ADMIN.value:
         return
-    if role != UserRole.BRANCH_MANAGER.value:
-        raise HTTPException(status_code=403, detail="Not allowed to update student status")
 
     if str(student.get("role") or "").lower() != "student":
         raise HTTPException(status_code=400, detail="Status updates apply to students only")
+
+    student_id = student.get("id")
+
+    # Partner Super Admin — tenant-scoped only (own org stamp or partner-branch enrollments).
+    if role == UserRole.PARTNER_SUPER_ADMIN.value:
+        org_id = partner_org_id_of(current_user)
+        if not org_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Partner organization not found for this account",
+            )
+        if str(student.get("partner_org_id") or "").strip() == org_id:
+            return
+        p_bids = await partner_branch_ids(db, current_user) or []
+        if p_bids:
+            if student.get("branch_id") and str(student.get("branch_id")) in {
+                str(b) for b in p_bids
+            }:
+                return
+            enr = await db.enrollments.find_one(
+                {"student_id": student_id, "branch_id": {"$in": list(p_bids)}},
+                {"id": 1},
+            )
+            if enr:
+                return
+        raise HTTPException(
+            status_code=403,
+            detail="You can only update status for students in your organization.",
+        )
+
+    if role != UserRole.BRANCH_MANAGER.value:
+        raise HTTPException(status_code=403, detail="Not allowed to update student status")
 
     managed = await get_managed_branch_ids_for_user(db, current_user)
     if not managed:
         raise HTTPException(status_code=403, detail="No managed branches assigned")
 
-    student_id = student.get("id")
     # Direct branch on user
     if student.get("branch_id") and str(student.get("branch_id")) in managed:
         return

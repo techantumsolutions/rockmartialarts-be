@@ -71,8 +71,12 @@ class AttendanceController:
         limit: Optional[int] = None,
         status: Optional[str] = None,
         method: Optional[str] = None,
+        record_type: Optional[str] = None,
     ):
-        """Get attendance reports with filtering and role-based access control"""
+        """Get attendance reports with filtering and role-based access control.
+
+        record_type: all | student | coach (default all — students + coaches).
+        """
         try:
             from utils.attendance_report_query import (
                 apply_method_filter,
@@ -86,15 +90,37 @@ class AttendanceController:
             if db is None:
                 raise HTTPException(status_code=500, detail="Database connection not available")
 
-            # Build filter query
-            filter_query = {}
-            
-            # Apply role-based filtering for branch managers
+            empty = {
+                "attendance_records": [],
+                "total": 0,
+                "summary": {
+                    "total": 0,
+                    "present": 0,
+                    "absent": 0,
+                    "late": 0,
+                    "biometric": 0,
+                },
+            }
+
+            rt = str(record_type or "all").strip().lower()
+            if rt in {"", "all", "both"}:
+                rt = "all"
+            elif rt in {"student", "students"}:
+                rt = "student"
+            elif rt in {"coach", "coaches"}:
+                rt = "coach"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid record_type. Use all, student, or coach.",
+                )
+
+            # Shared base filter (branch / date / status / method)
+            filter_query: dict = {}
             role = str((current_user or {}).get("role") or "").lower()
             if role == "branch_manager":
                 managed_branch_ids = await get_managed_branch_ids_for_user(db, current_user)
                 if not managed_branch_ids:
-                    # Fallback to manager_id lookup used historically
                     branch_manager_id = current_user.get("id")
                     managed_branches = await db.branches.find(
                         {"manager_id": branch_manager_id, "is_active": True}
@@ -102,14 +128,17 @@ class AttendanceController:
                     managed_branch_ids = [branch["id"] for branch in (managed_branches or [])]
                 if not managed_branch_ids:
                     return {
-                        "attendance_records": [],
-                        "total": 0,
-                        "summary": {
-                            "total": 0,
-                            "present": 0,
-                            "absent": 0,
-                            "late": 0,
-                            "biometric": 0,
+                        **empty,
+                        "filters": {
+                            "student_id": student_id,
+                            "coach_id": coach_id,
+                            "course_id": course_id,
+                            "branch_id": branch_id,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "status": status,
+                            "method": method,
+                            "record_type": rt,
                         },
                     }
 
@@ -123,32 +152,60 @@ class AttendanceController:
                 else:
                     filter_query["branch_id"] = {"$in": managed_branch_ids}
 
-            # Apply additional filters
-            if student_id:
-                filter_query["student_id"] = student_id
-            if coach_id:
-                filter_query["coach_id"] = coach_id
-            if course_id:
-                filter_query["course_id"] = course_id
             if branch_id and role != "branch_manager":
                 filter_query["branch_id"] = branch_id
 
-            from utils.partner_tenant import apply_partner_branch_scope
-
-            # Attendance rows are scoped by branch ownership (not partner_org_id stamps).
-            filter_query = await apply_partner_branch_scope(
-                db, filter_query, current_user, branch_id=branch_id if role != "branch_manager" else None
+            from utils.partner_tenant import (
+                apply_partner_branch_scope,
+                merge_and_clause,
+                partner_branch_ids,
+                rock_owned_clause,
             )
+
+            filter_query = await apply_partner_branch_scope(
+                db,
+                filter_query,
+                current_user,
+                branch_id=branch_id if role != "branch_manager" else None,
+            )
+
+            # Rock SA/BM: attendance rows are branch-scoped — exclude partner-tenant branches.
+            partner_bids = await partner_branch_ids(db, current_user)
+            if partner_bids is None:
+                rock_bids = await db.branches.distinct(
+                    "id", merge_and_clause({"is_active": True}, rock_owned_clause())
+                )
+                rock_set = {str(b) for b in (rock_bids or []) if b}
+                existing = filter_query.get("branch_id")
+                if isinstance(existing, str) and existing:
+                    if str(existing) not in rock_set:
+                        return {
+                            **empty,
+                            "filters": {
+                                "student_id": student_id,
+                                "coach_id": coach_id,
+                                "course_id": course_id,
+                                "branch_id": branch_id,
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                "status": status,
+                                "method": method,
+                                "record_type": rt,
+                            },
+                        }
+                elif isinstance(existing, dict) and "$in" in existing:
+                    allowed = [b for b in (existing.get("$in") or []) if str(b) in rock_set]
+                    filter_query["branch_id"] = {"$in": allowed}
+                else:
+                    filter_query["branch_id"] = {"$in": list(rock_bids or [])}
 
             apply_status_filter(filter_query, status)
             apply_method_filter(filter_query, method)
 
-            # Date range filtering
             if start_date and end_date:
                 try:
-                    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                    # Inclusive end-of-day when date-only strings are used
+                    start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                     if len(end_date) <= 10:
                         end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
                     filter_query["attendance_date"] = {"$gte": start_dt, "$lte": end_dt}
@@ -162,79 +219,239 @@ class AttendanceController:
                 except (TypeError, ValueError):
                     fetch_limit = 1000
 
-            # Get attendance records with student and course information
-            pipeline = [
-                {"$match": filter_query},
-                {"$sort": {"attendance_date": -1}},
-                {"$limit": fetch_limit},
-                {
-                    "$lookup": {
-                        "from": "users",
-                        "localField": "student_id",
-                        "foreignField": "id",
-                        "as": "student_info"
-                    }
-                },
-                {"$unwind": {"path": "$student_info", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$lookup": {
-                        "from": "courses",
-                        "localField": "course_id",
-                        "foreignField": "id",
-                        "as": "course_info"
-                    }
-                },
-                {"$unwind": {"path": "$course_info", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$lookup": {
-                        "from": "branches",
-                        "localField": "branch_id",
-                        "foreignField": "id",
-                        "as": "branch_info"
-                    }
-                },
-                {"$unwind": {"path": "$branch_info", "preserveNullAndEmptyArrays": True}},
-                {
-                    "$project": {
-                        "id": 1,
-                        "student_id": 1,
-                        "student_name": {"$ifNull": ["$student_info.full_name", {"$concat": ["$student_info.first_name", " ", "$student_info.last_name"]}]},
-                        "course_id": 1,
-                        "course_name": {"$ifNull": ["$course_info.title", "$course_info.name"]},
-                        "branch_id": 1,
-                        "branch_name": {"$ifNull": ["$branch_info.branch.name", "$branch_info.name"]},
-                        "attendance_date": 1,
-                        "check_in_time": 1,
-                        "check_out_time": 1,
-                        "is_present": 1,
-                        "status": 1,
-                        "method": 1,
-                        "notes": 1,
-                        "created_at": 1,
-                        "admin_adjusted": 1,
-                        "attendance_modified_at": 1,
-                        "attendance_modified_by": 1,
-                        "updated_at": 1,
-                    }
-                },
-                {"$sort": {"attendance_date": -1}}
-            ]
+            def _serialize_rows(rows: list, *, record_kind: str) -> list:
+                out = []
+                for record in rows:
+                    serialized_record = {}
+                    for key, value in record.items():
+                        if key == "_id":
+                            continue
+                        if hasattr(value, "isoformat"):
+                            serialized_record[key] = value.isoformat()
+                        else:
+                            serialized_record[key] = value
+                    serialized_record["status"] = normalize_status_value(serialized_record)
+                    serialized_record["record_type"] = record_kind
+                    out.append(serialized_record)
+                return out
 
-            attendance_records = await db.attendance.aggregate(pipeline).to_list(length=fetch_limit)
+            serialized_records: list = []
 
-            # Convert to serializable format
-            serialized_records = []
-            for record in attendance_records:
-                serialized_record = {}
-                for key, value in record.items():
-                    if key == "_id":
-                        continue
-                    elif hasattr(value, 'isoformat'):
-                        serialized_record[key] = value.isoformat()
-                    else:
-                        serialized_record[key] = value
-                serialized_record["status"] = normalize_status_value(serialized_record)
-                serialized_records.append(serialized_record)
+            # Student attendance (collection: attendance)
+            if rt in {"all", "student"}:
+                student_filter = dict(filter_query)
+                if student_id:
+                    student_filter["student_id"] = student_id
+                if course_id:
+                    student_filter["course_id"] = course_id
+                # Coach-only filters should not pull student rows.
+                if coach_id and rt == "all":
+                    pass
+                pipeline = [
+                    {"$match": student_filter},
+                    {"$sort": {"attendance_date": -1}},
+                    {"$limit": fetch_limit},
+                    {
+                        "$lookup": {
+                            "from": "users",
+                            "localField": "student_id",
+                            "foreignField": "id",
+                            "as": "student_info",
+                        }
+                    },
+                    {"$unwind": {"path": "$student_info", "preserveNullAndEmptyArrays": True}},
+                    {
+                        "$lookup": {
+                            "from": "courses",
+                            "localField": "course_id",
+                            "foreignField": "id",
+                            "as": "course_info",
+                        }
+                    },
+                    {"$unwind": {"path": "$course_info", "preserveNullAndEmptyArrays": True}},
+                    {
+                        "$lookup": {
+                            "from": "branches",
+                            "localField": "branch_id",
+                            "foreignField": "id",
+                            "as": "branch_info",
+                        }
+                    },
+                    {"$unwind": {"path": "$branch_info", "preserveNullAndEmptyArrays": True}},
+                    {
+                        "$project": {
+                            "id": 1,
+                            "student_id": 1,
+                            "student_name": {
+                                "$ifNull": [
+                                    "$student_info.full_name",
+                                    {
+                                        "$concat": [
+                                            "$student_info.first_name",
+                                            " ",
+                                            "$student_info.last_name",
+                                        ]
+                                    },
+                                ]
+                            },
+                            "course_id": 1,
+                            "course_name": {
+                                "$ifNull": ["$course_info.title", "$course_info.name"]
+                            },
+                            "branch_id": 1,
+                            "branch_name": {
+                                "$ifNull": [
+                                    "$branch_info.branch.name",
+                                    "$branch_info.name",
+                                ]
+                            },
+                            "attendance_date": 1,
+                            "check_in_time": 1,
+                            "check_out_time": 1,
+                            "is_present": 1,
+                            "status": 1,
+                            "method": 1,
+                            "notes": 1,
+                            "created_at": 1,
+                            "admin_adjusted": 1,
+                            "attendance_modified_at": 1,
+                            "attendance_modified_by": 1,
+                            "updated_at": 1,
+                        }
+                    },
+                ]
+                student_rows = await db.attendance.aggregate(pipeline).to_list(
+                    length=fetch_limit
+                )
+                serialized_records.extend(_serialize_rows(student_rows, record_kind="student"))
+
+            # Coach attendance (collection: coach_attendance)
+            # Skip coaches when a specific student_id is selected under "all".
+            include_coaches = rt == "coach" or (rt == "all" and not student_id)
+            if include_coaches:
+                coach_filter = dict(filter_query)
+                if coach_id:
+                    coach_filter["coach_id"] = coach_id
+                # course_id does not apply to coach attendance rows
+                coach_pipeline = [
+                    {"$match": coach_filter},
+                    {"$sort": {"attendance_date": -1}},
+                    {"$limit": fetch_limit},
+                    {
+                        "$lookup": {
+                            "from": "coaches",
+                            "localField": "coach_id",
+                            "foreignField": "id",
+                            "as": "coach_info",
+                        }
+                    },
+                    {
+                        "$unwind": {
+                            "path": "$coach_info",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "branches",
+                            "localField": "branch_id",
+                            "foreignField": "id",
+                            "as": "branch_info",
+                        }
+                    },
+                    {
+                        "$unwind": {
+                            "path": "$branch_info",
+                            "preserveNullAndEmptyArrays": True,
+                        }
+                    },
+                    {
+                        "$project": {
+                            "id": 1,
+                            "coach_id": 1,
+                            "student_id": {"$literal": None},
+                            "student_name": {
+                                "$ifNull": [
+                                    "$coach_info.full_name",
+                                    {
+                                        "$ifNull": [
+                                            "$coach_info.personal_info.full_name",
+                                            {
+                                                "$trim": {
+                                                    "input": {
+                                                        "$concat": [
+                                                            {
+                                                                "$ifNull": [
+                                                                    "$coach_info.first_name",
+                                                                    {
+                                                                        "$ifNull": [
+                                                                            "$coach_info.personal_info.first_name",
+                                                                            "",
+                                                                        ]
+                                                                    },
+                                                                ]
+                                                            },
+                                                            " ",
+                                                            {
+                                                                "$ifNull": [
+                                                                    "$coach_info.last_name",
+                                                                    {
+                                                                        "$ifNull": [
+                                                                            "$coach_info.personal_info.last_name",
+                                                                            "",
+                                                                        ]
+                                                                    },
+                                                                ]
+                                                            },
+                                                        ]
+                                                    }
+                                                }
+                                            },
+                                        ]
+                                    },
+                                ]
+                            },
+                            "course_id": {"$literal": None},
+                            "course_name": {"$literal": "—"},
+                            "branch_id": 1,
+                            "branch_name": {
+                                "$ifNull": [
+                                    "$branch_info.branch.name",
+                                    "$branch_info.name",
+                                ]
+                            },
+                            "attendance_date": 1,
+                            "check_in_time": 1,
+                            "check_out_time": 1,
+                            "is_present": 1,
+                            "status": 1,
+                            "method": 1,
+                            "notes": 1,
+                            "created_at": 1,
+                            "updated_at": 1,
+                        }
+                    },
+                ]
+                coach_rows = await db.coach_attendance.aggregate(coach_pipeline).to_list(
+                    length=fetch_limit
+                )
+                coach_serialized = _serialize_rows(coach_rows, record_kind="coach")
+                for row in coach_serialized:
+                    name = (row.get("student_name") or "").strip()
+                    if not name:
+                        name = "Unknown Coach"
+                        row["student_name"] = name
+                    row["coach_name"] = name
+                serialized_records.extend(coach_serialized)
+
+            # Newest first; keep combined list within fetch_limit
+            def _sort_key(row: dict):
+                raw = row.get("attendance_date") or ""
+                return str(raw)
+
+            serialized_records.sort(key=_sort_key, reverse=True)
+            if len(serialized_records) > fetch_limit:
+                serialized_records = serialized_records[:fetch_limit]
 
             summary = summarize_records(serialized_records)
             return {
@@ -250,6 +467,7 @@ class AttendanceController:
                     "end_date": end_date,
                     "status": status,
                     "method": method,
+                    "record_type": rt,
                 },
             }
 
@@ -342,17 +560,13 @@ class AttendanceController:
 
             # If single date is provided, return format compatible with specific endpoints
             if date:
-                # Get all students based on role-based filtering
-                student_filter = {"role": "student", "is_active": True}
-                students = await db.users.find(student_filter).to_list(length=None)
+                from utils.partner_tenant import merge_and_clause, rock_owned_clause
 
-                # Get student IDs for enrollment filtering
-                student_ids = [student["id"] for student in students]
-
-                # Build enrollment filter based on role.
-                # Require active enrollments so attendance roster matches students page
-                # (exclude accounts with only inactive/old enrollments).
-                enrollment_filter = {"student_id": {"$in": student_ids}, "is_active": True}
+                # Roster only students with active course enrollments (must have course_id).
+                enrollment_filter: dict = {
+                    "is_active": True,
+                    "course_id": {"$exists": True, "$nin": [None, ""]},
+                }
                 if managed_branch_ids:
                     if branch_id and str(branch_id) in {str(b) for b in managed_branch_ids}:
                         enrollment_filter["branch_id"] = branch_id
@@ -365,41 +579,58 @@ class AttendanceController:
                         enrollment_filter["branch_id"] = {"$in": list(partner_bids or [])}
                 elif branch_id:
                     enrollment_filter["branch_id"] = branch_id
-                # Only apply course filtering when explicitly requested
+                else:
+                    # Rock SA: enrollments at rock-owned branches only (enrollments often lack partner_org_id).
+                    rock_bids = await db.branches.distinct(
+                        "id",
+                        merge_and_clause({"is_active": True}, rock_owned_clause()),
+                    )
+                    enrollment_filter["branch_id"] = {"$in": list(rock_bids or [])}
+
                 if course_id:
                     enrollment_filter["course_id"] = course_id
                 if batch_ref and batch_ref != "all":
-                    enrollment_filter["$or"] = [
-                        {"batch_ref": batch_ref},
-                        {"batch_id": batch_ref}
-                    ]
+                    enrollment_filter = merge_and_clause(
+                        enrollment_filter,
+                        {
+                            "$or": [
+                                {"batch_ref": batch_ref},
+                                {"batch_id": batch_ref},
+                            ]
+                        },
+                    )
 
-                # Get matching enrollments
-                # For Rock SA without branch/course filter, show all students even if
-                # enrollments collection is incomplete (prevents "empty attendance" UI).
-                # Partner SA must always stay within own org enrollments.
-                user_role = str(current_user.get("role") or "").lower() if current_user else ""
-                must_filter_by_enrollment = bool(
-                    managed_branch_ids
-                    or partner_bids is not None
-                    or branch_id
-                    or course_id
-                    or (batch_ref and batch_ref != "all")
-                )
-                # Always load enrollments for course context (but don't always filter student list by them).
                 enrollments = await db.enrollments.find(enrollment_filter).to_list(length=None)
-                if must_filter_by_enrollment or user_role in [
-                    "branch_manager",
-                    "coach",
-                    "coach_admin",
-                    "partner_super_admin",
-                ]:
-                    enrolled_student_ids = set(
+                # Drop rows that don't resolve to a real course id string.
+                enrollments = [
+                    e
+                    for e in enrollments
+                    if str(e.get("course_id") or "").strip() and e.get("student_id")
+                ]
+                enrolled_student_ids = list(
+                    {
                         str(enrollment.get("student_id"))
                         for enrollment in enrollments
                         if enrollment.get("student_id")
-                    )
-                    students = [student for student in students if str(student.get("id")) in enrolled_student_ids]
+                    }
+                )
+                if not enrolled_student_ids:
+                    return {
+                        "students": [],
+                        "date": date,
+                        "total": 0,
+                        "attendance_marked": 0,
+                    }
+
+                student_filter: dict = {
+                    "role": "student",
+                    "is_active": True,
+                    "id": {"$in": enrolled_student_ids},
+                }
+                if partner_bids is None and not managed_branch_ids:
+                    student_filter = merge_and_clause(student_filter, rock_owned_clause())
+
+                students = await db.users.find(student_filter).to_list(length=None)
 
                 # Ensure unique students (multiple enrollments do not duplicate a student)
                 seen_student_ids = set()
@@ -475,7 +706,7 @@ class AttendanceController:
                     courses = []
 
                     for enrollment in student_enrollments:
-                        # Get course details
+                        # Get course details — skip enrollments without a resolvable course.
                         course = course_by_id.get(enrollment.get("course_id"))
                         if course:
                             cid = str(course["id"])
@@ -489,6 +720,10 @@ class AttendanceController:
                                 "branch_id": enrollment.get("branch_id"),
                                 "attendance": c_att,
                             })
+
+                    # Only show students who have at least one enrolled course.
+                    if not courses:
+                        continue
 
                     # Match attendance to requested course_id or to the student's course
                     target_course_id = str(course_id) if course_id else (str(courses[0]["id"]) if courses else None)
@@ -1005,6 +1240,31 @@ class AttendanceController:
             # Get coaches from the coaches collection (not users collection)
             coaches = await db.coaches.find(coach_filter).to_list(length=1000)
 
+            # Attendance marking only applies to coaches with an assigned batch on an
+            # available/active course. Skip coaches with no schedulable assignment.
+            from utils.coach_batch_schedule import coach_ids_assigned_to_active_course_batches
+
+            scope_branch_ids = None
+            if managed_branch_ids is not None:
+                scope_branch_ids = list(managed_branch_ids)
+            elif partner_bids is not None:
+                scope_branch_ids = list(partner_bids or [])
+            elif branch_id:
+                scope_branch_ids = [branch_id]
+
+            eligible_coach_ids = await coach_ids_assigned_to_active_course_batches(
+                db, branch_ids=scope_branch_ids
+            )
+            if eligible_coach_ids:
+                coaches = [
+                    c
+                    for c in coaches
+                    if str(c.get("id") or "") in eligible_coach_ids
+                    or str(c.get("user_id") or "").strip() in eligible_coach_ids
+                ]
+            else:
+                coaches = []
+
             # If single date is provided, return format compatible with branch manager attendance page
             if date:
                 try:
@@ -1227,43 +1487,38 @@ class AttendanceController:
                 attendance_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 next_day = attendance_date + timedelta(days=1)
 
-            # Get all students - for Rock SA, show all students regardless of enrollment
-            # For branch managers / partner SA, only show students from their branches
-            student_filter = {"role": "student", "is_active": True}
+            # Stats roster: only students with active course enrollments (RMA + partner).
+            from utils.partner_tenant import merge_and_clause, rock_owned_clause
+
+            student_filter: dict = {"role": "student", "is_active": True}
+            enrollment_scope: dict = {
+                "is_active": True,
+                "course_id": {"$exists": True, "$nin": [None, ""]},
+            }
 
             if managed_branch_ids:
-                # For branch managers, get students from their branches via active enrollments
-                enrollments = await db.enrollments.find(
-                    {"branch_id": {"$in": managed_branch_ids}, "is_active": True}
-                ).to_list(length=None)
-                if enrollments:
-                    enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
-                    student_filter["id"] = {"$in": enrolled_student_ids}
-                else:
-                    # If no enrollments exist, show no students for branch managers
-                    student_filter["id"] = {"$in": []}
+                enrollment_scope["branch_id"] = {"$in": managed_branch_ids}
             elif partner_bids is not None:
                 scope_bids = [branch_id] if branch_id else list(partner_bids or [])
-                enrollments = await db.enrollments.find(
-                    {"branch_id": {"$in": scope_bids}, "is_active": True}
-                ).to_list(length=None)
-                if enrollments:
-                    enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
-                    student_filter["id"] = {"$in": enrolled_student_ids}
-                else:
-                    student_filter["id"] = {"$in": []}
+                enrollment_scope["branch_id"] = {"$in": scope_bids}
             elif branch_id:
-                # For specific branch, get students from that branch via active enrollments
-                enrollments = await db.enrollments.find(
-                    {"branch_id": branch_id, "is_active": True}
-                ).to_list(length=None)
-                if enrollments:
-                    enrolled_student_ids = list(set(e["student_id"] for e in enrollments))
-                    student_filter["id"] = {"$in": enrolled_student_ids}
-                else:
-                    # If no enrollments exist, show no students for specific branch
-                    student_filter["id"] = {"$in": []}
-            # For Rock SA without branch filter, show all students regardless of enrollment status
+                enrollment_scope["branch_id"] = branch_id
+            else:
+                rock_bids = await db.branches.distinct(
+                    "id",
+                    merge_and_clause({"is_active": True}, rock_owned_clause()),
+                )
+                enrollment_scope["branch_id"] = {"$in": list(rock_bids or [])}
+                student_filter = merge_and_clause(student_filter, rock_owned_clause())
+
+            enrollments = await db.enrollments.find(enrollment_scope).to_list(length=None)
+            if enrollments:
+                enrolled_student_ids = list(
+                    {e["student_id"] for e in enrollments if e.get("student_id")}
+                )
+                student_filter["id"] = {"$in": enrolled_student_ids}
+            else:
+                student_filter["id"] = {"$in": []}
 
             all_students = await db.users.find(student_filter).to_list(length=None)
             # Unique roster (guard against duplicate user docs)
@@ -1486,7 +1741,8 @@ class AttendanceController:
         format: str = "csv",
         status: Optional[str] = None,
         method: Optional[str] = None,
-        current_user: dict = None
+        current_user: dict = None,
+        record_type: Optional[str] = None,
     ):
         """Export attendance reports (csv or excel)"""
         try:
@@ -1502,6 +1758,7 @@ class AttendanceController:
                 current_user=current_user,
                 status=status,
                 method=method,
+                record_type=record_type,
             )
             export = build_attendance_export(
                 attendance_data.get("attendance_records") or [],

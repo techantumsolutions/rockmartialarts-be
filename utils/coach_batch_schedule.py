@@ -77,6 +77,7 @@ def iter_active_batches(branch_id: str, branch_name: str, schedule: Any) -> Iter
             yield {
                 "branch_id": str(branch_id),
                 "branch_name": branch_name,
+                "course_id": course_id,
                 "batch_id": batch_id,
                 "batch_name": name or f"Batch {index + 1}",
                 "coach_id": str(batch.get("coach_id") or batch.get("coachId") or "").strip(),
@@ -87,6 +88,65 @@ def iter_active_batches(branch_id: str, branch_name: str, schedule: Any) -> Iter
                 "end": end,
                 "complete": bool(days) and start is not None and end is not None and end > start,
             }
+
+
+async def coach_ids_assigned_to_active_course_batches(
+    db,
+    *,
+    branch_ids: Optional[List[str]] = None,
+) -> Set[str]:
+    """Coach ids assigned to at least one batch on an available, active course."""
+    query: Dict[str, Any] = {"is_active": True}
+    if branch_ids is not None:
+        if not branch_ids:
+            return set()
+        query["id"] = {"$in": [str(b) for b in branch_ids if b]}
+
+    branches = await db.branches.find(
+        query,
+        {"id": 1, "branch.name": 1, "name": 1, "assignments.course_schedule": 1},
+    ).to_list(length=1000)
+
+    course_ids: Set[str] = set()
+    scheduled_batches: List[dict] = []
+    for branch in branches:
+        schedule = ((branch.get("assignments") or {}).get("course_schedule")) or []
+        for batch in iter_active_batches(str(branch.get("id") or ""), _branch_name(branch), schedule):
+            if not batch.get("coach_id"):
+                continue
+            scheduled_batches.append(batch)
+            cid = str(batch.get("course_id") or "").strip()
+            if cid:
+                course_ids.add(cid)
+
+    if not scheduled_batches:
+        return set()
+
+    active_course_ids: Set[str] = set()
+    if course_ids:
+        active_courses = await db.courses.find(
+            {
+                "id": {"$in": list(course_ids)},
+                "$or": [
+                    {"settings.active": True},
+                    {"settings.active": {"$exists": False}},
+                    {"settings": {"$exists": False}},
+                ],
+            },
+            {"id": 1},
+        ).to_list(length=len(course_ids))
+        active_course_ids = {str(c.get("id")) for c in active_courses if c.get("id")}
+
+    assigned: Set[str] = set()
+    for batch in scheduled_batches:
+        course_id = str(batch.get("course_id") or "").strip()
+        # Keep batches whose course is active, or legacy rows with no course id.
+        if course_id and course_id not in active_course_ids:
+            continue
+        coach_id = str(batch.get("coach_id") or "").strip()
+        if coach_id:
+            assigned.add(coach_id)
+    return assigned
 
 
 async def coach_assignment_ids(db, coach: dict) -> Set[str]:

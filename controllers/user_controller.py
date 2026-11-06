@@ -1492,7 +1492,7 @@ class UserController:
         )
 
         role = str(current_user.get("role") or "").lower()
-        if role == "branch_manager":
+        if role in {"branch_manager", "partner_super_admin"}:
             await assert_can_manage_student_status(db, student, current_user)
         elif role not in {"super_admin", "coach_admin"}:
             raise HTTPException(status_code=403, detail="Not allowed")
