@@ -408,6 +408,12 @@ async def create_lead_from_payload(data: LeadCreate) -> Dict[str, Any]:
     )
     out = lead_to_response_dict(ser)
     out["duplicate_merged"] = merged
+    try:
+        from utils.ops_email_hooks import fire_lead_created
+
+        await fire_lead_created(get_db(), ser or out, was_merged=bool(merged))
+    except Exception:
+        logger.exception("ops email after lead create failed")
     return out
 
 

@@ -303,6 +303,13 @@ async def _insert_training_request(
     except Exception:
         logger.exception("Lead hook after training request failed")
 
+    try:
+        from utils.ops_email_hooks import fire_training_request
+
+        await fire_training_request(db, doc)
+    except Exception:
+        logger.exception("ops email after training request failed")
+
     return {
         "message": success_message,
         "request": serialize_doc(doc),

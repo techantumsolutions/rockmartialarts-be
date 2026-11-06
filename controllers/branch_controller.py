@@ -1,7 +1,10 @@
+import logging
 import re
 from fastapi import HTTPException, Depends, status
 from typing import Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from models.branch_models import BranchCreate, BranchUpdate, Branch
 from models.holiday_models import HolidayCreate, Holiday
@@ -866,6 +869,62 @@ class BranchController:
         if "assignments" in update_data:
             refreshed = await db.branches.find_one({"id": branch_id})
             await sync_branch_courses_from_assignments(db, branch_id, refreshed)
+            # Additive schedule-update emails when course_schedule was provided
+            try:
+                new_asg = update_data.get("assignments") or {}
+                if isinstance(new_asg, dict) and "course_schedule" in new_asg:
+                    from utils.ops_email_hooks import (
+                        fire_schedule_update_students,
+                        fire_coach_batch_update,
+                    )
+
+                    schedule = new_asg.get("course_schedule") or []
+                    summary = f"Schedule updated ({len(schedule)} batch(es)) at this branch."
+                    # Notify active enrolled students at this branch (best-effort, capped)
+                    student_emails = []
+                    async for enr in db.enrollments.find(
+                        {"branch_id": branch_id, "is_active": True},
+                        {"student_id": 1, "course_name": 1},
+                    ).limit(200):
+                        sid = enr.get("student_id")
+                        if not sid:
+                            continue
+                        u = await db.users.find_one({"id": sid}, {"email": 1})
+                        if u and u.get("email"):
+                            student_emails.append(u["email"])
+                    course_label = "your course"
+                    if schedule and isinstance(schedule[0], dict):
+                        course_label = (
+                            schedule[0].get("course_name")
+                            or schedule[0].get("title")
+                            or course_label
+                        )
+                    await fire_schedule_update_students(
+                        student_emails=list(dict.fromkeys(student_emails)),
+                        course_name=course_label,
+                        new_schedule=summary,
+                    )
+                    coach_emails = []
+                    for row in schedule:
+                        if not isinstance(row, dict):
+                            continue
+                        for cid in row.get("coach_ids") or (
+                            [row["coach_id"]] if row.get("coach_id") else []
+                        ):
+                            c = await db.coaches.find_one({"id": str(cid)})
+                            if not c:
+                                continue
+                            contact = c.get("contact_info") if isinstance(c.get("contact_info"), dict) else {}
+                            em = (c.get("email") or contact.get("email") or "").strip()
+                            if em:
+                                coach_emails.append(em)
+                    await fire_coach_batch_update(
+                        coach_emails=list(dict.fromkeys(coach_emails)),
+                        course_name=course_label,
+                        change_summary=summary,
+                    )
+            except Exception:
+                logger.exception("ops email after branch schedule update failed")
         
         return {"message": "Branch updated successfully"}
 

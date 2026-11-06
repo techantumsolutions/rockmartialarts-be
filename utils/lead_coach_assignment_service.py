@@ -356,6 +356,20 @@ async def assign_coach_to_lead(
         )
 
     updated_lead = await db[COL_LEADS].find_one({"id": lead_id})
+    try:
+        from utils.ops_email_hooks import fire_coach_lead_assigned
+
+        contact = coach.get("contact_info") if isinstance(coach.get("contact_info"), dict) else {}
+        coach_email = (coach.get("email") or contact.get("email") or "").strip() or None
+        await fire_coach_lead_assigned(
+            coach_email=coach_email,
+            coach_name=coach_name or "Coach",
+            lead_name=lead.get("name") or "Lead",
+            lead_phone=lead.get("phone") or "",
+            lead_source=lead.get("source") or lead.get("source_type") or "",
+        )
+    except Exception:
+        logger.exception("ops email after coach lead assign failed")
     return {
         "message": "Coach assigned. Waiting for coach response.",
         "assignment": _public(doc),

@@ -166,6 +166,12 @@ async def create_callback(body: CallbackCreate) -> Dict[str, Any]:
         logger.exception("Lead upsert for callback failed")
 
     await db[COL].insert_one(doc)
+    try:
+        from utils.ops_email_hooks import fire_callback_created
+
+        await fire_callback_created(db, doc)
+    except Exception:
+        logger.exception("ops email after callback create failed")
     return {
         "message": "Callback request submitted. Our team will contact you soon.",
         "callback": _public(doc),

@@ -271,4 +271,16 @@ class OnboardingController:
             )
         await db.payments.insert_many(payment_docs)
 
+        try:
+            from utils.ops_email_hooks import fire_student_account_ready
+
+            await fire_student_account_ready(
+                student_email=user.get("email"),
+                student_name=full_name or user.get("full_name") or "Student",
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("ops email after onboarding failed")
+
         return {"message": "Onboarding complete. You can now log in.", "user_id": student_id}

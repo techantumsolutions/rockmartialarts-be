@@ -7,6 +7,7 @@ in the existing Leads admin UI.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
@@ -21,6 +22,8 @@ from utils.collaboration_partner import (
 )
 from utils.database import get_db
 from utils.lead_service import create_or_merge_lead, lead_to_response_dict
+
+logger = logging.getLogger(__name__)
 
 
 class PartnerLandingLeadCreate(BaseModel):
@@ -81,6 +84,16 @@ async def _create_for_partner_branch(branch: dict, payload: PartnerLandingLeadCr
         "branch_name": branch_name,
         "slug": branch.get("slug"),
     }
+    try:
+        from utils.ops_email_hooks import fire_partner_landing_lead
+
+        await fire_partner_landing_lead(
+            get_db(),
+            ser or out,
+            partner_branch_name=branch_name,
+        )
+    except Exception:
+        logger.exception("ops email after partner landing lead failed")
     return {
         "message": "Thank you — we received your enquiry.",
         "lead": out,

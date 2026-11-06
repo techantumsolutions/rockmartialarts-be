@@ -334,6 +334,17 @@ class AuthController:
             response_data["enrollment_id"] = enrollment_id
             response_data["message"] = "User registered and enrolled successfully"
 
+        try:
+            if user_data.role == UserRole.STUDENT:
+                from utils.ops_email_hooks import fire_student_self_welcome
+
+                await fire_student_self_welcome(
+                    student_email=user_dict.get("email"),
+                    student_name=user_dict.get("full_name") or "Student",
+                )
+        except Exception:
+            logger.exception("ops email after self registration failed")
+
         return response_data
 
     @staticmethod
@@ -621,6 +632,17 @@ class AuthController:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         await sync_account_password(db, user, new_hashed_password)
+
+        try:
+            if str(user.get("role") or "").lower() == "student":
+                from utils.ops_email_hooks import fire_student_account_ready
+
+                await fire_student_account_ready(
+                    student_email=user.get("email"),
+                    student_name=user.get("full_name") or user.get("first_name") or "Student",
+                )
+        except Exception:
+            logger.exception("ops email after password reset failed")
 
         return {"message": "Password has been reset successfully."}
 
@@ -1302,6 +1324,17 @@ class AuthController:
                 )
             except Exception:
                 logger.exception("Failed sending linked-student SMS")
+
+        try:
+            from utils.ops_email_hooks import fire_family_profile_added
+
+            await fire_family_profile_added(
+                parent_email=acc.get("email") or user_dict.get("email"),
+                parent_name=acc.get("full_name") or acc.get("name") or "Parent",
+                student_name=full_name or "Student",
+            )
+        except Exception:
+            logger.exception("ops email after linked student create failed")
 
         return {"user_id": user_dict["id"], "enrollment_id": enrollment_id, "user": user_dict}
 
