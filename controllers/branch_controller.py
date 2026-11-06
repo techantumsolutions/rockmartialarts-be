@@ -218,9 +218,10 @@ class BranchController:
                     "limit": limit,
                     "message": "No branches assigned to this manager"
                 }
-        from utils.partner_tenant import apply_tenant_filter
+        from utils.partner_tenant import tenant_or_rock_owned_filter
 
-        filter_query = apply_tenant_filter(filter_query, current_user)
+        # Partner → own tenant only; Rock SA/BM → rock-owned only (no partner branches).
+        filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 

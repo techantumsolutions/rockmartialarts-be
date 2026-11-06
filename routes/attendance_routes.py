@@ -64,6 +64,9 @@ async def get_attendance_reports(
     end_date: Optional[str] = Query(None),
     status: Optional[str] = Query(None, description="present | absent | late"),
     method: Optional[str] = Query(None, description="manual | biometric | ..."),
+    record_type: Optional[str] = Query(
+        None, description="all | student | coach (default all)"
+    ),
     limit: Optional[int] = Query(None, ge=1, le=1000),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.COACH, UserRole.BRANCH_MANAGER]))
 ):
@@ -79,6 +82,7 @@ async def get_attendance_reports(
         limit=limit,
         status=status,
         method=method,
+        record_type=record_type,
     )
 
 @router.get("/students")
@@ -205,6 +209,9 @@ async def export_attendance_reports(
     end_date: Optional[str] = Query(None),
     status: Optional[str] = Query(None, description="present | absent | late"),
     method: Optional[str] = Query(None, description="manual | biometric | ..."),
+    record_type: Optional[str] = Query(
+        None, description="all | student | coach (default all)"
+    ),
     format: str = Query("csv", regex="^(csv|excel)$"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]))
 ):
@@ -220,6 +227,7 @@ async def export_attendance_reports(
         status,
         method,
         current_user,
+        record_type=record_type,
     )
 
 @router.get("/coach/{coach_id}/students")
