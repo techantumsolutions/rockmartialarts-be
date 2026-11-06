@@ -85,6 +85,26 @@ async def check_and_send_stock_alert(product: dict, branch_id: str, new_stock_le
     db = get_db()
     threshold = product.get("stock_alert_threshold", 10)
     if new_stock_level <= threshold:
+        # Additive email alert (does not replace existing SMS/WA template path)
+        try:
+            from utils.ops_email_hooks import fire_stock_low
+
+            branch_name = ""
+            try:
+                bdoc = await db.branches.find_one({"id": branch_id})
+                if bdoc:
+                    branch_name = (bdoc.get("branch") or {}).get("name") or bdoc.get("name") or ""
+            except Exception:
+                pass
+            await fire_stock_low(
+                db,
+                item_name=(product or {}).get("name") or "Item",
+                quantity=new_stock_level,
+                branch_name=branch_name,
+            )
+        except Exception:
+            logging.exception("ops email stock low alert failed")
+
         # Find admins to notify (Super Admins and the Coach Admin of the branch)
         from models.user_models import UserRole
         admin_filter = {

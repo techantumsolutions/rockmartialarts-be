@@ -359,6 +359,16 @@ async def _finalize_paid_org(
     )
     updated = await db[COL].find_one({"id": org["id"]})
     updated["_invite_email_sent"] = email_sent
+    try:
+        from utils.ops_email_hooks import fire_partner_payment_success
+
+        await fire_partner_payment_success(
+            updated,
+            amount=updated.get("registration_fee") or updated.get("amount") or "",
+            txn_id=razorpay_payment_id or "",
+        )
+    except Exception:
+        logger.exception("ops email after partner finalize failed")
     return updated
 
 
@@ -527,6 +537,12 @@ async def verify_partner_online_payment(
     if not verify_razorpay_signature(
         body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
     ):
+        try:
+            from utils.ops_email_hooks import fire_partner_payment_failed
+
+            await fire_partner_payment_failed(org)
+        except Exception:
+            logger.exception("ops email partner payment failed notify error")
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
     updated = await _finalize_paid_org(
@@ -956,6 +972,12 @@ async def set_partner_org_active(
             {"$set": {"is_active": bool(body.is_active), "updated_at": now}},
         )
     updated = await db[COL].find_one({"id": partner_org_id})
+    try:
+        from utils.ops_email_hooks import fire_partner_status_change
+
+        await fire_partner_status_change(updated or org, is_active=bool(body.is_active))
+    except Exception:
+        logger.exception("ops email partner status change failed")
     return {
         "message": "Partner enabled" if body.is_active else "Partner disabled",
         "partner": partner_org_public(updated),

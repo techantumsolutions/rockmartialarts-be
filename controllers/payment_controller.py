@@ -1306,6 +1306,22 @@ class PaymentController:
                 },
             }
         )
+        if delete_result.deleted_count > 0:
+            try:
+                from utils.ops_email_hooks import fire_payment_failed
+
+                await fire_payment_failed(
+                    student_email=current_user.get("email"),
+                    student_name=current_user.get("full_name")
+                    or current_user.get("name")
+                    or "Student",
+                    amount=enrollment.get("fee_amount")
+                    or enrollment.get("amount")
+                    or "",
+                    failure_reason="Payment was not completed or checkout was dismissed",
+                )
+            except Exception:
+                logger.exception("ops email after cancel pending checkout failed")
         return {
             "cancelled": delete_result.deleted_count > 0,
             "enrollment_id": enrollment_id,
@@ -1721,6 +1737,43 @@ class PaymentController:
             out["new_end_date"] = renewal_meta.get("end_date")
             out["prior_end_date"] = renewal_meta.get("prior_end_date")
             out["message"] = "Renewal payment recorded successfully"
+        try:
+            from utils.ops_email_hooks import fire_payment_success
+
+            student_doc = await db.users.find_one({"id": student_id}) or {}
+            await fire_payment_success(
+                db,
+                student_email=student_doc.get("email") or payment_doc.get("student_email"),
+                student_name=(
+                    student_doc.get("full_name")
+                    or payment_doc.get("student_name")
+                    or "Student"
+                ),
+                amount=payment_doc.get("amount"),
+                course_or_plan=payment_doc.get("course_name")
+                or enrollment.get("course_name")
+                or "Course",
+                txn_id=payment_doc.get("transaction_id")
+                or payment_doc.get("razorpay_payment_id")
+                or payment_doc.get("id")
+                or "",
+                payment_date=payment_doc.get("payment_date") or now,
+                invoice_id=(invoice or {}).get("id") or "",
+                invoice_no=(invoice or {}).get("invoice_number") or "",
+                enrollment_course=enrollment.get("course_name")
+                or payment_doc.get("course_name")
+                or "",
+                branch_name=enrollment.get("branch_name")
+                or payment_doc.get("branch_name")
+                or "",
+                branch_id=enrollment.get("branch_id") or payment_doc.get("branch_id"),
+                start_date=enrollment.get("start_date"),
+                partner_org_id=enrollment.get("partner_org_id")
+                or payment_doc.get("partner_org_id")
+                or student_doc.get("partner_org_id"),
+            )
+        except Exception:
+            logger.exception("ops email after razorpay confirm failed")
         return out
 
     @staticmethod
@@ -2702,6 +2755,24 @@ class PaymentController:
                 },
             )
 
+        try:
+            from utils.ops_email_hooks import fire_payment_success
+
+            await fire_payment_success(
+                db,
+                student_email=holder.get("email"),
+                student_name=first_payload.get("full_name") or "Student",
+                amount=total_amount,
+                course_or_plan=(last_info.course_name if last_info else None) or "Course",
+                txn_id=transaction_id or "",
+                payment_date=datetime.utcnow(),
+                enrollment_course=(last_info.course_name if last_info else None) or "",
+                branch_name=(last_info.branch_name if last_info else None) or "",
+                branch_id=first.branch_id,
+            )
+        except Exception:
+            logger.exception("ops email after family registration failed")
+
         return RegistrationPaymentResponse(
             payment_id=last_payment_id,
             student_id=first_student_id,
@@ -3159,6 +3230,30 @@ class PaymentController:
             if phone:
                 message = f"Welcome! Your registration is complete. Payment of ₹{payment_info.pricing.total_amount} received. Transaction ID: {transaction_id}"
                 await send_whatsapp(phone, message)
+
+            try:
+                from utils.ops_email_hooks import fire_payment_success
+
+                await fire_payment_success(
+                    db,
+                    student_email=payment_data.student_data.get("email"),
+                    student_name=payment_data.student_data.get("full_name")
+                    or payment_data.student_data.get("first_name")
+                    or "Student",
+                    amount=payment_info.pricing.total_amount,
+                    course_or_plan=payment_info.course_name or "Course",
+                    txn_id=transaction_id or "",
+                    payment_date=datetime.utcnow(),
+                    invoice_id=inv_id or "",
+                    invoice_no=inv_number or "",
+                    enrollment_course=payment_info.course_name or "",
+                    branch_name=payment_info.branch_name or "",
+                    branch_id=payment_data.branch_id,
+                    partner_org_id=getattr(payment_data, "partner_org_id", None)
+                    or (creator_dict or {}).get("partner_org_id"),
+                )
+            except Exception:
+                logger.exception("ops email after registration payment failed")
 
             return RegistrationPaymentResponse(
                 payment_id=payment.id,

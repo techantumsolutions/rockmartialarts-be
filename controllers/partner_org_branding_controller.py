@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from models.partner_org_branding_models import (
     PartnerOrgBranding,
@@ -439,4 +442,16 @@ class PartnerOrgBrandingController:
             "name": org.get("name"),
             "slug": org.get("slug"),
         }
+        try:
+            from utils.ops_email_hooks import fire_partner_landing_lead
+
+            lead_doc = dict(ser or out)
+            lead_doc["partner_org_id"] = org["id"]
+            await fire_partner_landing_lead(
+                db,
+                lead_doc,
+                partner_branch_name=org.get("name") or "",
+            )
+        except Exception:
+            logger.exception("ops email after partner org landing lead failed")
         return {"message": "Thank you — we received your enquiry.", "lead": out}

@@ -234,6 +234,14 @@ async def _send_one(
     if dry_run:
         return "dry_run"
 
+    # Email reminder (additive; does not replace SMS)
+    try:
+        from utils.ops_email_hooks import fire_event_reminder
+
+        await fire_event_reminder(reg, event=event)
+    except Exception:
+        logger.exception("ops email event reminder failed")
+
     tid = _otp_dlt_template_id()
     ok, err = send_registration_sms(phone, msg, template_id=tid)
     expects = sms_provider_expects_delivery()
