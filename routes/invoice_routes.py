@@ -38,7 +38,13 @@ async def list_invoices(
     ),
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):
@@ -60,7 +66,13 @@ async def get_invoice_by_payment(
     payment_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):
@@ -72,7 +84,13 @@ async def get_invoice_document(
     invoice_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):
@@ -84,7 +102,13 @@ async def get_invoice_whatsapp_deliveries(
     invoice_id: str,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):
@@ -98,7 +122,13 @@ async def resend_invoice_whatsapp(
     body: Optional[InvoiceWhatsAppResendBody] = None,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):
@@ -117,7 +147,13 @@ async def get_invoice(
     include_html: bool = False,
     current_user: dict = Depends(
         require_role_unified(
-            [UserRole.SUPER_ADMIN, UserRole.BRANCH_MANAGER, UserRole.STUDENT, UserRole.COACH]
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.PARTNER_SUPER_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.STUDENT,
+                UserRole.COACH,
+            ]
         )
     ),
 ):

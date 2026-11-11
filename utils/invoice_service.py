@@ -16,7 +16,10 @@ from typing import Any, Dict, List, Optional
 from models.invoice_models import InvoiceLineItem, InvoiceStatus
 from utils.database import get_db
 from utils.helpers import serialize_doc
-from utils.invoice_document import build_invoice_html
+from utils.invoice_document import (
+    build_invoice_html,
+    resolve_invoice_company_branding,
+)
 from utils.invoice_number import ensure_invoice_counter_indexes, next_invoice_number
 
 logger = logging.getLogger(__name__)
@@ -391,6 +394,17 @@ async def generate_invoice_for_payment(
         doc["payment_id"] = payment.get("id")
     if checkout_id:
         doc["cart_checkout_id"] = checkout_id
+
+    # Resolve official branding (Rock Martial Arts or Partner Organization)
+    try:
+        resolved_company = await resolve_invoice_company_branding(db, doc)
+        if resolved_company:
+            doc["company"] = resolved_company
+            if resolved_company.get("partner_org_id"):
+                doc["partner_org_id"] = resolved_company["partner_org_id"]
+    except Exception as exc:
+        logger.warning("Failed resolving invoice branding: %s", exc)
+
     doc["document_html"] = build_invoice_html(doc)
 
     try:
