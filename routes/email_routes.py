@@ -6,10 +6,19 @@ from fastapi import status as http_status
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List, Dict, Any
 from utils.email_service import send_email
+from models.user_models import UserRole
+from utils.unified_auth import require_role_unified
 import httpx
 import logging
 
 router = APIRouter(tags=["Email"])
+
+_EMAIL_ADMIN_ROLES = [
+    UserRole.SUPER_ADMIN,
+    UserRole.PARTNER_SUPER_ADMIN,
+    UserRole.BRANCH_MANAGER,
+    UserRole.COACH_ADMIN,
+]
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -49,17 +58,14 @@ class WebhookEmailResponse(BaseModel):
             status_code=http_status.HTTP_200_OK,
             summary="Send an email",
             response_description="Email sent successfully")
-async def send_email_endpoint(email_data: EmailRequest):
+async def send_email_endpoint(
+    email_data: EmailRequest,
+    current_user: dict = Depends(require_role_unified(_EMAIL_ADMIN_ROLES)),
+):
     """
-    Send an email using the configured SMTP server.
-    
-    - **to_email**: Recipient's email address
-    - **subject**: Email subject
-    - **message**: Plain text email content
-    - **html_message**: Optional HTML formatted content (if not provided, plain text will be used)
-    
-    Returns a success message if the email was sent successfully.
+    Send an email using the configured SMTP/Resend path (staff only).
     """
+    _ = current_user
     try:
         await send_email(
             to_email=email_data.to_email,
@@ -79,25 +85,22 @@ async def send_email_endpoint(email_data: EmailRequest):
             summary="Send email via webhook",
             response_description="Email sent successfully via webhook",
             response_model=List[WebhookEmailResponse])
-async def send_webhook_email(email_data: WebhookEmailRequest):
+async def send_webhook_email(
+    email_data: WebhookEmailRequest,
+    current_user: dict = Depends(require_role_unified(_EMAIL_ADMIN_ROLES)),
+):
     """
-    Send an email using the external webhook service.
-
-    This endpoint forwards the email request to the external webhook service
-    and returns the exact response format from the webhook.
-
-    - **to_email**: Recipient's email address
-    - **subject**: Email subject
-    - **message**: Plain text email content
-    - **html_message**: HTML formatted content
-
-    Returns the webhook response with delivery details including:
-    - accepted/rejected email addresses
-    - SMTP server response details
-    - timing information
-    - message ID for tracking
+    Send an email using the external webhook service (staff only).
     """
-    webhook_url = "https://ai.alviongs.com/webhook/de77d8d6-ae98-471d-ba19-8d7f58ec8449"
+    import os
+    _ = current_user
+
+    webhook_url = (os.getenv("EMAIL_WEBHOOK_URL") or "").strip()
+    if not webhook_url or webhook_url.lower() in {"0", "false", "off", "disabled", "none"}:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Email webhook is not configured. Set EMAIL_WEBHOOK_URL or use Resend.",
+        )
 
     try:
         logger.info(f"📧 Sending email via webhook to {email_data.to_email}")

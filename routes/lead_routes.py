@@ -57,6 +57,28 @@ async def lead_pipeline_summary(
     return await LeadController.pipeline_summary(current_user=current_user)
 
 
+@router.get("/notifications")
+async def get_lead_notifications(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: dict = Depends(require_role_unified(_LEAD_ADMIN_ROLES)),
+):
+    """In-app notifications for new leads (per recipient)."""
+    return await LeadController.get_lead_notifications(
+        current_user=current_user, skip=skip, limit=limit
+    )
+
+
+@router.put("/notifications/{notification_id}/read")
+async def mark_lead_notification_read(
+    notification_id: str,
+    current_user: dict = Depends(require_role_unified(_LEAD_ADMIN_ROLES)),
+):
+    return await LeadController.mark_lead_notification_read(
+        notification_id, current_user=current_user
+    )
+
+
 @router.get("")
 async def list_leads(
     skip: int = Query(0, ge=0),

@@ -9,6 +9,10 @@ from models.student_models import (
     CancelPendingCheckoutBody,
     RenewalQuoteBody,
     PrepareRenewalCheckoutBody,
+    AdminRenewalQuoteBody,
+    AdminRenewalConfirmBody,
+    AdminRenewalRazorpayConfirmBody,
+    AdminRenewalCancelBody,
 )
 from models.payment_models import RegistrationPaymentCreate, AdminPaymentRecoveryBody, CreateRegistrationOrderBody
 from models.user_models import UserRole
@@ -97,6 +101,102 @@ async def student_renewal_history(
 ):
     """M07-S04: renewal history (old expiry, renewal date, arrears, resulting expiry)."""
     return await PaymentController.get_student_renewal_history(current_user, enrollment_id)
+
+
+@router.post("/admin/renewal-quote", status_code=status.HTTP_200_OK)
+async def admin_renewal_quote(
+    body: AdminRenewalQuoteBody,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """Admin renewal quote: fee + validity preview for existing course/branch only."""
+    from utils.admin_renewal_service import admin_quote_renewal
+
+    return await admin_quote_renewal(
+        enrollment_id=body.enrollment_id,
+        duration=body.duration,
+        batch_ref=body.batch_ref,
+        current_user=current_user,
+    )
+
+
+@router.post("/admin/renew-plan", status_code=status.HTTP_200_OK)
+async def admin_renew_plan(
+    body: AdminRenewalConfirmBody,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """Prepare admin renewal + Razorpay order (plan activates after payment verify)."""
+    from utils.admin_renewal_service import admin_confirm_renewal
+
+    return await admin_confirm_renewal(
+        enrollment_id=body.enrollment_id,
+        duration=body.duration,
+        batch_ref=body.batch_ref,
+        payment_method=body.payment_method or "razorpay",
+        notes=body.notes,
+        current_user=current_user,
+    )
+
+
+@router.post("/admin/renew-plan/confirm-razorpay", status_code=status.HTTP_200_OK)
+async def admin_renew_plan_confirm_razorpay(
+    body: AdminRenewalRazorpayConfirmBody,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """Verify Razorpay payment and activate admin-initiated renewal."""
+    from utils.admin_renewal_service import admin_confirm_razorpay_renewal
+
+    return await admin_confirm_razorpay_renewal(
+        enrollment_id=body.enrollment_id,
+        razorpay_payment_id=body.razorpay_payment_id,
+        razorpay_order_id=body.razorpay_order_id,
+        razorpay_signature=body.razorpay_signature,
+        current_user=current_user,
+    )
+
+
+@router.post("/admin/renew-plan/cancel", status_code=status.HTTP_200_OK)
+async def admin_renew_plan_cancel(
+    body: AdminRenewalCancelBody,
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """Cancel unpaid admin renewal checkout after Razorpay dismiss/fail."""
+    from utils.admin_renewal_service import admin_cancel_pending_renewal
+
+    return await admin_cancel_pending_renewal(
+        enrollment_id=body.enrollment_id,
+        current_user=current_user,
+    )
+
+
+@router.get("/admin/renewal-history", status_code=status.HTTP_200_OK)
+async def admin_renewal_history(
+    enrollment_id: str = Query(..., description="Source or current enrollment id"),
+    current_user: dict = Depends(
+        require_role_unified(
+            [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+        )
+    ),
+):
+    """Admin view of renewal history for an enrollment."""
+    from utils.admin_renewal_service import admin_list_renewal_history
+
+    return await admin_list_renewal_history(enrollment_id, current_user)
 
 
 @router.post("/confirm-razorpay", status_code=status.HTTP_200_OK)

@@ -431,6 +431,24 @@ async def approve_coach(
                 expiry_hours=expiry_hours,
             )
             logger.info("Sent approval & setup email to coach %s (%s)", coach_id, coach_email)
+            try:
+                from utils.ops_notify import notify_ops_mobile
+
+                contact = coach.get("contact_info") if isinstance(coach.get("contact_info"), dict) else {}
+                coach_phone = (
+                    coach.get("phone") or contact.get("phone") or contact.get("mobile") or ""
+                ).strip() or None
+                await notify_ops_mobile(
+                    "rock_coach_approved",
+                    coach_phone,
+                    {
+                        "coach_name": coach_name,
+                        "token": reset_token,
+                        "expiry_hours": str(expiry_hours),
+                    },
+                )
+            except Exception:
+                logger.exception("ops mobile after coach approval failed")
         except Exception as e:
             logger.exception("Failed sending coach approval email for %s: %s", coach_id, e)
 

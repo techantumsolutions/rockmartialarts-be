@@ -9,9 +9,10 @@ import logging
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from pymongo import ReturnDocument
 
 from models.training_request_models import (
     ALLOWED_STATUS_TRANSITIONS,
@@ -62,6 +63,7 @@ async def ensure_training_request_indexes(db=None) -> None:
         await database[COL].create_index([("type", 1), ("status", 1), ("created_at", -1)])
         await database[COL].create_index([("branch_id", 1), ("status", 1)])
         await database[COL].create_index("assigned_coach_id")
+        await database[COL].create_index("notified_coach_ids")
         await database[COL].create_index("contact_phone")
         await database[COL].create_index([("created_at", -1)])
         await database[COL_HISTORY].create_index("id", unique=True)
@@ -99,6 +101,103 @@ async def _append_history(
 
 def _normalize_phone(phone: str) -> str:
     return re.sub(r"\s+", "", (phone or "").strip())
+
+
+def _assign_coach_ids(body: TrainingRequestCoachAssign) -> List[str]:
+    raw: List[str] = []
+    if body.coach_ids:
+        raw.extend([str(i).strip() for i in body.coach_ids if str(i).strip()])
+    if body.coach_id and str(body.coach_id).strip():
+        raw.append(str(body.coach_id).strip())
+    seen = set()
+    unique: List[str] = []
+    for cid in raw:
+        if cid not in seen:
+            seen.add(cid)
+            unique.append(cid)
+    if not unique:
+        raise HTTPException(status_code=400, detail="coach_id or coach_ids is required")
+    return unique
+
+
+def _coach_display_name(coach: dict, fallback_id: str = "") -> str:
+    return (
+        coach.get("full_name")
+        or f"{coach.get('first_name', '')} {coach.get('last_name', '')}".strip()
+        or fallback_id
+        or "Coach"
+    )
+
+
+def _coach_eligible(coach: dict) -> bool:
+    if coach.get("is_active") is False:
+        return False
+    approval = str(coach.get("approval_status") or "approved").lower().strip()
+    return approval in {"", "approved"}
+
+
+async def _resolve_coach_record(db, coach_id: str) -> Tuple[dict, str]:
+    coach = await db.coaches.find_one({"id": coach_id})
+    if not coach:
+        user = await db.users.find_one({"id": coach_id, "role": "coach"})
+        if not user:
+            raise HTTPException(status_code=404, detail=f"Coach not found: {coach_id}")
+        coach = user
+    if not _coach_eligible(coach):
+        raise HTTPException(
+            status_code=400,
+            detail="Coach must be active and approved to receive assignments.",
+        )
+    return coach, _coach_display_name(coach, coach_id)
+
+
+def _notified_entry_for(doc: dict, coach_id: str) -> Optional[dict]:
+    for row in doc.get("notified_coaches") or []:
+        if str(row.get("coach_id") or "") == str(coach_id):
+            return row
+    return None
+
+
+def _coach_inbox_status(doc: dict, coach_id: str) -> str:
+    """Per-coach status for coach inbox UI (backward compatible with single assign)."""
+    assigned = str(doc.get("assigned_coach_id") or "").strip()
+    notified_ids = [str(x) for x in (doc.get("notified_coach_ids") or [])]
+    entry = _notified_entry_for(doc, coach_id)
+    if assigned and assigned != str(coach_id):
+        if coach_id in notified_ids or assigned:
+            if entry and entry.get("status") == "rejected":
+                return "rejected"
+            return "notified_taken"
+        return "notified_taken"
+    if assigned == str(coach_id):
+        return str(doc.get("coach_assignment_status") or "pending").lower() or "pending"
+    if entry and entry.get("status"):
+        return str(entry.get("status")).lower()
+    if coach_id in notified_ids:
+        return "pending"
+    if assigned == str(coach_id):
+        return str(doc.get("coach_assignment_status") or "pending").lower() or "pending"
+    return "pending"
+
+
+def _coach_visible_query(coach_id: str) -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"assigned_coach_id": coach_id},
+            {"notified_coach_ids": coach_id},
+        ]
+    }
+
+
+def _serialize_for_coach_inbox(doc: dict, coach_id: str) -> dict:
+    out = serialize_doc(doc) or {}
+    inbox = _coach_inbox_status(doc, coach_id)
+    out["coach_inbox_status"] = inbox
+    if inbox == "notified_taken":
+        out["coach_assignment_status"] = "notified_taken"
+    elif inbox in {"pending", "accepted", "rejected"}:
+        out["coach_assignment_status"] = inbox
+    return out
 
 
 async def _assert_admin_access(db, current_user: dict, doc: Optional[dict] = None) -> None:
@@ -1001,46 +1100,96 @@ async def assign_coach(
             detail=f"Cannot assign coach when status is {doc.get('status')}",
         )
 
-    coach_id = body.coach_id.strip()
-    coach = await db.coaches.find_one({"id": coach_id})
-    coach_name = None
-    if coach:
-        coach_name = (
-            coach.get("full_name")
-            or f"{coach.get('first_name', '')} {coach.get('last_name', '')}".strip()
-        )
-    else:
-        user = await db.users.find_one({"id": coach_id, "role": "coach"})
-        if not user:
-            raise HTTPException(status_code=404, detail="Coach not found")
-        coach_name = (
-            user.get("full_name")
-            or f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-            or coach_id
-        )
-
+    coach_ids = _assign_coach_ids(body)
     now = datetime.utcnow()
     actor = _actor(current_user)
     prev_status = str(doc.get("status") or "")
-    new_status = prev_status
-    # Move to coach_assigned when still early in pipeline
+
+    # —— Single-coach assign (legacy behavior) ——
+    if len(coach_ids) == 1:
+        coach_id = coach_ids[0]
+        _, coach_name = await _resolve_coach_record(db, coach_id)
+        new_status = prev_status
+        if prev_status in {
+            TrainingRequestStatus.SUBMITTED.value,
+            TrainingRequestStatus.UNDER_REVIEW.value,
+            TrainingRequestStatus.COACH_ASSIGNED.value,
+        }:
+            new_status = TrainingRequestStatus.COACH_ASSIGNED.value
+
+        await db[COL].update_one(
+            {"id": request_id},
+            {
+                "$set": {
+                    "assigned_coach_id": coach_id,
+                    "assigned_coach_name": coach_name,
+                    "notified_coach_ids": [coach_id],
+                    "notified_coaches": [
+                        {
+                            "coach_id": coach_id,
+                            "coach_name": coach_name,
+                            "notified_at": now,
+                            "status": "pending",
+                        }
+                    ],
+                    "assigned_at": now,
+                    "assigned_by": actor.get("id"),
+                    "status": new_status,
+                    "coach_assignment_status": "pending",
+                    "coach_rejection_reason": None,
+                    "coach_response_note": None,
+                    "coach_responded_at": None,
+                    "updated_at": now,
+                }
+            },
+        )
+        await _append_history(
+            db,
+            request_id=request_id,
+            from_status=prev_status,
+            to_status=new_status,
+            actor=actor,
+            note=body.note or f"Assigned coach: {coach_name}",
+            action="coach_assigned",
+        )
+        updated = await db[COL].find_one({"id": request_id})
+        return {"message": "Coach assigned", "request": serialize_doc(updated)}
+
+    # —— Multi-coach notify (first accept wins) ——
+    notified: List[Dict[str, Any]] = []
+    for cid in coach_ids:
+        coach, coach_name = await _resolve_coach_record(db, cid)
+        notified.append(
+            {
+                "coach_id": cid,
+                "coach_name": coach_name,
+                "notified_at": now,
+                "status": "pending",
+            }
+        )
+
+    new_status = TrainingRequestStatus.UNDER_REVIEW.value
     if prev_status in {
         TrainingRequestStatus.SUBMITTED.value,
         TrainingRequestStatus.UNDER_REVIEW.value,
-        TrainingRequestStatus.COACH_ASSIGNED.value,
     }:
-        new_status = TrainingRequestStatus.COACH_ASSIGNED.value
+        new_status = TrainingRequestStatus.UNDER_REVIEW.value
+    elif prev_status == TrainingRequestStatus.COACH_ASSIGNED.value:
+        new_status = TrainingRequestStatus.UNDER_REVIEW.value
 
+    name_list = ", ".join(n["coach_name"] for n in notified)
     await db[COL].update_one(
         {"id": request_id},
         {
             "$set": {
-                "assigned_coach_id": coach_id,
-                "assigned_coach_name": coach_name,
+                "assigned_coach_id": None,
+                "assigned_coach_name": None,
+                "notified_coach_ids": coach_ids,
+                "notified_coaches": notified,
                 "assigned_at": now,
                 "assigned_by": actor.get("id"),
                 "status": new_status,
-                "coach_assignment_status": "pending",
+                "coach_assignment_status": "pending_multi",
                 "coach_rejection_reason": None,
                 "coach_response_note": None,
                 "coach_responded_at": None,
@@ -1054,11 +1203,14 @@ async def assign_coach(
         from_status=prev_status,
         to_status=new_status,
         actor=actor,
-        note=body.note or f"Assigned coach: {coach_name}",
-        action="coach_assigned",
+        note=body.note or f"Notified coaches: {name_list}",
+        action="coaches_notified",
     )
     updated = await db[COL].find_one({"id": request_id})
-    return {"message": "Coach assigned", "request": serialize_doc(updated)}
+    return {
+        "message": "Coaches notified; awaiting first acceptance",
+        "request": serialize_doc(updated),
+    }
 
 
 async def list_status_history(
@@ -1094,78 +1246,85 @@ async def list_coach_training_requests(
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
 
-    coach_id = current_user.get("id")
+    coach_id = str(current_user.get("id") or "")
     if not coach_id:
         raise HTTPException(status_code=401, detail="Coach authentication required")
 
-    base_query: Dict[str, Any] = {"assigned_coach_id": coach_id}
+    base_query: Dict[str, Any] = _coach_visible_query(coach_id)
 
-    # Tab counts (all, pending, accepted, rejected)
-    all_cnt = await db[COL].count_documents(base_query)
-    pending_cnt = await db[COL].count_documents({
-        **base_query,
-        "coach_assignment_status": {"$in": ["pending", None, ""]}
-    })
-    accepted_cnt = await db[COL].count_documents({
-        **base_query,
-        "coach_assignment_status": "accepted"
-    })
-    rejected_cnt = await db[COL].count_documents({
-        **base_query,
-        "coach_assignment_status": "rejected"
-    })
+    visible_rows = (
+        await db[COL]
+        .find(base_query)
+        .sort([("assigned_at", -1), ("created_at", -1)])
+        .to_list(length=500)
+    )
+    counts = {"all": 0, "pending": 0, "accepted": 0, "rejected": 0}
+    for row in visible_rows:
+        counts["all"] += 1
+        st = _coach_inbox_status(row, coach_id)
+        if st == "pending":
+            counts["pending"] += 1
+        elif st == "accepted":
+            counts["accepted"] += 1
+        elif st == "rejected":
+            counts["rejected"] += 1
 
-    counts = {
-        "all": all_cnt,
-        "pending": pending_cnt,
-        "accepted": accepted_cnt,
-        "rejected": rejected_cnt,
-    }
+    query_clauses: List[Dict[str, Any]] = [base_query]
 
-    query = dict(base_query)
-
-    # Apply status filter
-    if status_filter:
-        sf = status_filter.lower().strip()
-        if sf == "pending":
-            query["coach_assignment_status"] = {"$in": ["pending", None, ""]}
-        elif sf in {"accepted", "rejected"}:
-            query["coach_assignment_status"] = sf
-
-    # Apply type filter
     if type_filter and type_filter != "all":
-        query["type"] = type_filter.lower().strip()
+        query_clauses.append({"type": type_filter.lower().strip()})
 
-    # Search filter
     if search and search.strip():
         s = search.strip()
         pattern = re.compile(re.escape(s), re.IGNORECASE)
-        query["$or"] = [
-            {"contact_name": pattern},
-            {"contact_phone": pattern},
-            {"contact_email": pattern},
-            {"id": pattern},
-            {"notes": pattern},
-            {"details.city": pattern},
-            {"details.address_line1": pattern},
-            {"details.school_name": pattern},
-            {"details.college_name": pattern},
-            {"details.organization_name": pattern},
-            {"details.training_type": pattern},
-            {"details.training_goals": pattern},
-        ]
+        query_clauses.append(
+            {
+                "$or": [
+                    {"contact_name": pattern},
+                    {"contact_phone": pattern},
+                    {"contact_email": pattern},
+                    {"id": pattern},
+                    {"notes": pattern},
+                    {"details.city": pattern},
+                    {"details.address_line1": pattern},
+                    {"details.school_name": pattern},
+                    {"details.college_name": pattern},
+                    {"details.organization_name": pattern},
+                    {"details.training_type": pattern},
+                    {"details.training_goals": pattern},
+                ]
+            }
+        )
 
-    total = await db[COL].count_documents(query)
-    cursor = (
-        db[COL]
-        .find(query)
-        .sort([("assigned_at", -1), ("created_at", -1)])
-        .skip(skip)
-        .limit(limit)
+    mongo_query: Dict[str, Any] = (
+        {"$and": query_clauses} if len(query_clauses) > 1 else query_clauses[0]
     )
-    rows = await cursor.to_list(length=limit)
+    candidate_rows = (
+        await db[COL]
+        .find(mongo_query)
+        .sort([("assigned_at", -1), ("created_at", -1)])
+        .to_list(length=500)
+    )
+
+    sf = (status_filter or "").lower().strip()
+    if sf and sf != "all":
+        filtered: List[dict] = []
+        for row in candidate_rows:
+            st = _coach_inbox_status(row, coach_id)
+            if sf == "pending" and st == "pending":
+                filtered.append(row)
+            elif sf == "accepted" and st == "accepted":
+                filtered.append(row)
+            elif sf == "rejected" and st == "rejected":
+                filtered.append(row)
+        candidate_rows = filtered
+
+    total = len(candidate_rows)
+    skip = max(0, skip)
+    limit = max(1, min(limit, 200))
+    page_rows = candidate_rows[skip : skip + limit]
     return {
-        "requests": serialize_doc(rows),
+        "requests": [_serialize_for_coach_inbox(r, coach_id) for r in page_rows],
         "total": total,
         "counts": counts,
     }
@@ -1186,8 +1345,20 @@ async def coach_respond_to_request(
     if not doc:
         raise HTTPException(status_code=404, detail="Training request not found")
 
-    coach_id = current_user.get("id")
-    if str(doc.get("assigned_coach_id") or "") != str(coach_id):
+    coach_id = str(current_user.get("id") or "")
+    if not coach_id:
+        raise HTTPException(status_code=401, detail="Coach authentication required")
+
+    assigned = str(doc.get("assigned_coach_id") or "").strip()
+    notified_ids = [str(x) for x in (doc.get("notified_coach_ids") or [])]
+    is_multi = (
+        str(doc.get("coach_assignment_status") or "").lower() == "pending_multi"
+        or (len(notified_ids) > 1 and not assigned)
+    )
+    is_legacy_single = assigned == coach_id
+    is_notified = coach_id in notified_ids
+
+    if not is_legacy_single and not is_notified:
         raise HTTPException(status_code=403, detail="You are not assigned to this training request")
 
     if body.action == "reject" and not (body.reason or "").strip():
@@ -1196,28 +1367,162 @@ async def coach_respond_to_request(
     now = datetime.utcnow()
     actor = _actor(current_user)
     prev_status = str(doc.get("status") or "")
+    coach_name = actor.get("name") or "Coach"
 
     if body.action == "accept":
+        if is_multi or (is_notified and not assigned):
+            taken = assigned and assigned != coach_id
+            if taken:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This training request has already been accepted by another coach.",
+                )
+            _, resolved_name = await _resolve_coach_record(db, coach_id)
+            coach_name = resolved_name
+            filter_doc: Dict[str, Any] = {
+                "id": request_id,
+                "notified_coach_ids": coach_id,
+                "$or": [
+                    {"assigned_coach_id": None},
+                    {"assigned_coach_id": ""},
+                    {"assigned_coach_id": {"$exists": False}},
+                ],
+                "coach_assignment_status": {
+                    "$in": ["pending_multi", "pending", None, ""],
+                },
+            }
+            notified_rows = list(doc.get("notified_coaches") or [])
+            updated_notified: List[Dict[str, Any]] = []
+            for row in notified_rows:
+                rid = str(row.get("coach_id") or "")
+                item = dict(row)
+                if rid == coach_id:
+                    item["status"] = "accepted"
+                elif rid in notified_ids:
+                    item["status"] = "notified_taken"
+                updated_notified.append(item)
+
+            new_status = TrainingRequestStatus.COACH_ASSIGNED.value
+            update_set = {
+                "assigned_coach_id": coach_id,
+                "assigned_coach_name": coach_name,
+                "coach_assignment_status": "accepted",
+                "coach_responded_at": now,
+                "coach_response_note": body.note,
+                "coach_rejection_reason": None,
+                "notified_coaches": updated_notified,
+                "status": new_status,
+                "updated_at": now,
+            }
+            result = await db[COL].find_one_and_update(
+                filter_doc,
+                {"$set": update_set},
+                return_document=ReturnDocument.AFTER,
+            )
+            if not result:
+                fresh = await db[COL].find_one({"id": request_id}) or {}
+                if str(fresh.get("assigned_coach_id") or "") not in {"", coach_id}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This training request has already been accepted by another coach.",
+                    )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unable to accept this request. It may no longer be available.",
+                )
+            note_text = body.note or f"Coach {coach_name} accepted the training request"
+            await _append_history(
+                db,
+                request_id=request_id,
+                from_status=prev_status,
+                to_status=new_status,
+                actor=actor,
+                note=note_text,
+                action="coach_accepted",
+            )
+            updated = await db[COL].find_one({"id": request_id})
+            return {
+                "message": "Training request accepted successfully",
+                "request": serialize_doc(updated),
+            }
+
+        # Legacy single-coach accept
+        if str(doc.get("coach_assignment_status") or "").lower() == "accepted":
+            raise HTTPException(status_code=400, detail="You have already accepted this request")
         update_data = {
             "coach_assignment_status": "accepted",
             "coach_responded_at": now,
             "coach_response_note": body.note,
             "updated_at": now,
         }
-        action_name = "coach_accepted"
-        note_text = body.note or f"Coach {actor.get('name')} accepted the training request"
-    else:
-        reason_text = body.reason.strip()
-        update_data = {
-            "coach_assignment_status": "rejected",
-            "coach_rejection_reason": reason_text,
-            "coach_response_note": body.note,
-            "coach_responded_at": now,
-            "updated_at": now,
+        await db[COL].update_one({"id": request_id}, {"$set": update_data})
+        note_text = body.note or f"Coach {coach_name} accepted the training request"
+        await _append_history(
+            db,
+            request_id=request_id,
+            from_status=prev_status,
+            to_status=prev_status,
+            actor=actor,
+            note=note_text,
+            action="coach_accepted",
+        )
+        updated = await db[COL].find_one({"id": request_id})
+        return {
+            "message": "Training request accepted successfully",
+            "request": serialize_doc(updated),
         }
-        action_name = "coach_rejected"
-        note_text = f"Coach {actor.get('name')} rejected: {reason_text}" + (f" (Note: {body.note})" if body.note else "")
 
+    # Reject
+    reason_text = (body.reason or "").strip()
+    if is_multi or (is_notified and not assigned):
+        notified_rows = list(doc.get("notified_coaches") or [])
+        updated_notified: List[Dict[str, Any]] = []
+        found = False
+        for row in notified_rows:
+            item = dict(row)
+            if str(item.get("coach_id") or "") == coach_id:
+                item["status"] = "rejected"
+                found = True
+            updated_notified.append(item)
+        if not found:
+            updated_notified.append(
+                {
+                    "coach_id": coach_id,
+                    "coach_name": coach_name,
+                    "notified_at": now,
+                    "status": "rejected",
+                }
+            )
+        await db[COL].update_one(
+            {"id": request_id},
+            {"$set": {"notified_coaches": updated_notified, "updated_at": now}},
+        )
+        note_text = f"Coach {coach_name} declined: {reason_text}"
+        await _append_history(
+            db,
+            request_id=request_id,
+            from_status=prev_status,
+            to_status=prev_status,
+            actor=actor,
+            note=note_text,
+            action="coach_rejected",
+        )
+        updated = await db[COL].find_one({"id": request_id})
+        return {
+            "message": "Training request rejected successfully",
+            "request": _serialize_for_coach_inbox(updated or {}, coach_id),
+        }
+
+    update_data = {
+        "coach_assignment_status": "rejected",
+        "coach_rejection_reason": reason_text,
+        "coach_response_note": body.note,
+        "coach_responded_at": now,
+        "updated_at": now,
+    }
+    note_text = f"Coach {coach_name} rejected: {reason_text}" + (
+        f" (Note: {body.note})" if body.note else ""
+    )
     await db[COL].update_one({"id": request_id}, {"$set": update_data})
     await _append_history(
         db,
@@ -1226,10 +1531,10 @@ async def coach_respond_to_request(
         to_status=prev_status,
         actor=actor,
         note=note_text,
-        action=action_name,
+        action="coach_rejected",
     )
     updated = await db[COL].find_one({"id": request_id})
     return {
-        "message": f"Training request {body.action}ed successfully",
+        "message": "Training request rejected successfully",
         "request": serialize_doc(updated),
     }

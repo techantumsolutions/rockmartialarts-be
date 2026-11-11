@@ -70,6 +70,48 @@ class PrepareRenewalCheckoutBody(BaseModel):
     beneficiary: Optional[BeneficiaryInput] = None
 
 
+class AdminRenewalQuoteBody(BaseModel):
+    """Super Admin / Branch Admin renewal quote for a student enrollment."""
+
+    enrollment_id: str
+    duration: Optional[str] = Field(
+        None,
+        description="Tenure id/code; defaults to enrollment.duration_id when omitted.",
+    )
+    batch_ref: Optional[str] = None
+
+
+class AdminRenewalConfirmBody(BaseModel):
+    """Start admin renewal checkout (creates pending enrollment + Razorpay order)."""
+
+    enrollment_id: str
+    duration: Optional[str] = Field(
+        None,
+        description="Renewal tenure; defaults to current plan tenure.",
+    )
+    batch_ref: Optional[str] = None
+    payment_method: str = Field(
+        default="razorpay",
+        description="Online gateway (razorpay). Plan activates only after verified payment.",
+    )
+    notes: Optional[str] = None
+
+
+class AdminRenewalRazorpayConfirmBody(BaseModel):
+    """Verify Razorpay payment for an admin-initiated renewal checkout."""
+
+    enrollment_id: str
+    razorpay_payment_id: str
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
+
+
+class AdminRenewalCancelBody(BaseModel):
+    """Cancel unpaid admin renewal checkout after Razorpay dismiss/fail."""
+
+    enrollment_id: str
+
+
 class CreateStudentRazorpayOrderBody(BaseModel):
     """Create a Razorpay order for an existing pending enrollment (amount is taken from enrollment server-side)."""
     enrollment_id: str

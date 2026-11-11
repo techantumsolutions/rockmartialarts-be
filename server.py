@@ -123,9 +123,9 @@ from controllers.student_performance_controller import ensure_student_performanc
 # Reconciliation loop (optional)
 from utils.razorpay_reconciliation import ensure_collections_indexes, reconcile_payments_batch
 
-# Load environment variables
+# Load environment variables (.env wins over empty/stale PM2/shell exports)
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / '.env', override=True)
 
 
 def _configure_dns_resolver() -> None:
@@ -289,6 +289,17 @@ async def lifespan(app: FastAPI):
         logging.exception("Failed to create student list indexes")
 
     try:
+        await app.mongodb.payment_notifications.create_index("id", unique=True)
+        await app.mongodb.payment_notifications.create_index("student_id")
+        await app.mongodb.payment_notifications.create_index("created_at")
+        await app.mongodb.payment_notifications.create_index("is_read")
+        await app.mongodb.payment_notifications.create_index(
+            [("is_read", 1), ("created_at", -1)]
+        )
+    except Exception:
+        logging.exception("Failed to create payment_notifications indexes")
+
+    try:
         await ensure_student_performance_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure student performance dashboard indexes")
@@ -398,6 +409,18 @@ async def lifespan(app: FastAPI):
         await ensure_lead_indexes(app.mongodb)
     except Exception:
         logging.exception("Failed to ensure lead indexes")
+
+    try:
+        from utils.lead_notification_service import ensure_lead_notification_indexes
+        await ensure_lead_notification_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure lead notification indexes")
+
+    try:
+        from utils.partner_org_service import ensure_partner_org_indexes
+        await ensure_partner_org_indexes(app.mongodb)
+    except Exception:
+        logging.exception("Failed to ensure partner organization indexes")
 
     try:
         from utils.callback_service import ensure_callback_indexes

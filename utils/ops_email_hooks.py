@@ -1,23 +1,26 @@
 """
-High-level fire-and-forget ops email hooks.
-Every public function catches all exceptions — never raises into live flows.
-Does not touch SMS / WhatsApp.
+High-level fire-and-forget ops notification hooks (email + WhatsApp + SMS).
+
+Uses W1–W45 catalog bodies. Channels per event:
+  - Customer acks / confirmations: email + WhatsApp when contact available
+  - Payment / renewal / password-critical: also SMS (ops_notify.SMS_PRIORITY_CODES)
+  - Staff alerts: email (SA/env list); WhatsApp only when staff phone passed
+
+Never raises into live flows.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from utils.ops_email_notify import (
     DEFAULT_ACADEMY,
-    notify_ops_email,
-    notify_staff_ops_email,
     resolve_branch_manager_email,
     resolve_partner_admin_email,
-    resolve_superadmin_emails,
 )
+from utils.ops_notify import notify_ops, notify_staff_ops
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,16 @@ def _date(v: Any) -> str:
     return str(v)
 
 
+def _phone(*candidates: Any) -> Optional[str]:
+    for c in candidates:
+        if c is None:
+            continue
+        s = str(c).strip()
+        if s:
+            return s
+    return None
+
+
 async def fire_lead_created(db, lead: dict, *, was_merged: bool = False) -> None:
     """W32 ack + W33 staff (+ W22 BM if branch known). Skip ack on merge to avoid spam."""
     try:
@@ -51,14 +64,25 @@ async def fire_lead_created(db, lead: dict, *, was_merged: bool = False) -> None
             "lead_source": lead.get("source") or lead.get("source_type") or "website",
             "branch_name": lead.get("branch_name") or "",
         }
-        if not was_merged and lead.get("email"):
-            await notify_ops_email("rock_lead_received_ack", lead.get("email"), ctx)
-        extras = []
+        phone = _phone(lead.get("phone"))
+        if not was_merged and (lead.get("email") or phone):
+            await notify_ops(
+                "rock_lead_received_ack",
+                email=lead.get("email"),
+                phone=phone,
+                context=ctx,
+            )
+        extras: List[str] = []
         bm = await resolve_branch_manager_email(db, lead.get("branch_id"))
         if bm:
             extras.append(bm)
-            await notify_ops_email("rock_bm_lead_alert", bm, {**ctx, "bm_name": "Branch Manager"})
-        await notify_staff_ops_email("rock_lead_staff_alert", ctx, db=db, extra_emails=extras)
+            await notify_ops(
+                "rock_bm_lead_alert",
+                email=bm,
+                context={**ctx, "bm_name": "Branch Manager"},
+                channels=["email"],
+            )
+        await notify_staff_ops("rock_lead_staff_alert", ctx, db=db, extra_emails=extras)
     except Exception:
         logger.exception("fire_lead_created failed")
 
@@ -70,9 +94,15 @@ async def fire_callback_created(db, doc: dict) -> None:
             "lead_name": (doc or {}).get("name") or "there",
             "lead_phone": (doc or {}).get("phone") or "",
         }
-        if doc.get("email"):
-            await notify_ops_email("rock_callback_request_ack", doc.get("email"), ctx)
-        await notify_staff_ops_email("rock_callback_staff_alert", ctx, db=db)
+        phone = _phone((doc or {}).get("phone"))
+        if doc.get("email") or phone:
+            await notify_ops(
+                "rock_callback_request_ack",
+                email=doc.get("email"),
+                phone=phone,
+                context=ctx,
+            )
+        await notify_staff_ops("rock_callback_staff_alert", ctx, db=db)
     except Exception:
         logger.exception("fire_callback_created failed")
 
@@ -82,7 +112,12 @@ async def fire_demo_booking(db, booking: dict, *, confirmed: bool) -> None:
     try:
         if not confirmed or not booking:
             return
-        preferred = booking.get("preferred_date") or booking.get("slot_date") or booking.get("demo_date") or ""
+        preferred = (
+            booking.get("preferred_date")
+            or booking.get("slot_date")
+            or booking.get("demo_date")
+            or ""
+        )
         ctx = {
             "academy_name": DEFAULT_ACADEMY,
             "lead_name": booking.get("participant_name") or "there",
@@ -90,9 +125,15 @@ async def fire_demo_booking(db, booking: dict, *, confirmed: bool) -> None:
             "branch_name": booking.get("branch_name") or "",
             "preferred_date": _date(preferred),
         }
-        if booking.get("participant_email"):
-            await notify_ops_email("rock_demo_request_ack", booking.get("participant_email"), ctx)
-        await notify_staff_ops_email("rock_demo_staff_alert", ctx, db=db)
+        phone = _phone(booking.get("participant_phone"), booking.get("phone"))
+        if booking.get("participant_email") or phone:
+            await notify_ops(
+                "rock_demo_request_ack",
+                email=booking.get("participant_email"),
+                phone=phone,
+                context=ctx,
+            )
+        await notify_staff_ops("rock_demo_staff_alert", ctx, db=db)
     except Exception:
         logger.exception("fire_demo_booking failed")
 
@@ -111,9 +152,15 @@ async def fire_training_request(db, doc: dict) -> None:
             "request_details": detail_txt or (doc.get("type") or "training"),
         }
         email = doc.get("contact_email") or doc.get("email")
-        if email:
-            await notify_ops_email("rock_training_request_ack", email, ctx)
-        await notify_staff_ops_email("rock_training_request_staff", ctx, db=db)
+        phone = _phone(doc.get("contact_phone"), doc.get("phone"))
+        if email or phone:
+            await notify_ops(
+                "rock_training_request_ack",
+                email=email,
+                phone=phone,
+                context=ctx,
+            )
+        await notify_staff_ops("rock_training_request_staff", ctx, db=db)
     except Exception:
         logger.exception("fire_training_request failed")
 
@@ -129,9 +176,15 @@ async def fire_camp_registration(db, reg: dict, camp: Optional[dict] = None) -> 
             "camp_dates": _date(camp.get("start_date") or reg.get("camp_dates")),
         }
         email = reg.get("participant_email") or reg.get("email")
-        if email:
-            await notify_ops_email("rock_camp_confirm", email, ctx)
-        await notify_staff_ops_email("rock_camp_staff_alert", ctx, db=db)
+        phone = _phone(reg.get("participant_phone"), reg.get("phone"))
+        if email or phone:
+            await notify_ops(
+                "rock_camp_confirm",
+                email=email,
+                phone=phone,
+                context=ctx,
+            )
+        await notify_staff_ops("rock_camp_staff_alert", ctx, db=db)
     except Exception:
         logger.exception("fire_camp_registration failed")
 
@@ -143,12 +196,24 @@ async def fire_event_registration(db, reg: dict, event: Optional[dict] = None) -
             "academy_name": DEFAULT_ACADEMY,
             "registrant_name": reg.get("participant_name") or reg.get("name") or "there",
             "event_name": event.get("title") or event.get("name") or reg.get("event_name") or "Event",
-            "event_date": _date(event.get("event_date") or event.get("start_date") or reg.get("event_date")),
+            "event_date": _date(
+                event.get("event_date") or event.get("start_date") or reg.get("event_date")
+            ),
             "event_venue": event.get("venue") or event.get("location") or reg.get("event_venue") or "",
         }
         email = reg.get("participant_email") or reg.get("email")
-        if email:
-            await notify_ops_email("rock_event_confirm", email, ctx)
+        phone = _phone(
+            reg.get("participant_phone"),
+            reg.get("phone"),
+            reg.get("mobile"),
+        )
+        if email or phone:
+            await notify_ops(
+                "rock_event_confirm",
+                email=email,
+                phone=phone,
+                context=ctx,
+            )
     except Exception:
         logger.exception("fire_event_registration failed")
 
@@ -160,12 +225,27 @@ async def fire_event_reminder(reg: dict, event: Optional[dict] = None) -> None:
             "academy_name": DEFAULT_ACADEMY,
             "registrant_name": reg.get("participant_name") or reg.get("name") or "there",
             "event_name": event.get("title") or event.get("name") or reg.get("event_name") or "Event",
-            "event_date": _date(event.get("event_date") or event.get("start_date") or reg.get("event_date")),
+            "event_date": _date(
+                event.get("start_at")
+                or event.get("event_date")
+                or event.get("start_date")
+                or reg.get("event_date")
+            ),
             "event_venue": event.get("venue") or event.get("location") or reg.get("event_venue") or "",
         }
         email = reg.get("participant_email") or reg.get("email")
-        if email:
-            await notify_ops_email("rock_event_reminder", email, ctx)
+        phone = _phone(
+            reg.get("participant_phone"),
+            reg.get("phone"),
+            reg.get("mobile"),
+        )
+        if email or phone:
+            await notify_ops(
+                "rock_event_reminder",
+                email=email,
+                phone=phone,
+                context=ctx,
+            )
     except Exception:
         logger.exception("fire_event_reminder failed")
 
@@ -178,15 +258,20 @@ async def fire_partner_landing_lead(db, lead: dict, *, partner_branch_name: str 
             "lead_phone": lead.get("phone") or "",
             "partner_branch_name": partner_branch_name or lead.get("branch_name") or "Partner Branch",
         }
-        if lead.get("email"):
-            await notify_ops_email("rock_collab_partner_lead_ack", lead.get("email"), ctx)
-        extras = []
-        # Prefer partner org email if present
+        phone = _phone(lead.get("phone"))
+        if lead.get("email") or phone:
+            await notify_ops(
+                "rock_collab_partner_lead_ack",
+                email=lead.get("email"),
+                phone=phone,
+                context=ctx,
+            )
+        extras: List[str] = []
         if lead.get("partner_org_id"):
             pe = await resolve_partner_admin_email(db, lead.get("partner_org_id"))
             if pe:
                 extras.append(pe)
-        await notify_staff_ops_email(
+        await notify_staff_ops(
             "rock_collab_partner_lead_staff", ctx, db=db, extra_emails=extras
         )
     except Exception:
@@ -210,6 +295,7 @@ async def fire_payment_success(
     start_date: Any = None,
     partner_org_id: Optional[str] = None,
     partner_admin_name: str = "",
+    student_phone: Optional[str] = None,
 ) -> None:
     """W6 + W8 (if invoice) + W10 + W21/W23 + W30/W31 when partner."""
     try:
@@ -226,20 +312,37 @@ async def fire_payment_success(
             "branch_name": branch_name or "",
             "start_date": _date(start_date),
         }
-        if student_email:
-            await notify_ops_email("rock_payment_success", student_email, ctx_pay)
+        phone = _phone(student_phone)
+        if student_email or phone:
+            await notify_ops(
+                "rock_payment_success",
+                email=student_email,
+                phone=phone,
+                context=ctx_pay,
+            )
             if invoice_id or invoice_no:
-                await notify_ops_email("rock_invoice_issued", student_email, ctx_pay)
-            await notify_ops_email("rock_enrollment_confirm", student_email, ctx_pay)
+                await notify_ops(
+                    "rock_invoice_issued",
+                    email=student_email,
+                    phone=phone,
+                    context=ctx_pay,
+                )
+            await notify_ops(
+                "rock_enrollment_confirm",
+                email=student_email,
+                phone=phone,
+                context=ctx_pay,
+            )
 
         bm = await resolve_branch_manager_email(db, branch_id)
         if bm:
-            await notify_ops_email(
+            await notify_ops(
                 "rock_bm_new_registration",
-                bm,
-                {**ctx_pay, "bm_name": "Branch Manager"},
+                email=bm,
+                context={**ctx_pay, "bm_name": "Branch Manager"},
+                channels=["email"],
             )
-        await notify_staff_ops_email("rock_sa_new_registration", ctx_pay, db=db)
+        await notify_staff_ops("rock_sa_new_registration", ctx_pay, db=db)
 
         if partner_org_id:
             pe = await resolve_partner_admin_email(db, partner_org_id)
@@ -248,8 +351,18 @@ async def fire_payment_success(
                     **ctx_pay,
                     "partner_admin_name": partner_admin_name or "Partner Admin",
                 }
-                await notify_ops_email("rock_partner_new_student", pe, pctx)
-                await notify_ops_email("rock_partner_payment_received", pe, pctx)
+                await notify_ops(
+                    "rock_partner_new_student",
+                    email=pe,
+                    context=pctx,
+                    channels=["email"],
+                )
+                await notify_ops(
+                    "rock_partner_payment_received",
+                    email=pe,
+                    context=pctx,
+                    channels=["email"],
+                )
     except Exception:
         logger.exception("fire_payment_success failed")
 
@@ -260,14 +373,17 @@ async def fire_payment_failed(
     student_name: str = "Student",
     amount: Any = "",
     failure_reason: str = "Payment was not completed",
+    student_phone: Optional[str] = None,
 ) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_payment_failed",
-            student_email,
-            {
+            email=student_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "student_name": student_name or "Student",
                 "amount": _money(amount) if amount != "" else "",
@@ -283,14 +399,17 @@ async def fire_family_profile_added(
     parent_email: Optional[str],
     parent_name: str,
     student_name: str,
+    parent_phone: Optional[str] = None,
 ) -> None:
     try:
-        if not parent_email:
+        phone = _phone(parent_phone)
+        if not parent_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_family_profile_added",
-            parent_email,
-            {
+            email=parent_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "parent_name": parent_name or "Parent",
                 "student_name": student_name or "Student",
@@ -300,27 +419,41 @@ async def fire_family_profile_added(
         logger.exception("fire_family_profile_added failed")
 
 
-async def fire_student_self_welcome(*, student_email: Optional[str], student_name: str) -> None:
+async def fire_student_self_welcome(
+    *,
+    student_email: Optional[str],
+    student_name: str,
+    student_phone: Optional[str] = None,
+) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_student_welcome_self",
-            student_email,
-            {"academy_name": DEFAULT_ACADEMY, "student_name": student_name or "Student"},
+            email=student_email,
+            phone=phone,
+            context={"academy_name": DEFAULT_ACADEMY, "student_name": student_name or "Student"},
         )
     except Exception:
         logger.exception("fire_student_self_welcome failed")
 
 
-async def fire_student_account_ready(*, student_email: Optional[str], student_name: str) -> None:
+async def fire_student_account_ready(
+    *,
+    student_email: Optional[str],
+    student_name: str,
+    student_phone: Optional[str] = None,
+) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_student_account_ready",
-            student_email,
-            {"academy_name": DEFAULT_ACADEMY, "student_name": student_name or "Student"},
+            email=student_email,
+            phone=phone,
+            context={"academy_name": DEFAULT_ACADEMY, "student_name": student_name or "Student"},
         )
     except Exception:
         logger.exception("fire_student_account_ready failed")
@@ -333,14 +466,17 @@ async def fire_coach_lead_assigned(
     lead_name: str,
     lead_phone: str = "",
     lead_source: str = "",
+    coach_phone: Optional[str] = None,
 ) -> None:
     try:
-        if not coach_email:
+        phone = _phone(coach_phone)
+        if not coach_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_coach_lead_assigned",
-            coach_email,
-            {
+            email=coach_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "coach_name": coach_name or "Coach",
                 "lead_name": lead_name or "Lead",
@@ -357,15 +493,22 @@ async def fire_schedule_update_students(
     student_emails: list,
     course_name: str,
     new_schedule: str,
+    student_phones: Optional[Sequence[Optional[str]]] = None,
 ) -> None:
     try:
-        for email in student_emails or []:
-            if not email:
+        phones = list(student_phones or [])
+        emails = list(student_emails or [])
+        n = max(len(emails), len(phones))
+        for i in range(n):
+            email = emails[i] if i < len(emails) else None
+            phone = phones[i] if i < len(phones) else None
+            if not email and not phone:
                 continue
-            await notify_ops_email(
+            await notify_ops(
                 "rock_course_schedule_update",
-                email,
-                {
+                email=email,
+                phone=_phone(phone),
+                context={
                     "academy_name": DEFAULT_ACADEMY,
                     "student_name": "Student",
                     "course_name": course_name or "Course",
@@ -381,15 +524,22 @@ async def fire_coach_batch_update(
     coach_emails: list,
     course_name: str,
     change_summary: str,
+    coach_phones: Optional[Sequence[Optional[str]]] = None,
 ) -> None:
     try:
-        for email in coach_emails or []:
-            if not email:
+        phones = list(coach_phones or [])
+        emails = list(coach_emails or [])
+        n = max(len(emails), len(phones))
+        for i in range(n):
+            email = emails[i] if i < len(emails) else None
+            phone = phones[i] if i < len(phones) else None
+            if not email and not phone:
                 continue
-            await notify_ops_email(
+            await notify_ops(
                 "rock_coach_batch_update",
-                email,
-                {
+                email=email,
+                phone=_phone(phone),
+                context={
                     "academy_name": DEFAULT_ACADEMY,
                     "coach_name": "Coach",
                     "course_name": course_name or "Course",
@@ -403,7 +553,8 @@ async def fire_coach_batch_update(
 async def fire_partner_payment_success(org: dict, *, amount: Any = "", txn_id: str = "") -> None:
     try:
         email = (org or {}).get("email")
-        if not email:
+        phone = _phone((org or {}).get("phone"), (org or {}).get("contact_phone"))
+        if not email and not phone:
             return
         ctx = {
             "partner_name": org.get("name") or "Partner",
@@ -412,8 +563,8 @@ async def fire_partner_payment_success(org: dict, *, amount: Any = "", txn_id: s
             "txn_id": txn_id or org.get("razorpay_payment_id") or "",
             "academy_name": DEFAULT_ACADEMY,
         }
-        await notify_ops_email("rock_partner_payment_success", email, ctx)
-        await notify_ops_email("rock_partner_activated", email, ctx)
+        await notify_ops("rock_partner_payment_success", email=email, phone=phone, context=ctx)
+        await notify_ops("rock_partner_activated", email=email, phone=phone, context=ctx)
     except Exception:
         logger.exception("fire_partner_payment_success failed")
 
@@ -421,12 +572,14 @@ async def fire_partner_payment_success(org: dict, *, amount: Any = "", txn_id: s
 async def fire_partner_payment_failed(org: dict) -> None:
     try:
         email = (org or {}).get("email")
-        if not email:
+        phone = _phone((org or {}).get("phone"), (org or {}).get("contact_phone"))
+        if not email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_partner_payment_failed",
-            email,
-            {
+            email=email,
+            phone=phone,
+            context={
                 "partner_name": org.get("name") or "Partner",
                 "partner_slug": org.get("slug") or "",
                 "academy_name": DEFAULT_ACADEMY,
@@ -439,7 +592,8 @@ async def fire_partner_payment_failed(org: dict) -> None:
 async def fire_partner_status_change(org: dict, *, is_active: bool) -> None:
     try:
         email = (org or {}).get("email")
-        if not email:
+        phone = _phone((org or {}).get("phone"), (org or {}).get("contact_phone"))
+        if not email and not phone:
             return
         ctx = {
             "partner_name": org.get("name") or "Partner",
@@ -448,7 +602,7 @@ async def fire_partner_status_change(org: dict, *, is_active: bool) -> None:
             "academy_name": DEFAULT_ACADEMY,
         }
         code = "rock_partner_activated" if is_active else "rock_partner_deactivated"
-        await notify_ops_email(code, email, ctx)
+        await notify_ops(code, email=email, phone=phone, context=ctx)
     except Exception:
         logger.exception("fire_partner_status_change failed")
 
@@ -467,7 +621,7 @@ async def fire_stock_low(
             "quantity": str(quantity),
             "branch_name": branch_name or "",
         }
-        await notify_staff_ops_email("rock_stock_low_alert", ctx, db=db)
+        await notify_staff_ops("rock_stock_low_alert", ctx, db=db)
     except Exception:
         logger.exception("fire_stock_low failed")
 
@@ -478,19 +632,24 @@ async def fire_payment_reminder(
     student_name: str,
     amount: Any,
     due_date: Any = None,
+    student_phone: Optional[str] = None,
+    channels: Optional[Sequence[str]] = None,
 ) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_payment_reminder",
-            student_email,
-            {
+            email=student_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "student_name": student_name or "Student",
                 "amount": _money(amount),
                 "due_date": _date(due_date),
             },
+            channels=channels,
         )
     except Exception:
         logger.exception("fire_payment_reminder failed")
@@ -502,19 +661,24 @@ async def fire_renewal_reminder(
     student_name: str,
     course_name: str,
     end_date: Any = None,
+    student_phone: Optional[str] = None,
+    channels: Optional[Sequence[str]] = None,
 ) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_renewal_reminder",
-            student_email,
-            {
+            email=student_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "student_name": student_name or "Student",
                 "course_name": course_name or "Course",
                 "end_date": _date(end_date),
             },
+            channels=channels,
         )
     except Exception:
         logger.exception("fire_renewal_reminder failed")
@@ -525,14 +689,17 @@ async def fire_enrollment_expired(
     student_email: Optional[str],
     student_name: str,
     course_name: str,
+    student_phone: Optional[str] = None,
 ) -> None:
     try:
-        if not student_email:
+        phone = _phone(student_phone)
+        if not student_email and not phone:
             return
-        await notify_ops_email(
+        await notify_ops(
             "rock_enrollment_expired",
-            student_email,
-            {
+            email=student_email,
+            phone=phone,
+            context={
                 "academy_name": DEFAULT_ACADEMY,
                 "student_name": student_name or "Student",
                 "course_name": course_name or "Course",

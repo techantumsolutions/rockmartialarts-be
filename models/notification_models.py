@@ -107,3 +107,20 @@ class MessageNotificationCreate(BaseModel):
     message: str
     subject: str
     priority: str = "normal"
+
+
+class LeadNotification(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    notification_type: str = "new_lead"
+    lead_id: str
+    lead_name: Optional[str] = None
+    recipient_id: str
+    recipient_role: str
+    title: str
+    message: str
+    link: Optional[str] = None
+    dedupe_key: str
+    is_read: bool = False
+    priority: str = "normal"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    read_at: Optional[datetime] = None

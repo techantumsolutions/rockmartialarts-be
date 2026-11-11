@@ -7,14 +7,29 @@ from utils.unified_auth import require_role_unified, get_current_user_or_superad
 
 router = APIRouter()
 
+# P0: financial/student/coach/branch report dumps are admin-scoped only
+_REPORT_ADMIN_ROLES = [
+    UserRole.SUPER_ADMIN,
+    UserRole.PARTNER_SUPER_ADMIN,
+    UserRole.BRANCH_MANAGER,
+    UserRole.COACH_ADMIN,
+]
+
 @router.get("/categories")
-async def get_report_categories():
-    """Get available report categories"""
+async def get_report_categories(
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES)),
+):
+    """Get available report categories (admin only)"""
+    _ = current_user
     return await ReportsController.get_report_categories()
 
 @router.get("/categories/{category_id}/reports")
-async def get_category_reports(category_id: str):
-    """Get reports available for a specific category"""
+async def get_category_reports(
+    category_id: str,
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES)),
+):
+    """Get reports available for a specific category (admin only)"""
+    _ = current_user
     return await ReportsController.get_category_reports(category_id)
 
 @router.get("/financial")
@@ -29,7 +44,7 @@ async def get_financial_reports(
     search: Optional[str] = Query(None, description="Search in transaction ID, course, branch, or notes"),
     skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive financial reports with enhanced filtering and search"""
     return await ReportsController.get_financial_reports(
@@ -39,7 +54,7 @@ async def get_financial_reports(
 
 @router.get("/financial/filters")
 async def get_financial_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for financial reports"""
     return await ReportsController.get_financial_report_filters(current_user)
@@ -50,7 +65,7 @@ async def get_student_reports(
     course_id: Optional[str] = Query(None, description="Filter by course ID"),
     start_date: Optional[datetime] = Query(None, description="Start date for report"),
     end_date: Optional[datetime] = Query(None, description="End date for report"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive student reports with branch-specific filtering for branch managers"""
     return await ReportsController.get_student_reports(
@@ -68,7 +83,7 @@ async def list_student_report_rows(
     end_date: Optional[str] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    current_user: dict = Depends(get_current_user_or_superadmin),
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES)),
 ):
     """M08-S02: filtered student rows for Admin/Branch Manager reports."""
     return await ReportsController.list_student_report_rows(
@@ -93,7 +108,7 @@ async def export_student_reports(
     is_active: Optional[bool] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin),
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES)),
 ):
     """M08-S02: CSV/Excel export using current authorized filters."""
     return await ReportsController.export_student_reports(
@@ -110,7 +125,7 @@ async def export_student_reports(
 
 @router.get("/students/filters")
 async def get_student_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for student reports (branch-specific for branch managers)"""
     return await ReportsController.get_student_report_filters(current_user)
@@ -120,7 +135,7 @@ async def get_coach_reports(
     branch_id: Optional[str] = Query(None, description="Filter by branch ID"),
     start_date: Optional[datetime] = Query(None, description="Start date for report"),
     end_date: Optional[datetime] = Query(None, description="End date for report"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive coach reports"""
     return await ReportsController.get_coach_reports(
@@ -135,7 +150,7 @@ async def get_branch_reports(
     status: Optional[str] = Query(None, description="Filter by branch status"),
     skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive branch reports with filtering and search"""
     return await ReportsController.get_branch_reports(
@@ -144,7 +159,7 @@ async def get_branch_reports(
 
 @router.get("/branches/filters")
 async def get_branch_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for branch reports"""
     return await ReportsController.get_branch_report_filters(current_user)
@@ -158,7 +173,7 @@ async def get_course_reports(
     search: Optional[str] = Query(None, description="Search by title, code, or description"),
     skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
     limit: int = Query(20, ge=1, le=100, description="Number of records to return"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive course reports with filtering and search"""
     return await ReportsController.get_course_reports(
@@ -167,7 +182,7 @@ async def get_course_reports(
 
 @router.get("/filters")
 async def get_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for reports"""
     return await ReportsController.get_report_filters(current_user)
@@ -178,7 +193,7 @@ async def get_total_balance_fees_statement(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Total Balance Fees Statement report"""
     result = await ReportsController.get_financial_reports(
@@ -195,7 +210,7 @@ async def get_balance_fees_statement(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Balance Fees Statement report"""
     result = await ReportsController.get_financial_reports(
@@ -212,7 +227,7 @@ async def get_daily_collection_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Daily Collection Report"""
     result = await ReportsController.get_financial_reports(
@@ -229,7 +244,7 @@ async def get_type_wise_balance_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Type Wise Balance Report"""
     result = await ReportsController.get_financial_reports(
@@ -246,7 +261,7 @@ async def get_fees_statement(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Fees Statement report"""
     result = await ReportsController.get_financial_reports(
@@ -263,7 +278,7 @@ async def get_total_fee_collection_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Total Fee Collection Report"""
     result = await ReportsController.get_financial_reports(
@@ -280,7 +295,7 @@ async def get_other_fees_collection_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Other Fees Collection Report"""
     result = await ReportsController.get_financial_reports(
@@ -297,7 +312,7 @@ async def get_online_fees_collection_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Online Fees Collection Report"""
     result = await ReportsController.get_financial_reports(
@@ -314,7 +329,7 @@ async def get_balance_fees_report_with_remark(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Balance Fees Report With Remark"""
     result = await ReportsController.get_financial_reports(
@@ -331,13 +346,53 @@ async def get_expense_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
-    """Get Expense Report (placeholder for future implementation)"""
+    """Expense report from payments marked as expense (empty when none)."""
+    from utils.database import get_db
+
+    db = get_db()
+    query: dict = {
+        "$or": [
+            {"payment_type": {"$regex": "expense", "$options": "i"}},
+            {"category": {"$regex": "expense", "$options": "i"}},
+            {"is_expense": True},
+        ]
+    }
+    if branch_id:
+        query["branch_id"] = branch_id
+    if start_date or end_date:
+        date_q: dict = {}
+        if start_date:
+            date_q["$gte"] = start_date
+        if end_date:
+            date_q["$lte"] = end_date
+        query["payment_date"] = date_q
+    rows = await db.payments.find(query).sort("payment_date", -1).to_list(length=500)
+    total = 0.0
+    items = []
+    for r in rows:
+        amt = float(r.get("amount") or 0)
+        total += amt
+        items.append(
+            {
+                "id": r.get("id"),
+                "amount": amt,
+                "branch_id": r.get("branch_id"),
+                "payment_date": r.get("payment_date"),
+                "description": r.get("description") or r.get("notes") or r.get("payment_type"),
+                "status": r.get("payment_status") or r.get("status"),
+            }
+        )
     return {
         "report_type": "Expense Report",
-        "data": {"message": "Expense reporting feature coming soon"},
-        "generated_at": datetime.utcnow()
+        "data": {
+            "available": True,
+            "total_expenses": total,
+            "count": len(items),
+            "items": items,
+        },
+        "generated_at": datetime.utcnow(),
     }
 
 @router.get("/financial/payroll-report")
@@ -345,13 +400,54 @@ async def get_payroll_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
-    """Get Payroll Report (placeholder for future implementation)"""
+    """Payroll-oriented report from coach salary / payroll payment records (empty when none)."""
+    from utils.database import get_db
+
+    db = get_db()
+    query: dict = {
+        "$or": [
+            {"payment_type": {"$regex": "payroll|salary|wage", "$options": "i"}},
+            {"category": {"$regex": "payroll|salary", "$options": "i"}},
+            {"is_payroll": True},
+        ]
+    }
+    if branch_id:
+        query["branch_id"] = branch_id
+    if start_date or end_date:
+        date_q: dict = {}
+        if start_date:
+            date_q["$gte"] = start_date
+        if end_date:
+            date_q["$lte"] = end_date
+        query["payment_date"] = date_q
+    rows = await db.payments.find(query).sort("payment_date", -1).to_list(length=500)
+    total = 0.0
+    items = []
+    for r in rows:
+        amt = float(r.get("amount") or 0)
+        total += amt
+        items.append(
+            {
+                "id": r.get("id"),
+                "amount": amt,
+                "coach_id": r.get("coach_id") or r.get("payee_id"),
+                "coach_name": r.get("coach_name") or r.get("payee_name"),
+                "branch_id": r.get("branch_id"),
+                "payment_date": r.get("payment_date"),
+                "status": r.get("payment_status") or r.get("status"),
+            }
+        )
     return {
         "report_type": "Payroll Report",
-        "data": {"message": "Payroll reporting feature coming soon"},
-        "generated_at": datetime.utcnow()
+        "data": {
+            "available": True,
+            "total_payroll": total,
+            "count": len(items),
+            "items": items,
+        },
+        "generated_at": datetime.utcnow(),
     }
 
 @router.get("/financial/income-report")
@@ -359,7 +455,7 @@ async def get_income_report(
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     branch_id: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get Income Report"""
     result = await ReportsController.get_financial_reports(
@@ -386,7 +482,7 @@ async def get_master_reports(
     search: Optional[str] = Query(None, description="Search by name, email, or phone"),
     skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get comprehensive master (coach) reports with filtering and search"""
     return await ReportsController.get_master_reports(
@@ -396,14 +492,14 @@ async def get_master_reports(
 
 @router.get("/masters/filters")
 async def get_master_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for master reports"""
     return await ReportsController.get_master_report_filters(current_user)
 
 @router.get("/courses/filters")
 async def get_course_report_filters(
-    current_user: dict = Depends(get_current_user_or_superadmin)
+    current_user: dict = Depends(require_role_unified(_REPORT_ADMIN_ROLES))
 ):
     """Get available filter options for course reports"""
     return await ReportsController.get_course_report_filters(current_user)
@@ -570,6 +666,56 @@ async def list_event_reports(
         end_date=end_date,
         skip=skip,
         limit=limit,
+    )
+
+
+@router.get("/attendance")
+async def list_attendance_reports(
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    record_type: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.list_attendance_operational(
+        current_user,
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+        record_type=record_type,
+        skip=skip,
+        limit=limit,
+    )
+
+
+@router.get("/attendance/export")
+async def export_attendance_reports_matrix(
+    background_tasks: BackgroundTasks,
+    branch_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    record_type: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    current_user: dict = Depends(_require_role(_ADMIN_ROLES)),
+):
+    return await op_reports.export_attendance_operational(
+        current_user,
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        status=status,
+        record_type=record_type,
+        format=format,
+        background_tasks=background_tasks,
     )
 
 

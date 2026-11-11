@@ -6,8 +6,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Shared ops webhook (SSL on this host is often broken; verify=False is intentional fallback).
-_EMAIL_WEBHOOK_URL = "https://ai.alviongs.com/webhook/de77d8d6-ae98-471d-ba19-8d7f58ec8449"
+def _email_webhook_url() -> str:
+    """Optional fallback when Resend fails. Empty disables the broken default webhook."""
+    raw = (os.getenv("EMAIL_WEBHOOK_URL") or "").strip()
+    if raw.lower() in {"0", "false", "off", "disabled", "none"}:
+        return ""
+    return raw
 
 
 def _resend_from_header() -> str:
@@ -36,10 +40,18 @@ async def _send_via_email_webhook(
     html_message: str,
     plain_message: str,
 ) -> bool:
+    url = _email_webhook_url()
+    if not url:
+        logger.warning(
+            "Email webhook fallback skipped (set EMAIL_WEBHOOK_URL to enable) for %s subject=%s",
+            to_email,
+            subject,
+        )
+        return False
     try:
         async with httpx.AsyncClient(timeout=30.0, verify=False, trust_env=False) as client:
             resp = await client.post(
-                _EMAIL_WEBHOOK_URL,
+                url,
                 json={
                     "to_email": to_email,
                     "subject": subject,
@@ -70,85 +82,43 @@ def build_student_welcome_email_html(
     creator_role: Optional[str] = None,
 ) -> str:
     """Build a modern, responsive HTML email template for student password setup."""
-    display_name = student_name.strip() if student_name else "Student"
+    from utils.email_layout import ACCENT_RED, wrap_rock_email_html
+    import html as _html
+
+    display_name = _html.escape(student_name.strip() if student_name else "Student")
+    link = _html.escape(setup_link, quote=True)
     creator_badge = ""
     if creator_name and creator_role:
-        role_label = creator_role.replace("_", " ").title()
+        role_label = _html.escape(creator_role.replace("_", " ").title())
         creator_badge = f"""
-        <div style="background-color: #f3f4f6; border-left: 4px solid #ef4444; padding: 12px 16px; margin: 20px 0; border-radius: 4px;">
-            <p style="margin: 0; color: #4b5563; font-size: 14px;">
-                <strong>Created by:</strong> {creator_name} ({role_label})
-            </p>
+        <div style="background-color:#f3f4f6;border-left:4px solid #ef4444;padding:12px 16px;margin:20px 0;border-radius:4px;">
+          <p style="margin:0;color:#4b5563;font-size:14px;">
+            <strong>Created by:</strong> {_html.escape(creator_name)} ({role_label})
+          </p>
         </div>
         """
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to Rock Martial Arts</title>
-</head>
-<body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937;">
-    <div style="max-width: 600px; margin: 40px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
-        <!-- Header -->
-        <div style="background: linear-gradient(135deg, #111827 0%, #1f2937 100%); padding: 32px 24px; text-align: center;">
-            <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: 0.5px;">
-                ROCK MARTIAL ARTS ACADEMY
-            </h1>
-            <p style="margin: 8px 0 0 0; color: #ef4444; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
-                Student Account Setup
-            </p>
-        </div>
-
-        <!-- Content -->
-        <div style="padding: 36px 32px;">
-            <h2 style="margin: 0 0 16px 0; color: #111827; font-size: 20px; font-weight: 600;">
-                Hello {display_name},
-            </h2>
-            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                Welcome to <strong>Rock Martial Arts Academy</strong>! Your student account has been successfully created.
-            </p>
-            {creator_badge}
-            <p style="margin: 0 0 24px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                Please set up your personal password to activate your account and access your student dashboard, training schedule, and attendance records.
-            </p>
-
-            <!-- Action Button -->
-            <div style="text-align: center; margin: 32px 0;">
-                <a href="{setup_link}" style="display: inline-block; background-color: #ef4444; color: #ffffff; font-size: 16px; font-weight: 600; text-decoration: none; padding: 14px 32px; border-radius: 8px; box-shadow: 0 2px 4px rgba(239, 68, 68, 0.3);">
-                    Set Up Your Password
-                </a>
-            </div>
-
-            <!-- Expiration Notice -->
-            <div style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 8px; padding: 14px 16px; margin: 24px 0;">
-                <p style="margin: 0; color: #92400e; font-size: 13px; line-height: 1.5;">
-                    ⏳ <strong>Important:</strong> This password setup link will expire in <strong>24 hours</strong>. If it expires, please contact your academy coach or administrator to generate a new setup link.
-                </p>
-            </div>
-
-            <p style="margin: 24px 0 8px 0; color: #6b7280; font-size: 13px;">
-                If the button above doesn't work, copy and paste this URL into your browser:
-            </p>
-            <p style="margin: 0; color: #ef4444; font-size: 12px; word-break: break-all; background-color: #f3f4f6; padding: 10px; border-radius: 6px;">
-                {setup_link}
-            </p>
-        </div>
-
-        <!-- Footer -->
-        <div style="background-color: #f9fafb; border-top: 1px solid #e5e7eb; padding: 24px; text-align: center;">
-            <p style="margin: 0 0 6px 0; color: #6b7280; font-size: 12px;">
-                &copy; {2026} Rock Martial Arts Academy. All rights reserved.
-            </p>
-            <p style="margin: 0; color: #9ca3af; font-size: 11px;">
-                If you did not expect this email, please disregard it.
-            </p>
-        </div>
-    </div>
-</body>
-</html>
-"""
+    content = f"""
+      <p style="margin:0 0 16px 0;">Hello <strong>{display_name}</strong>,</p>
+      <p style="margin:0 0 16px 0;">Welcome to <strong>Rock Martial Arts Academy</strong>! Your student account has been successfully created.</p>
+      {creator_badge}
+      <p style="margin:0 0 8px 0;">Set up your password to activate your dashboard, training schedule, and attendance records.</p>
+      <div style="background-color:#fffbeb;border:1px solid #fef3c7;border-radius:8px;padding:14px 16px;margin:24px 0;">
+        <p style="margin:0;color:#92400e;font-size:13px;line-height:1.5;">
+          <strong>Important:</strong> This setup link expires in <strong>24 hours</strong>.
+        </p>
+      </div>
+      <p style="margin:16px 0 6px 0;color:#6b7280;font-size:13px;">Or paste this URL into your browser:</p>
+      <p style="margin:0;color:#ef4444;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{link}</p>
+    """
+    return wrap_rock_email_html(
+        content_html=content,
+        eyebrow="Student Account Setup",
+        cta_label="Set Up Your Password",
+        cta_url=setup_link,
+        accent=ACCENT_RED,
+        footer_note="If you did not expect this email, please disregard it.",
+        preheader="Set up your Rock Martial Arts student password",
+    )
 
 
 async def send_student_welcome_setup_email(
@@ -228,74 +198,32 @@ def build_coach_approval_email_html(
     expiry_hours: int = 24,
 ) -> str:
     """Build a modern, responsive HTML email template for coach password setup upon approval."""
-    display_name = coach_name.strip() if coach_name else "Coach"
+    from utils.email_layout import ACCENT_GOLD, wrap_rock_email_html
+    import html as _html
 
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Coach Application Approved - Rock Martial Arts Academy</title>
-</head>
-<body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937;">
-    <div style="max-width: 600px; margin: 40px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
-        <!-- Header -->
-        <div style="background: linear-gradient(135deg, #111827 0%, #1f2937 100%); padding: 32px 24px; text-align: center;">
-            <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: 0.5px;">
-                ROCK MARTIAL ARTS ACADEMY
-            </h1>
-            <p style="margin: 8px 0 0 0; color: #FFB70F; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
-                Coach Application Approved
-            </p>
-        </div>
-
-        <!-- Content -->
-        <div style="padding: 36px 32px;">
-            <h2 style="margin: 0 0 16px 0; color: #111827; font-size: 20px; font-weight: 600;">
-                Congratulations {display_name}!
-            </h2>
-            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                We are excited to inform you that your application to join <strong>Rock Martial Arts Academy</strong> as a coach has been <strong>approved</strong> by our administration team.
-            </p>
-            <p style="margin: 0 0 24px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                To activate your coach account and access your dashboard, schedules, and assigned students, please set up your account password using the secure button below:
-            </p>
-
-            <!-- Action Button -->
-            <div style="text-align: center; margin: 32px 0;">
-                <a href="{setup_link}" style="display: inline-block; background-color: #FFB70F; color: #111827; font-size: 16px; font-weight: 700; text-decoration: none; padding: 14px 32px; border-radius: 8px; box-shadow: 0 2px 4px rgba(255, 183, 15, 0.4);">
-                    Set Up Your Password
-                </a>
-            </div>
-
-            <!-- Expiration Notice -->
-            <div style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 8px; padding: 14px 16px; margin: 24px 0;">
-                <p style="margin: 0; color: #92400e; font-size: 13px; line-height: 1.5;">
-                    ⏳ <strong>Important:</strong> This password setup link will expire in <strong>{expiry_hours} hours</strong>. For security purposes, please set up your password before it expires.
-                </p>
-            </div>
-
-            <p style="margin: 24px 0 8px 0; color: #6b7280; font-size: 13px;">
-                If the button above does not work, copy and paste this link into your web browser:
-            </p>
-            <p style="margin: 0; color: #d97706; font-size: 12px; word-break: break-all; background-color: #f3f4f6; padding: 10px; border-radius: 6px;">
-                {setup_link}
-            </p>
-        </div>
-
-        <!-- Footer -->
-        <div style="background-color: #f9fafb; border-top: 1px solid #e5e7eb; padding: 24px; text-align: center;">
-            <p style="margin: 0 0 6px 0; color: #6b7280; font-size: 12px;">
-                &copy; {datetime.utcnow().year} Rock Martial Arts Academy. All rights reserved.
-            </p>
-            <p style="margin: 0; color: #9ca3af; font-size: 11px;">
-                If you did not register for this account, please contact us immediately.
-            </p>
-        </div>
-    </div>
-</body>
-</html>
-"""
+    display_name = _html.escape(coach_name.strip() if coach_name else "Coach")
+    link = _html.escape(setup_link, quote=True)
+    content = f"""
+      <p style="margin:0 0 16px 0;">Congratulations <strong>{display_name}</strong>!</p>
+      <p style="margin:0 0 16px 0;">Your coach application at <strong>Rock Martial Arts Academy</strong> has been <strong>approved</strong>.</p>
+      <p style="margin:0 0 8px 0;">Set your password to access your coach dashboard, schedules, and assigned students.</p>
+      <div style="background-color:#fffbeb;border:1px solid #fef3c7;border-radius:8px;padding:14px 16px;margin:24px 0;">
+        <p style="margin:0;color:#92400e;font-size:13px;">
+          <strong>Important:</strong> This link expires in <strong>{int(expiry_hours)} hours</strong>.
+        </p>
+      </div>
+      <p style="margin:16px 0 6px 0;color:#6b7280;font-size:13px;">Or paste this URL into your browser:</p>
+      <p style="margin:0;color:#d97706;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{link}</p>
+    """
+    return wrap_rock_email_html(
+        content_html=content,
+        eyebrow="Coach Application Approved",
+        cta_label="Set Up Your Password",
+        cta_url=setup_link,
+        accent=ACCENT_GOLD,
+        footer_note="If you did not register for this account, please contact us immediately.",
+        preheader="Your coach application was approved — set your password",
+    )
 
 
 def build_coach_rejection_email_html(
@@ -303,65 +231,29 @@ def build_coach_rejection_email_html(
     reason: str,
 ) -> str:
     """Build a modern, courteous HTML email notification when a coach application is rejected."""
-    display_name = coach_name.strip() if coach_name else "Coach"
-    rejection_reason = reason.strip() if reason else "Application criteria were not met."
+    from utils.email_layout import ACCENT_RED, wrap_rock_email_html
+    import html as _html
 
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Coach Application Status - Rock Martial Arts Academy</title>
-</head>
-<body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f2937;">
-    <div style="max-width: 600px; margin: 40px auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);">
-        <!-- Header -->
-        <div style="background: linear-gradient(135deg, #111827 0%, #1f2937 100%); padding: 32px 24px; text-align: center;">
-            <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: 0.5px;">
-                ROCK MARTIAL ARTS ACADEMY
-            </h1>
-            <p style="margin: 8px 0 0 0; color: #ef4444; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
-                Coach Application Update
-            </p>
-        </div>
-
-        <!-- Content -->
-        <div style="padding: 36px 32px;">
-            <h2 style="margin: 0 0 16px 0; color: #111827; font-size: 20px; font-weight: 600;">
-                Hello {display_name},
-            </h2>
-            <p style="margin: 0 0 16px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                Thank you for your interest in joining <strong>Rock Martial Arts Academy</strong> as a coach and for taking the time to submit your application.
-            </p>
-            <p style="margin: 0 0 20px 0; color: #4b5563; font-size: 15px; line-height: 1.6;">
-                After careful review of your profile and submitted details, our administration team has determined that we are unable to approve your application at this time.
-            </p>
-
-            <!-- Reason Box -->
-            <div style="background-color: #fef2f2; border-left: 4px solid #ef4444; padding: 16px 20px; margin: 24px 0; border-radius: 4px;">
-                <p style="margin: 0 0 6px 0; color: #991b1b; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;">
-                    Reason for Decision:
-                </p>
-                <p style="margin: 0; color: #7f1d1d; font-size: 14px; line-height: 1.6;">
-                    {rejection_reason}
-                </p>
-            </div>
-
-            <p style="margin: 20px 0 0 0; color: #4b5563; font-size: 14px; line-height: 1.6;">
-                If you have questions regarding this decision, additional certifications, or would like to discuss future opportunities, please reach out to our academy administration team.
-            </p>
-        </div>
-
-        <!-- Footer -->
-        <div style="background-color: #f9fafb; border-top: 1px solid #e5e7eb; padding: 24px; text-align: center;">
-            <p style="margin: 0 0 6px 0; color: #6b7280; font-size: 12px;">
-                &copy; {datetime.utcnow().year} Rock Martial Arts Academy. All rights reserved.
-            </p>
-        </div>
-    </div>
-</body>
-</html>
-"""
+    display_name = _html.escape(coach_name.strip() if coach_name else "Coach")
+    rejection_reason = _html.escape(
+        reason.strip() if reason else "Application criteria were not met."
+    )
+    content = f"""
+      <p style="margin:0 0 16px 0;">Hello <strong>{display_name}</strong>,</p>
+      <p style="margin:0 0 16px 0;">Thank you for applying to join <strong>Rock Martial Arts Academy</strong> as a coach.</p>
+      <p style="margin:0 0 16px 0;">After careful review, we are unable to approve your application at this time.</p>
+      <div style="background-color:#fef2f2;border-left:4px solid #ef4444;padding:16px 20px;margin:24px 0;border-radius:4px;">
+        <p style="margin:0 0 6px 0;color:#991b1b;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Reason</p>
+        <p style="margin:0;color:#7f1d1d;font-size:14px;line-height:1.6;">{rejection_reason}</p>
+      </div>
+      <p style="margin:0;font-size:14px;">Questions or future opportunities — please contact academy administration.</p>
+    """
+    return wrap_rock_email_html(
+        content_html=content,
+        eyebrow="Coach Application Update",
+        accent=ACCENT_RED,
+        preheader="Update on your Rock Martial Arts coach application",
+    )
 
 
 async def send_coach_approval_email(
@@ -578,42 +470,41 @@ async def send_partner_invite_email(
 """
     # ASCII hyphen in subject — some filters mishandle unicode dashes
     subject = f"Welcome to {display} - create your partner admin password"
-    html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2937;">
-  <div style="max-width:560px;margin:40px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 6px -1px rgba(0,0,0,.1);">
-    <div style="background:linear-gradient(135deg,#111827 0%,#1f2937 100%);padding:28px 24px;text-align:center;">
-      <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;">Partner Admin Invite</h1>
-      <p style="margin:8px 0 0;color:#fbbf24;font-size:13px;font-weight:600;letter-spacing:.5px;">WHITE-LABEL DASHBOARD</p>
-    </div>
-    <div style="padding:28px 28px 20px;">
-      <h2 style="margin:0 0 12px;font-size:18px;color:#111827;">Hello {display},</h2>
-      <p style="margin:0 0 16px;color:#4b5563;font-size:14px;line-height:1.6;">
-        Your partner organization has been created. Set your password to access your partner admin dashboard.
-      </p>
-      <table style="width:100%;border-collapse:collapse;margin:12px 0 20px;font-size:14px;">
-        <tr><td style="padding:6px 0;color:#6b7280;">Partner</td><td style="padding:6px 0;"><b>{display}</b></td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">{to_clean}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="padding:6px 0;">{phone or "-"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Address</td><td style="padding:6px 0;">{address or "-"}</td></tr>
-        <tr><td style="padding:6px 0;color:#6b7280;">Payment</td><td style="padding:6px 0;">{payment_method or "-"} / {payment_status or "-"}</td></tr>
+    from utils.email_layout import ACCENT_PARTNER, wrap_rock_email_html
+    import html as _html
+
+    safe_display = _html.escape(display)
+    safe_email = _html.escape(to_clean)
+    safe_phone = _html.escape(phone or "—")
+    safe_address = _html.escape(address or "—")
+    safe_pay = _html.escape(f"{payment_method or '—'} / {payment_status or '—'}")
+    safe_set = _html.escape(set_password_link, quote=True)
+    safe_login = _html.escape(login_link, quote=True)
+    content = f"""
+      <p style="margin:0 0 16px 0;">Hello <strong>{safe_display}</strong>,</p>
+      <p style="margin:0 0 16px 0;">Your partner organization is ready (Powered by Rock Martial Arts). Create your password to open the partner admin dashboard.</p>
+      <table style="width:100%;border-collapse:collapse;margin:12px 0 8px;font-size:14px;">
+        <tr><td style="padding:6px 0;color:#6b7280;">Partner</td><td style="padding:6px 0;"><b>{safe_display}</b></td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">{safe_email}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="padding:6px 0;">{safe_phone}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Address</td><td style="padding:6px 0;">{safe_address}</td></tr>
+        <tr><td style="padding:6px 0;color:#6b7280;">Payment</td><td style="padding:6px 0;">{safe_pay}</td></tr>
       </table>
-      <div style="text-align:center;margin:24px 0;">
-        <a href="{set_password_link}" style="display:inline-block;background:#FFC403;color:#1a2332;font-size:15px;font-weight:600;text-decoration:none;padding:12px 28px;border-radius:8px;">
-          Create password
-        </a>
-      </div>
-      <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Or paste this link in your browser:</p>
-      <p style="margin:0 0 16px;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{set_password_link}</p>
-      <p style="margin:0 0 8px;color:#6b7280;font-size:12px;">Admin login after setup:</p>
-      <p style="margin:0;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{login_link}</p>
+      <p style="margin:16px 0 6px 0;color:#6b7280;font-size:12px;">Or paste this link:</p>
+      <p style="margin:0 0 12px;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{safe_set}</p>
+      <p style="margin:0 0 6px;color:#6b7280;font-size:12px;">Admin login after setup:</p>
+      <p style="margin:0 0 8px;color:#111827;font-size:12px;word-break:break-all;background:#f3f4f6;padding:10px;border-radius:6px;">{safe_login}</p>
       {role_links_html}
       <p style="margin:16px 0 0;color:#9ca3af;font-size:12px;">This invite link expires in 7 days.</p>
-    </div>
-  </div>
-</body>
-</html>"""
+    """
+    html = wrap_rock_email_html(
+        content_html=content,
+        eyebrow="Partner Admin Invite",
+        cta_label="Create password",
+        cta_url=set_password_link,
+        accent=ACCENT_PARTNER,
+        preheader=f"Create your password for {display}",
+    )
     plain = (
         f"Hello {display},\n\n"
         f"Your partner organization has been created.\n"

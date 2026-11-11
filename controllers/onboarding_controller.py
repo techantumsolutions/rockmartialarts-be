@@ -277,6 +277,7 @@ class OnboardingController:
             await fire_student_account_ready(
                 student_email=user.get("email"),
                 student_name=full_name or user.get("full_name") or "Student",
+                student_phone=user.get("phone"),
             )
         except Exception:
             import logging

@@ -19,7 +19,7 @@ router = APIRouter()
 
 # Simple in-process rate limit (per worker). Enough to blunt casual guessing.
 _VERIFY_WINDOW_SEC = 60
-_VERIFY_MAX_PER_WINDOW = 40
+_VERIFY_MAX_PER_WINDOW = 20
 _VERIFY_HITS: Dict[str, Deque[float]] = defaultdict(deque)
 _VERIFY_LOCK = Lock()
 

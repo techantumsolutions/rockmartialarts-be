@@ -361,12 +361,16 @@ async def assign_coach_to_lead(
 
         contact = coach.get("contact_info") if isinstance(coach.get("contact_info"), dict) else {}
         coach_email = (coach.get("email") or contact.get("email") or "").strip() or None
+        coach_phone = (
+            coach.get("phone") or contact.get("phone") or contact.get("mobile") or ""
+        ).strip() or None
         await fire_coach_lead_assigned(
             coach_email=coach_email,
             coach_name=coach_name or "Coach",
             lead_name=lead.get("name") or "Lead",
             lead_phone=lead.get("phone") or "",
             lead_source=lead.get("source") or lead.get("source_type") or "",
+            coach_phone=coach_phone,
         )
     except Exception:
         logger.exception("ops email after coach lead assign failed")

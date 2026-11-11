@@ -962,6 +962,7 @@ class BranchController:
                     summary = f"Schedule updated ({len(schedule)} batch(es)) at this branch."
                     # Notify active enrolled students at this branch (best-effort, capped)
                     student_emails = []
+                    student_phones = []
                     async for enr in db.enrollments.find(
                         {"branch_id": branch_id, "is_active": True},
                         {"student_id": 1, "course_name": 1},
@@ -969,9 +970,11 @@ class BranchController:
                         sid = enr.get("student_id")
                         if not sid:
                             continue
-                        u = await db.users.find_one({"id": sid}, {"email": 1})
-                        if u and u.get("email"):
-                            student_emails.append(u["email"])
+                        u = await db.users.find_one({"id": sid}, {"email": 1, "phone": 1})
+                        if not u:
+                            continue
+                        student_emails.append(u.get("email"))
+                        student_phones.append(u.get("phone"))
                     course_label = "your course"
                     if schedule and isinstance(schedule[0], dict):
                         course_label = (
@@ -980,11 +983,13 @@ class BranchController:
                             or course_label
                         )
                     await fire_schedule_update_students(
-                        student_emails=list(dict.fromkeys(student_emails)),
+                        student_emails=student_emails,
+                        student_phones=student_phones,
                         course_name=course_label,
                         new_schedule=summary,
                     )
                     coach_emails = []
+                    coach_phones = []
                     for row in schedule:
                         if not isinstance(row, dict):
                             continue
@@ -996,10 +1001,12 @@ class BranchController:
                                 continue
                             contact = c.get("contact_info") if isinstance(c.get("contact_info"), dict) else {}
                             em = (c.get("email") or contact.get("email") or "").strip()
-                            if em:
-                                coach_emails.append(em)
+                            ph = (c.get("phone") or contact.get("phone") or "").strip()
+                            coach_emails.append(em or None)
+                            coach_phones.append(ph or None)
                     await fire_coach_batch_update(
-                        coach_emails=list(dict.fromkeys(coach_emails)),
+                        coach_emails=coach_emails,
+                        coach_phones=coach_phones,
                         course_name=course_label,
                         change_summary=summary,
                     )

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from datetime import datetime
 from typing import List, Optional, Dict
 from enum import Enum
@@ -65,6 +65,15 @@ class CreateCoachRegistrationOrderBody(BaseModel):
     phone: Optional[str] = None
 
 
+def _validate_training_mode_optional(value: Optional[str]) -> Optional[str]:
+    if value is None or str(value).strip() == "":
+        return None
+    mode = str(value).strip().lower()
+    if mode not in {"online", "offline"}:
+        raise ValueError('training_mode must be "online" or "offline"')
+    return mode
+
+
 class CoachRegistrationCreate(BaseModel):
     """
     M14-S01 public self-registration payload.
@@ -105,6 +114,16 @@ class CoachRegistrationCreate(BaseModel):
     razorpay_payment_id: Optional[str] = None
     razorpay_order_id: Optional[str] = None
     razorpay_signature: Optional[str] = None
+    training_mode: Optional[str] = Field(
+        default=None,
+        max_length=16,
+        description='Coach delivery mode: "online" | "offline"',
+    )
+
+    @field_validator("training_mode")
+    @classmethod
+    def _training_mode_registration(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_training_mode_optional(v)
 
 
 class CoachCreate(BaseModel):
@@ -121,6 +140,16 @@ class CoachCreate(BaseModel):
     featured_on_homepage: bool = False
     homepage_rating: Optional[float] = None
     display_order: Optional[int] = None
+    training_mode: Optional[str] = Field(
+        default=None,
+        max_length=16,
+        description='Coach delivery mode: "online" | "offline"',
+    )
+
+    @field_validator("training_mode")
+    @classmethod
+    def _training_mode_create(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_training_mode_optional(v)
 
 class CoachUpdate(BaseModel):
     personal_info: Optional[PersonalInfo] = None
@@ -137,6 +166,16 @@ class CoachUpdate(BaseModel):
     featured_on_homepage: Optional[bool] = None
     homepage_rating: Optional[float] = None
     display_order: Optional[int] = None
+    training_mode: Optional[str] = Field(
+        default=None,
+        max_length=16,
+        description='Coach delivery mode: "online" | "offline"',
+    )
+
+    @field_validator("training_mode")
+    @classmethod
+    def _training_mode_update(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_training_mode_optional(v)
 
 class CoachLogin(BaseModel):
     email: EmailStr
@@ -177,6 +216,7 @@ class Coach(BaseModel):
     user_id: Optional[str] = None
     service_location_ids: List[str] = Field(default_factory=list)
     registration_source: Optional[str] = None
+    training_mode: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -201,6 +241,7 @@ class CoachResponse(BaseModel):
     user_id: Optional[str] = None
     service_location_ids: Optional[List[str]] = None
     registration_source: Optional[str] = None
+    training_mode: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

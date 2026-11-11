@@ -113,27 +113,9 @@ async def assert_branch_manager_assigned(
     M21-S10-T02: Branch managers may only access their assigned branches.
     Platform admins pass through. Other roles are rejected for partner CMS.
     """
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if is_platform_admin(current_user):
-        return []
-    if not is_branch_manager_user(current_user):
-        raise HTTPException(
-            status_code=403,
-            detail="Not allowed to manage collaboration partner CMS",
-        )
-    managed = await get_managed_branch_ids(db, current_user)
-    if not managed:
-        raise HTTPException(
-            status_code=403,
-            detail="No managed branches assigned",
-        )
-    if str(branch_id) not in set(managed):
-        raise HTTPException(
-            status_code=403,
-            detail="You can only manage Partner CMS for your assigned branch",
-        )
-    return managed
+    from utils.partner_org_access import assert_partner_branch_manager_scope
+
+    return await assert_partner_branch_manager_scope(db, current_user, branch_id)
 
 
 async def get_partner_branch_for_cms(

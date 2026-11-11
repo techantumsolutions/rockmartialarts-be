@@ -219,12 +219,63 @@ async def ensure_collections_indexes(db) -> None:
     try:
         await db.razorpay_webhook_events.create_index("event_id", unique=True, sparse=True)
         await db.razorpay_webhook_events.create_index([("created_at", -1)])
-        await db.payments.create_index("razorpay_payment_id", sparse=True)
+        # Unique sparse gateway id prevents double-credit races (confirm + webhook)
+        try:
+            await db.payments.create_index(
+                "razorpay_payment_id",
+                unique=True,
+                sparse=True,
+                name="razorpay_payment_id_unique_sparse",
+            )
+        except Exception:
+            await db.payments.create_index("razorpay_payment_id", sparse=True)
         await db.payments.create_index("razorpay_order_id", sparse=True)
         await db.payments.create_index([("payment_status", 1), ("created_at", -1)])
         await db.payments.create_index([("enrollment_id", 1), ("created_at", -1)], sparse=True)
+        await db.payments.create_index([("student_id", 1), ("created_at", -1)], sparse=True)
+        await db.payments.create_index("id", unique=True, sparse=True)
         await db.payment_reconciliation_runs.create_index([("created_at", -1)])
         await db.system_meta.create_index("key", unique=True)
+        # Hot secondary indexes for related collections
+        try:
+            await db.attendance.create_index(
+                [("student_id", 1), ("date", -1)],
+                sparse=True,
+                name="attendance_student_date",
+            )
+            await db.attendance.create_index(
+                [("branch_id", 1), ("date", -1)],
+                sparse=True,
+                name="attendance_branch_date",
+            )
+        except Exception:
+            logger.exception("attendance index ensure failed (non-fatal)")
+        try:
+            await db.reg_checkout_payments.create_index(
+                "razorpay_order_id", sparse=True, name="reg_checkout_order"
+            )
+            await db.reg_checkout_payments.create_index(
+                "razorpay_payment_id", sparse=True, name="reg_checkout_payment"
+            )
+            await db.reg_checkout_payments.create_index(
+                [("status", 1), ("created_at", -1)], name="reg_checkout_status_created"
+            )
+        except Exception:
+            logger.exception("reg_checkout index ensure failed (non-fatal)")
+        try:
+            await db.export_jobs.create_index([("created_at", -1)])
+            await db.export_jobs.create_index("id", unique=True, sparse=True)
+            await db.export_jobs.create_index([("status", 1), ("created_at", -1)])
+        except Exception:
+            logger.exception("export_jobs index ensure failed (non-fatal)")
+        try:
+            await db.users.create_index("email", unique=True, sparse=True, name="users_email_unique")
+        except Exception:
+            # Duplicates may exist historically — non-unique fallback
+            try:
+                await db.users.create_index("email", sparse=True, name="users_email")
+            except Exception:
+                logger.exception("users email index ensure failed (non-fatal)")
     except Exception:
         # Index creation can fail on insufficient permissions; continue safely.
         logger.exception("Index ensure failed (non-fatal)")

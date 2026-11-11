@@ -93,16 +93,43 @@ async def deliver_email(
     *,
     dry_run: bool = False,
 ) -> ProviderResult:
-    """Email channel stub — logs only until mail provider is wired (S02+)."""
+    """Email via Resend (HTML + plain), with webhook fallback."""
     if dry_run:
         return "skipped", None, None
-    logger.info(
-        "[notification email stub] to=%s subject=%s body=%s",
-        recipient,
-        subject[:80],
-        body[:120],
-    )
-    return "stubbed", "Email provider not configured", None
+    to = (recipient or "").strip()
+    if not to:
+        return "failed", "Missing email recipient", None
+    try:
+        from utils.resend_email import send_html_email_via_resend
+        from utils.email_service import send_custom_email_webhook
+
+        plain = body or ""
+        # Treat body as HTML when it looks like markup; otherwise brand-wrap plain text.
+        if "<" in plain and ">" in plain:
+            html = plain
+            text = None
+        else:
+            text = plain
+            from utils.email_layout import plain_body_to_content_html, wrap_rock_email_html
+
+            html = wrap_rock_email_html(
+                content_html=f'<div style="margin:0;">{plain_body_to_content_html(plain)}</div>',
+                eyebrow="Notification",
+                preheader=(plain.split("\n")[0] if plain else "")[:120],
+            )
+        ok = await send_html_email_via_resend(
+            to, subject or "Notification", html, plain_message=text or plain
+        )
+        if not ok:
+            ok = await send_custom_email_webhook(to, subject or "Notification", html, plain)
+        if ok:
+            return "sent", None, None
+        if not (os.getenv("RESEND_API_KEY") or "").strip():
+            return "stubbed", "RESEND_API_KEY not configured", None
+        return "failed", "Email send failed", None
+    except Exception as exc:
+        logger.exception("Email provider error")
+        return "failed", str(exc)[:200], None
 
 
 async def deliver_channel(
@@ -138,9 +165,16 @@ async def deliver_channel(
 
 
 def provider_info() -> Dict[str, Any]:
+    try:
+        from utils.whatsapp_sender import whatsapp_is_configured
+        wa_ready = whatsapp_is_configured()
+    except Exception:
+        wa_ready = False
     return {
         "sms_provider": (os.getenv("SMS_PROVIDER") or "json").strip().lower(),
         "sms_expects_delivery": sms_provider_expects_delivery(),
         "whatsapp_provider": _whatsapp_provider_name(),
+        "whatsapp_configured": wa_ready,
+        "email_provider": "resend" if (os.getenv("RESEND_API_KEY") or "").strip() else "unset",
         "sms_stub_allowed": _allow_sms_stub(),
     }

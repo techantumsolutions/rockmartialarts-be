@@ -37,6 +37,7 @@ async def ensure_coach_registration_indexes(db=None) -> None:
         await database[COL].create_index("approval_status")
         await database[COL].create_index("user_id")
         await database[COL].create_index("service_location_ids")
+        await database[COL].create_index("training_mode")
         await database[COL].create_index(
             [("registration_source", 1), ("created_at", -1)]
         )
@@ -396,6 +397,7 @@ async def register_coach(
         "is_active": False,
         "user_id": user_id,
         "registration_source": "self",
+        "training_mode": (body.training_mode or "").strip().lower() or None,
         "created_at": now,
         "updated_at": now,
     }

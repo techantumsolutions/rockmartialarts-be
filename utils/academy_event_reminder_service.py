@@ -142,6 +142,21 @@ async def _already_sent(db, registration_id: str, offset_hours: int) -> bool:
     return bool(doc)
 
 
+def _event_ops_context(event: dict, reg: dict, start_at: datetime) -> Dict[str, Any]:
+    when = start_at.strftime("%d-%m-%Y %H:%M")
+    venue = event.get("venue") or reg.get("event_venue") or ""
+    return {
+        "name": str(reg.get("participant_name") or "Participant").strip() or "Participant",
+        "event_title": str(event.get("title") or "Event").strip(),
+        "when": when,
+        "venue": venue,
+        "event_date": when,
+        "event_venue": venue,
+        "registrant_name": str(reg.get("participant_name") or "Participant").strip(),
+        "event_name": str(event.get("title") or "Event").strip(),
+    }
+
+
 async def _write_logs(
     db,
     *,
@@ -152,6 +167,8 @@ async def _write_logs(
     message: str,
     status: str,
     error: Optional[str] = None,
+    channel: str = "sms",
+    channel_results: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
     log = {
@@ -162,10 +179,11 @@ async def _write_logs(
         "participant_name": reg.get("participant_name"),
         "participant_phone": phone,
         "offset_hours": offset_hours,
-        "channel": "sms",
+        "channel": channel,
         "status": status,
         "message": message,
         "error": error,
+        "channel_results": channel_results or {},
         "created_at": now,
     }
     try:
@@ -234,18 +252,55 @@ async def _send_one(
     if dry_run:
         return "dry_run"
 
-    # Email reminder (additive; does not replace SMS)
+    email = str(reg.get("participant_email") or reg.get("email") or "").strip()
+    ctx = _event_ops_context(event, reg, start_at)
+    channel_results: Dict[str, Any] = {}
+
+    # Email + WhatsApp via ops catalog (same as other transactional notifications)
     try:
-        from utils.ops_email_hooks import fire_event_reminder
+        from utils.ops_notify import notify_ops
 
-        await fire_event_reminder(reg, event=event)
-    except Exception:
-        logger.exception("ops email event reminder failed")
+        if email or phone:
+            channel_results["ops"] = await notify_ops(
+                "rock_event_reminder",
+                email=email or None,
+                phone=phone or None,
+                context=ctx,
+                channels=["email", "whatsapp", "sms"],
+            )
+    except Exception as exc:
+        logger.exception("academy event reminder notify_ops failed event=%s", event.get("id"))
+        channel_results["ops_error"] = str(exc)
 
-    tid = _otp_dlt_template_id()
-    ok, err = send_registration_sms(phone, msg, template_id=tid)
-    expects = sms_provider_expects_delivery()
-    if ok:
+    # Dedicated SMS path (DLT template) when a phone is present
+    sms_ok = False
+    sms_err: Optional[str] = None
+    if phone:
+        tid = _otp_dlt_template_id()
+        sms_ok, sms_err = send_registration_sms(phone, msg, template_id=tid)
+        channel_results["sms_dlt"] = {"ok": sms_ok, "error": sms_err}
+        if sms_ok:
+            logger.info(
+                "academy event reminder SMS sent event=%s reg=%s offset_h=%s",
+                event.get("id"),
+                reg.get("id"),
+                offset_hours,
+            )
+        elif sms_err:
+            logger.warning(
+                "academy event reminder SMS failed event=%s reg=%s err=%s",
+                event.get("id"),
+                reg.get("id"),
+                sms_err,
+            )
+
+    ops = channel_results.get("ops") if isinstance(channel_results.get("ops"), dict) else {}
+    ops_any = any(bool(ops.get(k)) for k in ("email", "whatsapp", "sms"))
+    expects_sms = sms_provider_expects_delivery()
+    any_sent = ops_any or sms_ok
+    allow_stub = _allow_sms_stub()
+
+    if any_sent:
         await _write_logs(
             db,
             event=event,
@@ -254,10 +309,18 @@ async def _send_one(
             phone=phone,
             message=msg,
             status="sent",
+            channel="multi",
+            channel_results=channel_results,
+        )
+        logger.info(
+            "academy event reminder delivered event=%s reg=%s channels=%s",
+            event.get("id"),
+            reg.get("id"),
+            channel_results,
         )
         return "sent"
 
-    if _allow_sms_stub() or not expects:
+    if allow_stub and not expects_sms and not email:
         await _write_logs(
             db,
             event=event,
@@ -266,9 +329,25 @@ async def _send_one(
             phone=phone,
             message=msg,
             status="stubbed",
-            error=err or "SMS stub / provider not configured",
+            channel="multi",
+            error="Reminder stub — no providers configured (set ACADEMY_EVENT_ALLOW_SMS_STUB=1)",
+            channel_results=channel_results,
+        )
+        logger.warning(
+            "academy event reminder stubbed (no providers) event=%s reg=%s",
+            event.get("id"),
+            reg.get("id"),
         )
         return "stubbed"
+
+    err_bits = []
+    if sms_err:
+        err_bits.append(f"sms: {sms_err}")
+    if ops:
+        failed_ch = [k for k in ("email", "whatsapp", "sms") if not ops.get(k)]
+        if failed_ch:
+            err_bits.append(f"ops_not_sent={','.join(failed_ch)}")
+    combined_err = "; ".join(err_bits) or "No reminder channel delivered (providers unset or failed)"
 
     await _write_logs(
         db,
@@ -278,7 +357,15 @@ async def _send_one(
         phone=phone,
         message=msg,
         status="failed",
-        error=err,
+        channel="multi",
+        error=combined_err,
+        channel_results=channel_results,
+    )
+    logger.warning(
+        "academy event reminder failed event=%s reg=%s err=%s",
+        event.get("id"),
+        reg.get("id"),
+        combined_err,
     )
     return "failed"
 
@@ -368,7 +455,7 @@ async def process_academy_event_reminders(
                 else:
                     skipped += 1
 
-    return {
+    summary = {
         "message": "Event reminders processed",
         "now": clock.isoformat(),
         "events_considered": len(events),
@@ -380,6 +467,15 @@ async def process_academy_event_reminders(
         "dry_run_count": dry,
         "dry_run": dry_run,
     }
+    logger.info(
+        "academy event reminders cron/trigger complete: sent=%s stubbed=%s failed=%s skipped=%s dry=%s",
+        sent,
+        stubbed,
+        failed,
+        skipped,
+        dry,
+    )
+    return summary
 
 
 async def run_academy_event_reminders(

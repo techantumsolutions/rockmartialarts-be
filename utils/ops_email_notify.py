@@ -35,32 +35,30 @@ def _fill(template: str, context: Dict[str, Any], *, escape: bool = False) -> st
     return _VAR_RE.sub(repl, template or "")
 
 
-def _plain_to_html(plain: str, *, button_label: str = "", button_url: str = "") -> str:
-    body = html.escape(plain or "").replace("\n", "<br>\n")
-    cta = ""
-    if button_label and button_url:
-        cta = f"""
-        <div style="text-align:center;margin:28px 0 8px;">
-          <a href="{html.escape(button_url, quote=True)}"
-             style="display:inline-block;background:#111827;color:#fff;text-decoration:none;
-                    padding:12px 22px;border-radius:8px;font-weight:600;font-size:15px;">
-            {html.escape(button_label)}
-          </a>
-        </div>
-        """
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2937;">
-  <div style="max-width:560px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);">
-    <div style="background:#111827;padding:22px 24px;text-align:center;">
-      <div style="color:#fff;font-size:18px;font-weight:700;letter-spacing:.4px;">ROCK MARTIAL ARTS ACADEMY</div>
-    </div>
-    <div style="padding:28px 26px;font-size:15px;line-height:1.65;color:#374151;">{body}{cta}</div>
-    <div style="padding:14px 26px 22px;font-size:12px;color:#9ca3af;border-top:1px solid #f3f4f6;">
-      This is an automated message from Rock Martial Arts Academy.
-    </div>
-  </div>
-</body></html>"""
+def _plain_to_html(
+    plain: str,
+    *,
+    button_label: str = "",
+    button_url: str = "",
+    eyebrow: str = "",
+    accent: str = "",
+) -> str:
+    from utils.email_layout import (
+        ACCENT_GOLD,
+        ACCENT_RED,
+        plain_body_to_content_html,
+        wrap_rock_email_html,
+    )
+
+    body = plain_body_to_content_html(plain)
+    return wrap_rock_email_html(
+        content_html=f'<div style="margin:0;">{body}</div>',
+        eyebrow=eyebrow or "Notification",
+        cta_label=button_label or "",
+        cta_url=button_url or "",
+        accent=accent or ACCENT_RED,
+        preheader=(plain or "").split("\n")[0][:120],
+    )
 
 
 def _normalize_emails(emails: Optional[Sequence[str] | str]) -> List[str]:
@@ -225,7 +223,12 @@ async def notify_ops_email(
         button_url = _fill(tmpl.get("button_url") or "", ctx, escape=False).strip()
         button_label = (tmpl.get("button_label") or "").strip()
         subject = (subject_override or tmpl.get("title") or "Rock Martial Arts").strip()
-        html_message = _plain_to_html(plain, button_label=button_label, button_url=button_url)
+        html_message = _plain_to_html(
+            plain,
+            button_label=button_label,
+            button_url=button_url,
+            eyebrow=(tmpl.get("title") or "Notification")[:60],
+        )
 
         from utils.resend_email import send_html_email_via_resend
         from utils.email_service import send_custom_email_webhook

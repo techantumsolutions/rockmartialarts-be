@@ -105,24 +105,36 @@ async def write_export_audit(
     row_count: int,
     fmt: str,
     mode: str = "sync",
-) -> None:
+    job_id: Optional[str] = None,
+) -> Optional[str]:
+    """Record who exported what and when. Returns audit log id when inserted."""
+    audit_id = str(uuid.uuid4())
     try:
         db = get_db()
         await db.export_audit_logs.insert_one(
             {
-                "id": str(uuid.uuid4()),
+                "id": audit_id,
                 "user_id": current_user.get("id"),
+                "user_email": current_user.get("email"),
+                "user_name": current_user.get("full_name")
+                or f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip()
+                or None,
                 "role": current_user.get("role"),
                 "report_type": report_type,
                 "filters": filters,
                 "row_count": row_count,
                 "format": fmt,
                 "mode": mode,
+                "job_id": job_id,
                 "created_at": datetime.utcnow(),
             }
         )
+        return audit_id
     except Exception:
-        pass
+        import logging
+
+        logging.exception("Failed to write export audit log for %s", report_type)
+        return None
 
 
 async def _enrich_named_entity_rows(db, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -275,16 +287,21 @@ async def export_operational(
     if total > EXPORT_ROW_THRESHOLD and background_tasks is not None:
         job_id = str(uuid.uuid4())
         download_token = str(uuid.uuid4())
+        audit_id = await write_export_audit(
+            current_user, report_type, filters, total, fmt, mode="async", job_id=job_id
+        )
         await db.export_jobs.insert_one(
             {
                 "id": job_id,
                 "user_id": current_user.get("id"),
+                "user_email": current_user.get("email"),
                 "role": current_user.get("role"),
                 "report_type": report_type,
                 "status": "pending",
                 "format": fmt,
                 "filters": filters,
                 "download_token": download_token,
+                "audit_id": audit_id,
                 "created_at": datetime.utcnow(),
                 "expires_at": datetime.utcnow() + timedelta(hours=EXPORT_JOB_TTL_HOURS),
             }
@@ -300,7 +317,6 @@ async def export_operational(
             report_type,
             filters,
         )
-        await write_export_audit(current_user, report_type, filters, total, fmt, mode="async")
         return {"async": True, "job_id": job_id, "status": "pending", "estimated_rows": total}
 
     rows = await coll.find(q).sort("created_at", -1).limit(10000).to_list(length=10000)
@@ -313,7 +329,14 @@ async def export_operational(
     content = _to_csv(serialized, fieldnames) if fmt == "csv" else _to_excel_xml(serialized, fieldnames)
     filename = f"{report_type}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.{'csv' if fmt == 'csv' else 'xls'}"
     await write_export_audit(current_user, report_type, filters, len(serialized), fmt, mode="sync")
-    return {"content": content, "filename": filename, "row_count": len(serialized), "async": False}
+    media = "text/csv" if fmt == "csv" else "application/vnd.ms-excel"
+    return {
+        "content": content,
+        "filename": filename,
+        "row_count": len(serialized),
+        "async": False,
+        "content_type": media,
+    }
 
 
 async def _run_export_job(
@@ -370,10 +393,172 @@ async def get_export_job(job_id: str, current_user: dict) -> dict:
         "filename": job.get("filename"),
         "row_count": job.get("row_count"),
         "format": job.get("format"),
+        "report_type": job.get("report_type"),
+        "filters": job.get("filters"),
         "error": job.get("error"),
         "created_at": job.get("created_at"),
         "completed_at": job.get("completed_at"),
+        "expires_at": job.get("expires_at"),
     }
+
+
+async def list_attendance_operational(
+    current_user: dict,
+    *,
+    branch_id: Optional[str] = None,
+    course_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status: Optional[str] = None,
+    record_type: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> dict:
+    """Paginated attendance rows for the unified admin reports matrix."""
+    from controllers.attendance_controller import AttendanceController
+
+    cap = min(max(skip + limit, limit), 1000)
+    result = await AttendanceController.get_attendance_reports(
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        current_user=current_user,
+        limit=cap,
+        status=status,
+        record_type=record_type or "all",
+    )
+    records = result.get("attendance_records") or []
+    total = int(result.get("total") or len(records))
+    page = records[skip : skip + limit]
+    return {
+        "rows": page,
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "summary": result.get("summary"),
+    }
+
+
+async def export_attendance_operational(
+    current_user: dict,
+    *,
+    branch_id: Optional[str] = None,
+    course_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status: Optional[str] = None,
+    record_type: Optional[str] = None,
+    format: str = "csv",
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> Any:
+    from controllers.attendance_controller import AttendanceController
+    from utils.attendance_report_query import build_attendance_export
+
+    fmt = (format or "csv").lower()
+    if fmt not in ("csv", "excel"):
+        raise HTTPException(status_code=400, detail="format must be csv or excel")
+
+    filters = {
+        "branch_id": branch_id,
+        "course_id": course_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "status": status,
+        "record_type": record_type or "all",
+    }
+
+    preview = await AttendanceController.get_attendance_reports(
+        branch_id=branch_id,
+        course_id=course_id,
+        start_date=start_date,
+        end_date=end_date,
+        current_user=current_user,
+        limit=EXPORT_ROW_THRESHOLD + 1,
+        status=status,
+        record_type=record_type or "all",
+    )
+    records = preview.get("attendance_records") or []
+    total = len(records)
+
+    if total > EXPORT_ROW_THRESHOLD and background_tasks is not None:
+        job_id = str(uuid.uuid4())
+        audit_id = await write_export_audit(
+            current_user, "attendance", filters, total, fmt, mode="async", job_id=job_id
+        )
+        db = get_db()
+        await db.export_jobs.insert_one(
+            {
+                "id": job_id,
+                "user_id": current_user.get("id"),
+                "user_email": current_user.get("email"),
+                "role": current_user.get("role"),
+                "report_type": "attendance",
+                "status": "pending",
+                "format": fmt,
+                "filters": filters,
+                "audit_id": audit_id,
+                "kind": "attendance",
+                "created_at": datetime.utcnow(),
+                "expires_at": datetime.utcnow() + timedelta(hours=EXPORT_JOB_TTL_HOURS),
+            }
+        )
+        background_tasks.add_task(
+            _run_attendance_export_job,
+            job_id,
+            current_user,
+            filters,
+            fmt,
+        )
+        return {"async": True, "job_id": job_id, "status": "pending", "estimated_rows": total}
+
+    export = build_attendance_export(records, format=fmt)
+    await write_export_audit(current_user, "attendance", filters, total, fmt, mode="sync")
+    return {
+        "content": export["content"],
+        "filename": export["filename"],
+        "row_count": total,
+        "async": False,
+        "content_type": export.get("content_type"),
+    }
+
+
+async def _run_attendance_export_job(job_id: str, current_user: dict, filters: dict, fmt: str) -> None:
+    from controllers.attendance_controller import AttendanceController
+    from utils.attendance_report_query import build_attendance_export
+
+    db = get_db()
+    try:
+        await db.export_jobs.update_one({"id": job_id}, {"$set": {"status": "processing"}})
+        attendance_data = await AttendanceController.get_attendance_reports(
+            branch_id=filters.get("branch_id"),
+            course_id=filters.get("course_id"),
+            start_date=filters.get("start_date"),
+            end_date=filters.get("end_date"),
+            current_user=current_user,
+            limit=50000,
+            status=filters.get("status"),
+            record_type=filters.get("record_type") or "all",
+        )
+        rows = attendance_data.get("attendance_records") or []
+        export = build_attendance_export(rows, format=fmt)
+        await db.export_jobs.update_one(
+            {"id": job_id},
+            {
+                "$set": {
+                    "status": "ready",
+                    "content": export["content"],
+                    "row_count": len(rows),
+                    "filename": export.get("filename") or f"attendance_{job_id[:8]}.csv",
+                    "completed_at": datetime.utcnow(),
+                }
+            },
+        )
+    except Exception as e:
+        await db.export_jobs.update_one(
+            {"id": job_id},
+            {"$set": {"status": "failed", "error": str(e), "completed_at": datetime.utcnow()}},
+        )
 
 
 async def download_export_job(job_id: str, current_user: dict) -> Response:

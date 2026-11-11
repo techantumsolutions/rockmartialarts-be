@@ -288,7 +288,11 @@ async def list_demo_availability(
 
 
 async def list_demo_availability_options() -> Dict[str, Any]:
-    """Public: branches/courses that currently have at least one active demo schedule."""
+    """
+    Public filter options for book-demo.
+    Prefer branches/courses that have active demo schedules; if none,
+    fall back to all active public branches and courses so the dropdowns work.
+    """
     db = get_db()
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection not available")
@@ -304,11 +308,36 @@ async def list_demo_availability_options() -> Dict[str, Any]:
         if cid:
             courses[cid] = str(s.get("course_name") or cid)
 
+    if not branches:
+        async for b in db.branches.find(
+            {"$or": [{"is_active": True}, {"is_active": {"$exists": False}}]},
+            {"id": 1, "name": 1, "branch.name": 1},
+        ).limit(200):
+            bid = str(b.get("id") or "")
+            if not bid:
+                continue
+            name = (
+                ((b.get("branch") or {}) if isinstance(b.get("branch"), dict) else {}).get("name")
+                or b.get("name")
+                or bid
+            )
+            branches[bid] = str(name).strip() or bid
+
+    if not courses:
+        async for c in db.courses.find(
+            {"$or": [{"is_active": True}, {"status": "active"}, {"is_active": {"$exists": False}}]},
+            {"id": 1, "title": 1, "name": 1},
+        ).limit(200):
+            cid = str(c.get("id") or "")
+            if not cid:
+                continue
+            courses[cid] = str(c.get("title") or c.get("name") or cid).strip() or cid
+
     return {
         "branches": [
-            {"id": k, "name": v} for k, v in sorted(branches.items(), key=lambda x: x[1])
+            {"id": k, "name": v} for k, v in sorted(branches.items(), key=lambda x: x[1].lower())
         ],
         "courses": [
-            {"id": k, "name": v} for k, v in sorted(courses.items(), key=lambda x: x[1])
+            {"id": k, "name": v} for k, v in sorted(courses.items(), key=lambda x: x[1].lower())
         ],
     }

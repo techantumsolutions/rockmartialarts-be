@@ -165,3 +165,7 @@ class BranchUpdate(BaseModel):
     allows_collaboration: Optional[bool] = None
     is_collaboration_partner: Optional[bool] = None
     is_active: Optional[bool] = None
+    description: Optional[str] = None
+    map_link: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    gallery_images: Optional[List[str]] = None

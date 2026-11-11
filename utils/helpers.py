@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime, date
 from bson import ObjectId
 import logging
+import os
 
 from models.activitylog_models import ActivityLog
 from models.notification_models import NotificationLog, NotificationType
@@ -70,15 +71,58 @@ async def log_activity(
     log_entry_dict = serialize_doc(log_entry.dict())
     await db.activity_logs.insert_one(log_entry_dict)
 
+def _allow_sms_or_whatsapp_stub() -> bool:
+    for key in (
+        "ALLOW_SMS_STUB",
+        "NOTIFICATION_ALLOW_SMS_STUB",
+        "REG_CHECKOUT_ALLOW_SMS_STUB",
+    ):
+        if os.getenv(key, "").lower() in ("1", "true", "yes"):
+            return True
+    env = (os.getenv("ENV") or os.getenv("NODE_ENV") or "").lower()
+    if env in ("production", "prod"):
+        return False
+    return os.getenv("ENVIRONMENT", "development").lower() not in ("production", "prod")
+
+
 async def send_sms(phone: str, message: str) -> bool:
-    """Mock SMS sending - to be replaced with Firebase integration"""
-    logging.info(f"Mock SMS sent to {phone}: {message}")
-    return True
+    """Send SMS via registration checkout provider when configured; never fake success in production."""
+    from utils.reg_checkout_sms import send_registration_sms, sms_provider_expects_delivery
+
+    ok, err = send_registration_sms(phone, message)
+    if ok:
+        return True
+    if sms_provider_expects_delivery():
+        logging.warning("SMS send failed to %s: %s", phone, err or "unknown error")
+        return False
+    if _allow_sms_or_whatsapp_stub():
+        logging.info("SMS stub (no provider): message not sent to %s", phone)
+        return True
+    logging.warning("SMS provider not configured; refusing to report success for %s", phone)
+    return False
+
 
 async def send_whatsapp(phone: str, message: str) -> bool:
-    """Mock WhatsApp sending - to be replaced with zaptra.in integration"""
-    logging.info(f"Mock WhatsApp sent to {phone}: {message}")
-    return True
+    """WhatsApp delivery via Meta Cloud / webhook when configured; stub only when allowed."""
+    from utils.whatsapp_sender import send_whatsapp_message, whatsapp_is_configured, whatsapp_provider_name
+
+    if whatsapp_is_configured():
+        ok, err = await send_whatsapp_message(phone, message)
+        if ok:
+            return True
+        logging.warning("WhatsApp send failed to %s: %s", phone, err or "unknown error")
+        return False
+
+    provider = whatsapp_provider_name()
+    if _allow_sms_or_whatsapp_stub():
+        logging.info("WhatsApp stub (provider=%s): message not sent to %s", provider or "unset", phone)
+        return True
+    logging.warning(
+        "WhatsApp provider not configured (WHATSAPP_PROVIDER=%s); refusing fake success for %s",
+        provider or "unset",
+        phone,
+    )
+    return False
 
 async def check_and_send_stock_alert(product: dict, branch_id: str, new_stock_level: int):
     """Checks if stock is low and sends an alert if needed."""

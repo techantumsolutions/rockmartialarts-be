@@ -7,6 +7,75 @@ from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.branch_courses import available_course_ids_for_branch, unique_course_ids
 
+_SUCCESS_PAYMENT_STATUSES = {"paid", "completed", "success", "captured"}
+
+
+async def _branch_monthly_revenue(db, branch_id: str) -> float:
+    """Sum successful payment amounts for the branch in the current UTC month."""
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_date_filter = {
+        "$or": [
+            {"payment_date": {"$gte": month_start}},
+            {
+                "$and": [
+                    {"$or": [{"payment_date": {"$exists": False}}, {"payment_date": None}]},
+                    {"created_at": {"$gte": month_start}},
+                ]
+            },
+        ]
+    }
+    branch_filter = {
+        "$or": [
+            {"branch_id": branch_id},
+            {"branch_details.branch_id": branch_id},
+        ]
+    }
+    status_filter = {
+        "$and": [
+            month_date_filter,
+            branch_filter,
+            {
+                "$or": [
+                    {"payment_status": {"$in": list(_SUCCESS_PAYMENT_STATUSES)}},
+                    {"status": {"$in": ["success", "completed"]}},
+                ]
+            },
+            {
+                "payment_status": {
+                    "$nin": [
+                        "cancelled",
+                        "canceled",
+                        "failed",
+                        "refunded",
+                        "pending",
+                        "processing",
+                    ]
+                }
+            },
+        ]
+    }
+    pipeline = [
+        {"$match": status_filter},
+        {
+            "$group": {
+                "_id": None,
+                "total": {
+                    "$sum": {
+                        "$convert": {
+                            "input": "$amount",
+                            "to": "double",
+                            "onError": 0.0,
+                            "onNull": 0.0,
+                        }
+                    }
+                },
+            }
+        },
+    ]
+    result = await db.payments.aggregate(pipeline).to_list(1)
+    return float(result[0]["total"]) if result else 0.0
+
+
 class BranchesWithCoursesController:
     @staticmethod
     async def get_branches_with_courses(
@@ -401,8 +470,7 @@ class BranchesWithCoursesController:
         unique_students_result = await db.enrollments.aggregate(unique_students_pipeline).to_list(length=1)
         unique_student_count = unique_students_result[0]["unique_students"] if unique_students_result else 0
 
-        # Calculate monthly revenue (placeholder - would need payment data)
-        monthly_revenue = 0
+        monthly_revenue = await _branch_monthly_revenue(db, branch_id)
 
         # Structure the response to match frontend expectations
         branch_details = {

@@ -1,12 +1,14 @@
 """White-label partner organization APIs."""
 
 from models.partner_org_models import (
+    PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
     PartnerProfileUpdate,
     PartnerSetPassword,
+    PartnerValidityUpdate,
 )
 from utils import partner_org_service as svc
 
@@ -65,3 +67,23 @@ class PartnerOrgController:
     @staticmethod
     async def update_me(body: PartnerProfileUpdate, current_user: dict):
         return await svc.update_partner_me(body, current_user)
+
+    @staticmethod
+    async def update_validity(
+        partner_org_id: str, body: PartnerValidityUpdate, current_user: dict
+    ):
+        return await svc.update_partner_validity(partner_org_id, body, current_user)
+
+    @staticmethod
+    async def get_feature_permissions(partner_org_id: str, current_user: dict):
+        return await svc.get_partner_feature_permissions(partner_org_id, current_user)
+
+    @staticmethod
+    async def patch_feature_permissions(
+        partner_org_id: str, body: PartnerFeaturePermissionsUpdate, current_user: dict
+    ):
+        return await svc.update_partner_feature_permissions(partner_org_id, body, current_user)
+
+    @staticmethod
+    async def get_my_feature_permissions(current_user: dict):
+        return await svc.get_partner_feature_permissions_for_me(current_user)

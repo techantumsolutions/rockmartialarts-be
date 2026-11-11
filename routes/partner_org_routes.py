@@ -11,12 +11,14 @@ from controllers.partner_org_branding_controller import (
 )
 from models.partner_org_branding_models import PartnerOrgBrandingUpsert
 from models.partner_org_models import (
+    PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
     PartnerProfileUpdate,
     PartnerSetPassword,
+    PartnerValidityUpdate,
 )
 from models.user_models import UserRole
 from utils.unified_auth import require_role_unified
@@ -164,3 +166,39 @@ async def set_partner_status(
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
 ):
     return await PartnerOrgController.set_active(partner_org_id, body, current_user)
+
+
+# Static "/me/..." paths MUST be registered before "/{partner_org_id}/..."
+# or FastAPI will treat "me" as a partner_org_id.
+@router.get("/me/feature-permissions")
+async def get_my_partner_feature_permissions(
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner admin read-only feature flags for dashboard nav (from DB)."""
+    return await PartnerOrgController.get_my_feature_permissions(current_user)
+
+
+@router.patch("/{partner_org_id}/validity")
+async def set_partner_validity(
+    partner_org_id: str,
+    body: PartnerValidityUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgController.update_validity(partner_org_id, body, current_user)
+
+
+@router.get("/{partner_org_id}/feature-permissions")
+async def get_partner_feature_permissions(
+    partner_org_id: str,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgController.get_feature_permissions(partner_org_id, current_user)
+
+
+@router.patch("/{partner_org_id}/feature-permissions")
+async def patch_partner_feature_permissions(
+    partner_org_id: str,
+    body: PartnerFeaturePermissionsUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgController.patch_feature_permissions(partner_org_id, body, current_user)

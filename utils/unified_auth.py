@@ -200,17 +200,17 @@ def require_role_unified(allowed_roles: List[UserRole], allow_inactive_coach: bo
                 # when SUPER_ADMIN is in the allowed list (tenant-scoped in controllers).
                 if UserRole.SUPER_ADMIN not in allowed_roles:
                     raise HTTPException(status_code=403, detail="Insufficient permissions")
-            # Block disabled partner orgs
+            # Block disabled / expired partner orgs
             org_id = (current_user.get("partner_org_id") or "").strip()
             if org_id:
+                from utils.partner_org_access import partner_org_blocks_access
+
                 _db = get_db()
-                org = await _db.partner_organizations.find_one(
-                    {"id": org_id}, {"is_active": 1, "status": 1}
-                )
-                if not org or org.get("is_active") is False or org.get("status") == "disabled":
+                org = await _db.partner_organizations.find_one({"id": org_id})
+                if not org or partner_org_blocks_access(org):
                     raise HTTPException(
                         status_code=403,
-                        detail="This partner account is disabled. Please contact administrator.",
+                        detail="This partner account is disabled or expired. Please contact administrator.",
                     )
         else:
             # Fallback for any other roles

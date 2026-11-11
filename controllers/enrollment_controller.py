@@ -189,19 +189,83 @@ class EnrollmentController:
         course_map = {c["id"]: c for c in courses}
         branch_map = {b["id"]: b for b in branches}
 
+        def _clean_name(value) -> str:
+            name = " ".join(str(value or "").split()).strip()
+            if not name:
+                return ""
+            if name.lower() in {"unknown", "unknown student", "customer", "student", "n/a", "na", "-"}:
+                return ""
+            return name
+
+        def _name_from_user(u: dict) -> str:
+            if not u:
+                return ""
+            return _clean_name(
+                u.get("full_name")
+                or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+                or u.get("name")
+                or u.get("email")
+            )
+
+        # Fallback: invoice / payment customer names for deleted or orphaned student users
+        missing_student_ids = [sid for sid in student_ids if not _name_from_user(user_map.get(sid))]
+        invoice_name_map: dict = {}
+        payment_name_map: dict = {}
+        if missing_student_ids:
+            try:
+                invoices = await db.invoices.find(
+                    {"student_id": {"$in": missing_student_ids}}
+                ).to_list(length=max(len(missing_student_ids) * 3, 50))
+                for inv in invoices:
+                    sid = inv.get("student_id")
+                    if not sid or sid in invoice_name_map:
+                        continue
+                    cust = inv.get("customer") if isinstance(inv.get("customer"), dict) else {}
+                    name = _clean_name(
+                        inv.get("student_name")
+                        or inv.get("customer_name")
+                        or inv.get("billing_name")
+                        or cust.get("name")
+                    )
+                    if name:
+                        invoice_name_map[sid] = name
+            except Exception:
+                invoice_name_map = {}
+            still_missing = [sid for sid in missing_student_ids if sid not in invoice_name_map]
+            if still_missing:
+                try:
+                    payments = await db.payments.find(
+                        {"student_id": {"$in": still_missing}}
+                    ).to_list(length=max(len(still_missing) * 3, 50))
+                    for pay in payments:
+                        sid = pay.get("student_id")
+                        if not sid or sid in payment_name_map:
+                            continue
+                        cust = pay.get("customer") if isinstance(pay.get("customer"), dict) else {}
+                        meta = pay.get("metadata") if isinstance(pay.get("metadata"), dict) else {}
+                        name = _clean_name(
+                            pay.get("student_name")
+                            or pay.get("customer_name")
+                            or cust.get("name")
+                            or meta.get("student_name")
+                            or meta.get("customer_name")
+                        )
+                        if name:
+                            payment_name_map[sid] = name
+                except Exception:
+                    payment_name_map = {}
+
         enriched = []
         for e in enrollments:
             doc = serialize_doc(e)
-            u = user_map.get(e.get("student_id"))
-            if u:
-                doc["student_name"] = (
-                    u.get("full_name")
-                    or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
-                    or u.get("email")
-                    or "Student"
-                )
-            else:
-                doc["student_name"] = "Unknown student"
+            sid = e.get("student_id")
+            u = user_map.get(sid)
+            doc["student_name"] = (
+                _name_from_user(u)
+                or invoice_name_map.get(sid)
+                or payment_name_map.get(sid)
+                or "Unknown student"
+            )
 
             c = course_map.get(e.get("course_id"))
             if c:

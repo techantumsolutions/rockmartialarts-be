@@ -11,7 +11,7 @@ from enum import Enum
 from typing import List, Optional, Literal
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TrainingRequestType(str, Enum):
@@ -416,9 +416,25 @@ class CoachTrainingRequestResponse(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2000)
 
 
+class NotifiedCoachEntry(BaseModel):
+    coach_id: str
+    coach_name: Optional[str] = None
+    notified_at: Optional[datetime] = None
+    status: str = "pending"
+
+
 class TrainingRequestCoachAssign(BaseModel):
-    coach_id: str = Field(..., min_length=1, max_length=64)
+    coach_id: Optional[str] = Field(default=None, max_length=64)
+    coach_ids: Optional[List[str]] = Field(default=None)
     note: Optional[str] = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _require_coach_target(self) -> "TrainingRequestCoachAssign":
+        ids = [str(i).strip() for i in (self.coach_ids or []) if str(i).strip()]
+        single = (self.coach_id or "").strip()
+        if not ids and not single:
+            raise ValueError("coach_id or coach_ids is required")
+        return self
 
 
 class TrainingRequestDocument(BaseModel):
@@ -435,6 +451,8 @@ class TrainingRequestDocument(BaseModel):
     details: dict = Field(default_factory=dict)
     assigned_coach_id: Optional[str] = None
     assigned_coach_name: Optional[str] = None
+    notified_coach_ids: List[str] = Field(default_factory=list)
+    notified_coaches: List[NotifiedCoachEntry] = Field(default_factory=list)
     assigned_at: Optional[datetime] = None
     assigned_by: Optional[str] = None
     coach_assignment_status: Optional[str] = None

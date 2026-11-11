@@ -62,11 +62,22 @@ from utils.collaboration_partner import (
     partner_cms_permissions,
 )
 from utils.database import get_db
+from utils.partner_org_access import assert_partner_branch_cms_access
 from utils.unified_auth import require_role_unified
 
 router = APIRouter()
 
 _ADMIN = [UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]
+
+
+async def ensure_partner_cms_branch(
+    branch_id: str,
+    current_user: dict = Depends(require_role_unified(_ADMIN)),
+) -> dict:
+    """M21-S10: route-level gate before partner CMS handlers."""
+    db = get_db()
+    await assert_partner_branch_cms_access(db, current_user, branch_id)
+    return current_user
 
 
 @router.get("/public/partners")
@@ -151,7 +162,7 @@ async def api_collaboration_partner_status(
 @router.get("/branches/{branch_id}/require-enabled")
 async def api_require_partner_enabled(
     branch_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """403 when branch is not a collaboration partner — used by partner CMS."""
     db = get_db()
@@ -182,7 +193,7 @@ async def api_list_partner_branches(
 @router.get("/branches/{branch_id}/profile")
 async def api_get_partner_profile(
     branch_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Get partner business/contact/agreement profile (403 if not partner)."""
     return await CollaborationPartnerController.get_profile(
@@ -194,7 +205,7 @@ async def api_get_partner_profile(
 async def api_upsert_partner_profile(
     branch_id: str,
     body: PartnerProfileUpsert,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Create or update partner profile. Auto-assigns Partner ID on first save."""
     return await CollaborationPartnerController.upsert_profile(
@@ -205,7 +216,7 @@ async def api_upsert_partner_profile(
 @router.get("/branches/{branch_id}/branding")
 async def api_get_partner_branding(
     branch_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Get partner branding & content (403 if not partner). Scoped to this branch only."""
     return await CollaborationPartnerBrandingController.get_branding(
@@ -217,7 +228,7 @@ async def api_get_partner_branding(
 async def api_upsert_partner_branding(
     branch_id: str,
     body: PartnerBrandingUpsert,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Create or update partner branding for the selected collaboration branch only."""
     return await CollaborationPartnerBrandingController.upsert_branding(
@@ -234,7 +245,7 @@ async def api_public_partner_seo(branch_id: str):
 @router.get("/branches/{branch_id}/seo")
 async def api_get_partner_seo(
     branch_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Get partner SEO (403 if not partner). Scoped to this branch only."""
     return await CollaborationPartnerSeoController.get_seo(
@@ -246,7 +257,7 @@ async def api_get_partner_seo(
 async def api_upsert_partner_seo(
     branch_id: str,
     body: PartnerSeoUpsert,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Create or update partner SEO for the selected collaboration branch only."""
     return await CollaborationPartnerSeoController.upsert_seo(
@@ -260,7 +271,7 @@ async def api_list_partner_masters(
     include_inactive: bool = Query(False),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """List masters/experts for a collaboration partner branch."""
     return await CollaborationPartnerMasterController.list_masters(
@@ -276,7 +287,7 @@ async def api_list_partner_masters(
 async def api_create_partner_master(
     branch_id: str,
     body: PartnerMasterCreate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Create a master/expert for the selected partner branch only."""
     return await CollaborationPartnerMasterController.create_master(
@@ -288,7 +299,7 @@ async def api_create_partner_master(
 async def api_get_partner_master(
     branch_id: str,
     master_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerMasterController.get_master(
         branch_id, master_id, current_user=current_user
@@ -300,7 +311,7 @@ async def api_update_partner_master(
     branch_id: str,
     master_id: str,
     body: PartnerMasterUpdate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerMasterController.update_master(
         branch_id, master_id, body, current_user=current_user
@@ -312,7 +323,7 @@ async def api_delete_partner_master(
     branch_id: str,
     master_id: str,
     hard: bool = Query(False),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Soft-deactivate by default; pass hard=true to permanently delete."""
     return await CollaborationPartnerMasterController.delete_master(
@@ -326,7 +337,7 @@ async def api_list_partner_gallery(
     include_inactive: bool = Query(False),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """List gallery items for a collaboration partner branch."""
     return await CollaborationPartnerGalleryController.list_items(
@@ -342,7 +353,7 @@ async def api_list_partner_gallery(
 async def api_create_partner_gallery_item(
     branch_id: str,
     body: PartnerGalleryItemCreate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerGalleryController.create_item(
         branch_id, body, current_user=current_user
@@ -353,7 +364,7 @@ async def api_create_partner_gallery_item(
 async def api_reorder_partner_gallery(
     branch_id: str,
     body: PartnerGalleryReorderRequest,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Update display_order for multiple gallery items (same branch only)."""
     return await CollaborationPartnerGalleryController.reorder_items(
@@ -365,7 +376,7 @@ async def api_reorder_partner_gallery(
 async def api_get_partner_gallery_item(
     branch_id: str,
     item_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerGalleryController.get_item(
         branch_id, item_id, current_user=current_user
@@ -377,7 +388,7 @@ async def api_update_partner_gallery_item(
     branch_id: str,
     item_id: str,
     body: PartnerGalleryItemUpdate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerGalleryController.update_item(
         branch_id, item_id, body, current_user=current_user
@@ -389,7 +400,7 @@ async def api_delete_partner_gallery_item(
     branch_id: str,
     item_id: str,
     hard: bool = Query(False),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     """Soft-deactivate by default; pass hard=true to permanently delete."""
     return await CollaborationPartnerGalleryController.delete_item(
@@ -418,7 +429,7 @@ async def api_list_partner_testimonials(
     status: Optional[str] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.list_items(
         branch_id,
@@ -434,7 +445,7 @@ async def api_list_partner_testimonials(
 async def api_create_partner_testimonial(
     branch_id: str,
     body: PartnerTestimonialCreate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.create_item(
         branch_id, body, current_user=current_user
@@ -445,7 +456,7 @@ async def api_create_partner_testimonial(
 async def api_reorder_partner_testimonials(
     branch_id: str,
     body: PartnerTestimonialReorderRequest,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.reorder_items(
         branch_id, body, current_user=current_user
@@ -456,7 +467,7 @@ async def api_reorder_partner_testimonials(
 async def api_get_partner_testimonial(
     branch_id: str,
     item_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.get_item(
         branch_id, item_id, current_user=current_user
@@ -468,7 +479,7 @@ async def api_update_partner_testimonial(
     branch_id: str,
     item_id: str,
     body: PartnerTestimonialUpdate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.update_item(
         branch_id, item_id, body, current_user=current_user
@@ -480,7 +491,7 @@ async def api_delete_partner_testimonial(
     branch_id: str,
     item_id: str,
     hard: bool = Query(False),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTestimonialController.delete_item(
         branch_id, item_id, hard=hard, current_user=current_user
@@ -507,7 +518,7 @@ async def api_list_partner_team(
     include_inactive: bool = Query(False),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=200),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTeamController.list_members(
         branch_id,
@@ -522,7 +533,7 @@ async def api_list_partner_team(
 async def api_create_partner_team_member(
     branch_id: str,
     body: PartnerTeamMemberCreate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTeamController.create_member(
         branch_id, body, current_user=current_user
@@ -533,7 +544,7 @@ async def api_create_partner_team_member(
 async def api_get_partner_team_member(
     branch_id: str,
     member_id: str,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTeamController.get_member(
         branch_id, member_id, current_user=current_user
@@ -545,7 +556,7 @@ async def api_update_partner_team_member(
     branch_id: str,
     member_id: str,
     body: PartnerTeamMemberUpdate,
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTeamController.update_member(
         branch_id, member_id, body, current_user=current_user
@@ -557,7 +568,7 @@ async def api_delete_partner_team_member(
     branch_id: str,
     member_id: str,
     hard: bool = Query(False),
-    current_user: dict = Depends(require_role_unified(_ADMIN)),
+    current_user: dict = Depends(ensure_partner_cms_branch),
 ):
     return await CollaborationPartnerTeamController.delete_member(
         branch_id, member_id, hard=hard, current_user=current_user

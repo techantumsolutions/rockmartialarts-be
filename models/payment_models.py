@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 from typing import Optional, Dict, Any, Literal, List, Union
 import uuid
@@ -108,6 +108,27 @@ class RegistrationPaymentCreate(BaseModel):
     razorpay_signature: Optional[str] = None
     # Optional physical cash notes / receipt reference
     cash_notes: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_razorpay_aliases(cls, data: Any):
+        """Accept FE aliases payment_id/order_id/signature → razorpay_*."""
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if not out.get("razorpay_payment_id"):
+            alias = out.get("payment_id") or out.get("razorpayPaymentId")
+            if alias:
+                out["razorpay_payment_id"] = alias
+        if not out.get("razorpay_order_id"):
+            alias = out.get("order_id") or out.get("razorpayOrderId")
+            if alias:
+                out["razorpay_order_id"] = alias
+        if not out.get("razorpay_signature"):
+            alias = out.get("signature") or out.get("razorpaySignature")
+            if alias:
+                out["razorpay_signature"] = alias
+        return out
 
 
 class PhysicalHandCash(BaseModel):

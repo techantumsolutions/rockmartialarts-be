@@ -285,6 +285,8 @@ class PartnerOrgBrandingController:
 
     @staticmethod
     async def public_directory(q: Optional[str] = None, skip: int = 0, limit: int = 50):
+        from utils.partner_org_access import compute_partner_effective_status
+
         db = get_db()
         query: Dict[str, Any] = {
             "is_active": True,
@@ -297,15 +299,15 @@ class PartnerOrgBrandingController:
                 {"slug": {"$regex": term, "$options": "i"}},
                 {"address": {"$regex": term, "$options": "i"}},
             ]
-        total = await db[ORG_COL].count_documents(query)
-        orgs = (
+        rows = (
             await db[ORG_COL]
             .find(query)
             .sort("name", 1)
-            .skip(skip)
-            .limit(limit)
-            .to_list(limit)
+            .to_list(length=500)
         )
+        orgs = [o for o in rows if compute_partner_effective_status(o) == "active"]
+        total = len(orgs)
+        orgs = orgs[skip : skip + limit]
         org_ids = [o["id"] for o in orgs if o.get("id")]
         branding_by_org = {}
         if org_ids:
@@ -336,16 +338,14 @@ class PartnerOrgBrandingController:
 
     @staticmethod
     async def public_landing_by_slug(slug: str):
+        from utils.partner_org_access import compute_partner_effective_status
+
         db = get_db()
         org = await db[ORG_COL].find_one({"slug": (slug or "").strip().lower()})
         if not org:
             # try exact slug
             org = await db[ORG_COL].find_one({"slug": (slug or "").strip()})
-        if (
-            not org
-            or org.get("is_active") is False
-            or org.get("status") == "disabled"
-        ):
+        if not org or compute_partner_effective_status(org) != "active":
             raise HTTPException(status_code=404, detail="Partner not found")
 
         doc = await db[COL].find_one({"partner_org_id": org["id"]})
@@ -410,15 +410,13 @@ class PartnerOrgBrandingController:
 
     @staticmethod
     async def submit_landing_lead(slug: str, payload: PartnerOrgLandingLeadCreate):
+        from utils.partner_org_access import compute_partner_effective_status
+
         db = get_db()
         org = await db[ORG_COL].find_one({"slug": (slug or "").strip().lower()})
         if not org:
             org = await db[ORG_COL].find_one({"slug": (slug or "").strip()})
-        if (
-            not org
-            or org.get("is_active") is False
-            or org.get("status") == "disabled"
-        ):
+        if not org or compute_partner_effective_status(org) != "active":
             raise HTTPException(status_code=404, detail="Partner not found")
 
         ser, merged = await create_or_merge_lead(

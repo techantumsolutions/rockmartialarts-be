@@ -28,7 +28,15 @@ class ReportsController:
 
         # Build filter query based on user role and parameters
         filter_query = {}
-        current_role = current_user.get("role")
+        current_role = str(current_user.get("role") or "").lower()
+        allowed_roles = {
+            "super_admin",
+            "partner_super_admin",
+            "branch_manager",
+            "coach_admin",
+        }
+        if current_role not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions for financial reports")
 
         if current_role == "coach_admin" and current_user.get("branch_id"):
             # Coach admins can only see payments from their branch
@@ -68,8 +76,10 @@ class ReportsController:
             else:
                 # If no branches are managed, return empty result
                 filter_query["branch_details.branch_id"] = {"$in": []}
-        elif branch_id and branch_id != "all":
-            # For superadmin and other roles, allow branch filtering
+        elif current_role == "super_admin" and branch_id and branch_id != "all":
+            # Superadmin may optionally filter by branch
+            filter_query["branch_details.branch_id"] = branch_id
+        elif current_role != "super_admin" and branch_id and branch_id != "all":
             filter_query["branch_details.branch_id"] = branch_id
 
         # Add payment type filter
@@ -1196,7 +1206,7 @@ class ReportsController:
                 {
                     "id": "attendance",
                     "name": "Attendance Reports",
-                    "description": "Attendance reports (see Attendance module for full UI)",
+                    "description": "Operational attendance listings and exports",
                     "reports_count": 1
                 },
             ]
@@ -1255,6 +1265,14 @@ class ReportsController:
                 {"id": "branch-operational-hours", "name": "Branch Operational Hours"},
                 {"id": "branch-comparison-report", "name": "Branch Comparison Report"},
                 {"id": "branch-growth-trends", "name": "Branch Growth Trends"}
+            ],
+            "enrollments": [{"id": "enrollments-list", "name": "Enrollments List"}],
+            "renewals": [{"id": "renewals-list", "name": "Renewals List"}],
+            "leads": [{"id": "leads-list", "name": "Leads List"}],
+            "events": [{"id": "events-list", "name": "Event Registrations"}],
+            "attendance": [
+                {"id": "attendance-list", "name": "Attendance List"},
+                {"id": "attendance-module", "name": "Full Attendance Reports UI"},
             ],
             "financial": [
                 {"id": "revenue-summary-report", "name": "Revenue Summary Report"},

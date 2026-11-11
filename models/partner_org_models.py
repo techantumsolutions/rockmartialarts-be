@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, EmailStr, Field
@@ -57,6 +57,15 @@ class PartnerOrgUpdateStatus(BaseModel):
     is_active: bool
 
 
+class PartnerValidityUpdate(BaseModel):
+    valid_from: Optional[Union[str, datetime]] = None
+    valid_until: Optional[Union[str, datetime]] = None
+
+
+class PartnerFeaturePermissionsUpdate(BaseModel):
+    feature_permissions: Dict[str, bool] = Field(default_factory=dict)
+
+
 def new_partner_org_id() -> str:
     return str(uuid4())
 
@@ -64,7 +73,9 @@ def new_partner_org_id() -> str:
 def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
     if not doc:
         return None
-    return {
+    from utils.partner_org_access import partner_org_public_extras
+
+    payload = {
         "id": doc.get("id"),
         "name": doc.get("name"),
         "slug": doc.get("slug"),
@@ -83,3 +94,5 @@ def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
         "updated_at": doc.get("updated_at"),
         "activated_at": doc.get("activated_at"),
     }
+    payload.update(partner_org_public_extras(doc))
+    return payload

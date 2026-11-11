@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from models.partner_org_models import (
+    PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerOrgCreate,
     PartnerOrgStatus,
@@ -20,8 +21,15 @@ from models.partner_org_models import (
     PartnerProfileUpdate,
     PartnerSetPassword,
     PartnerOrgVerifyPayment,
+    PartnerValidityUpdate,
     new_partner_org_id,
     partner_org_public,
+)
+from utils.partner_org_access import (
+    compute_partner_effective_status,
+    is_partner_feature_enabled,
+    normalize_feature_permissions,
+    partner_org_blocks_access,
 )
 from models.user_models import UserRole
 from utils.auth import create_access_token, hash_password, verify_password
@@ -217,6 +225,8 @@ async def ensure_partner_org_indexes(db) -> None:
         await db[COL].create_index("email", unique=True)
         await db[COL].create_index("invite_token")
         await db[COL].create_index([("is_active", 1), ("status", 1)])
+        await db[COL].create_index("valid_from")
+        await db[COL].create_index("valid_until")
     except Exception:
         logger.exception("partner_organizations index ensure failed")
 
@@ -233,8 +243,11 @@ async def assert_partner_org_active(db, partner_org_id: str) -> dict:
     org = await db[COL].find_one({"id": partner_org_id})
     if not org:
         raise HTTPException(status_code=404, detail="Partner organization not found")
-    if org.get("is_active") is False or org.get("status") == PartnerOrgStatus.DISABLED.value:
-        raise HTTPException(status_code=403, detail="This partner account is disabled")
+    if partner_org_blocks_access(org):
+        raise HTTPException(
+            status_code=403,
+            detail="This partner account is disabled or expired",
+        )
     return org
 
 
@@ -265,6 +278,20 @@ async def _send_invite_email(org: dict, invite_token: str) -> bool:
         login_link=login_link,
         role_login_links=role_login_links,
     )
+    try:
+        from utils.ops_notify import notify_ops_mobile
+
+        await notify_ops_mobile(
+            "rock_partner_invite",
+            org.get("phone") or org.get("contact_phone"),
+            {
+                "partner_name": name,
+                "partner_slug": slug,
+                "token": invite_token,
+            },
+        )
+    except Exception:
+        logger.exception("ops mobile after partner invite failed")
     if not sent:
         logger.error(
             "Partner invite email was not delivered to %s (check Resend logs / FROM domain). Link: %s",
@@ -701,10 +728,10 @@ async def login_partner(slug: str, body: PartnerLogin) -> Dict[str, Any]:
     org = await db[COL].find_one({"slug": (slug or "").strip().lower()})
     if not org:
         raise HTTPException(status_code=404, detail="Partner not found")
-    if org.get("is_active") is False or org.get("status") == PartnerOrgStatus.DISABLED.value:
+    if partner_org_blocks_access(org):
         raise HTTPException(
             status_code=401,
-            detail="This partner account is disabled. Please contact administrator.",
+            detail="This partner account is disabled or expired. Please contact administrator.",
         )
 
     email = str(body.email).lower().strip()
@@ -760,11 +787,15 @@ async def get_partner_public_by_slug(slug: str) -> Dict[str, Any]:
     org = await db[COL].find_one({"slug": (slug or "").strip().lower()})
     if not org:
         raise HTTPException(status_code=404, detail="Partner not found")
+    public = partner_org_public(org) or {}
     return {
-        "name": org.get("name"),
-        "slug": org.get("slug"),
-        "is_active": org.get("is_active", True),
-        "status": org.get("status"),
+        "name": public.get("name"),
+        "slug": public.get("slug"),
+        "is_active": public.get("is_active", True),
+        "status": public.get("status"),
+        "effective_status": public.get("effective_status"),
+        "valid_from": public.get("valid_from"),
+        "valid_until": public.get("valid_until"),
     }
 
 
@@ -924,15 +955,21 @@ async def list_partner_orgs(
     q: Dict[str, Any] = {}
     if not include_inactive:
         q["is_active"] = True
-    total = await db[COL].count_documents(q)
-    rows = (
+        q["status"] = {"$nin": [PartnerOrgStatus.DISABLED.value, "disabled"]}
+    raw_rows = (
         await db[COL]
         .find(q)
         .sort("created_at", -1)
-        .skip(max(0, skip))
-        .limit(max(1, min(limit, 200)))
-        .to_list(limit)
+        .to_list(length=2000)
     )
+    if not include_inactive:
+        raw_rows = [
+            r for r in raw_rows if compute_partner_effective_status(r) == "active"
+        ]
+    total = len(raw_rows)
+    skip_n = max(0, skip)
+    limit_n = max(1, min(limit, 200))
+    rows = raw_rows[skip_n : skip_n + limit_n]
     return {
         "partners": [partner_org_public(r) for r in rows],
         "total": total,
@@ -982,3 +1019,114 @@ async def set_partner_org_active(
         "message": "Partner enabled" if body.is_active else "Partner disabled",
         "partner": partner_org_public(updated),
     }
+
+
+def _coerce_validity_field(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    s = str(value).strip()
+    return s or None
+
+
+async def update_partner_validity(
+    partner_org_id: str,
+    body: PartnerValidityUpdate,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    patch: Dict[str, Any] = {
+        "updated_at": datetime.utcnow(),
+        "updated_by": current_user.get("id"),
+    }
+    fields_set = getattr(body, "model_fields_set", None)
+    if fields_set is None:
+        unset_body = (
+            body.model_dump(exclude_unset=True)
+            if hasattr(body, "model_dump")
+            else body.dict(exclude_unset=True)
+        )
+        fields_set = set(unset_body.keys())
+    if "valid_from" in fields_set:
+        patch["valid_from"] = _coerce_validity_field(body.valid_from)
+    if "valid_until" in fields_set:
+        patch["valid_until"] = _coerce_validity_field(body.valid_until)
+    await db[COL].update_one({"id": partner_org_id}, {"$set": patch})
+    updated = await db[COL].find_one({"id": partner_org_id})
+    return {
+        "message": "Partner validity updated",
+        "partner": partner_org_public(updated),
+    }
+
+
+async def get_partner_feature_permissions(
+    partner_org_id: str,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    perms = normalize_feature_permissions(org.get("feature_permissions"))
+    return {
+        "partner_org_id": partner_org_id,
+        "feature_permissions": perms,
+        "partner": partner_org_public(org),
+    }
+
+
+async def update_partner_feature_permissions(
+    partner_org_id: str,
+    body: PartnerFeaturePermissionsUpdate,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    if partner_org_blocks_access(org):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change feature permissions while partner is disabled or expired.",
+        )
+    merged = normalize_feature_permissions(org.get("feature_permissions"))
+    for key, enabled in (body.feature_permissions or {}).items():
+        k = str(key).strip()
+        if k:
+            merged[k] = bool(enabled)
+    now = datetime.utcnow()
+    await db[COL].update_one(
+        {"id": partner_org_id},
+        {
+            "$set": {
+                "feature_permissions": merged,
+                "updated_at": now,
+                "updated_by": current_user.get("id"),
+            }
+        },
+    )
+    updated = await db[COL].find_one({"id": partner_org_id})
+    return {
+        "message": "Feature permissions updated",
+        "feature_permissions": normalize_feature_permissions(updated.get("feature_permissions")),
+        "partner": partner_org_public(updated),
+    }
+
+
+async def get_partner_feature_permissions_for_me(current_user: dict) -> Dict[str, Any]:
+    org_id = partner_org_id_of(current_user)
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Partner organization is missing on this account")
+    db = get_db()
+    org = await db[COL].find_one({"id": org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    perms = normalize_feature_permissions(org.get("feature_permissions"))
+    for key in list(perms.keys()):
+        if not is_partner_feature_enabled(org, key):
+            perms[key] = False
+    return {"partner_org_id": org_id, "feature_permissions": perms}

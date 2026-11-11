@@ -609,11 +609,14 @@ class RegCheckoutController:
             try:
                 from utils.ops_email_hooks import fire_renewal_reminder
 
+                # Email + WhatsApp from catalog; SMS kept on DLT path below
                 await fire_renewal_reminder(
                     student_email=user.get("email"),
                     student_name=name,
                     course_name=str(sub.get("plan_name") or sub.get("course_name") or "Plan"),
                     end_date=end,
+                    student_phone=phone,
+                    channels=["email", "whatsapp"],
                 )
             except Exception:
                 logger.exception("ops email renewal reminder failed")

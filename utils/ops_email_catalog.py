@@ -1,6 +1,8 @@
 """
-Ops email catalog (W1–W45) — same bodies/vars as the approved WhatsApp pack.
-Email-only. Does not touch SMS or WhatsApp providers.
+Ops notification catalog (W1–W45) — same bodies/vars as the approved WhatsApp pack.
+Used for email (Resend), WhatsApp, and SMS via utils.ops_notify.
+Templates marked legacy_email=True keep dedicated HTML Resend senders for email;
+mobile channels still use these bodies.
 """
 
 from __future__ import annotations

@@ -108,6 +108,7 @@ class CourseCreate(BaseModel):
     created_by_role: Optional[str] = None
     created_by_name: Optional[str] = None
     branch_ids: Optional[List[str]] = None
+    partner_org_id: Optional[str] = None
 
 class CourseUpdate(BaseModel):
     title: Optional[str] = None

@@ -304,6 +304,112 @@ def _batch_fee_from_doc(batch_doc: Optional[dict]) -> Optional[float]:
     return v
 
 
+_REGISTRATION_CASH_STAFF_ROLES = {
+    "super_admin",
+    "partner_super_admin",
+    "branch_manager",
+    "branch_admin",
+    "coach",
+    "coach_admin",
+}
+
+
+def _registration_payment_method_raw(payment_data) -> str:
+    raw = payment_data.payment_method
+    if hasattr(raw, "value"):
+        raw = raw.value
+    return str(raw or "").strip().lower()
+
+
+def _is_registration_cash_method(raw_pm: str) -> bool:
+    return raw_pm in {"cash", "physical_cash", "hand_cash"}
+
+
+def _is_registration_online_method(raw_pm: str) -> bool:
+    return raw_pm in {
+        "razorpay",
+        "online",
+        "digital_wallet",
+        "upi",
+        "credit_card",
+        "debit_card",
+        "net_banking",
+        "netbanking",
+        "card",
+        "",
+    }
+
+
+async def _assert_registration_payment_authorized(
+    payment_data,
+    current_user: Optional[dict],
+    *,
+    expected_amount_inr: Optional[float] = None,
+) -> None:
+    """
+    P0: cash registrations require authenticated staff; online requires verified Razorpay.
+    """
+    raw_pm = _registration_payment_method_raw(payment_data)
+    is_cash = _is_registration_cash_method(raw_pm)
+
+    if is_cash:
+        role = ""
+        if current_user and current_user.get("role"):
+            role = str(current_user.get("role") or "").lower()
+        elif getattr(payment_data, "created_by", None) and isinstance(payment_data.created_by, dict):
+            # Do not trust client-supplied created_by alone for authorization
+            role = ""
+        if role not in _REGISTRATION_CASH_STAFF_ROLES:
+            raise HTTPException(
+                status_code=401,
+                detail="Cash registration requires an authenticated staff session.",
+            )
+        return
+
+    # Treat everything else as gateway-paid (including digital_wallet from public FE)
+    if not _is_registration_online_method(raw_pm) and raw_pm not in {"razorpay", "online", "digital_wallet"}:
+        # Unknown method: still require Razorpay proof unless staff cash
+        if raw_pm not in _REGISTRATION_CASH_STAFF_ROLES:
+            pass
+
+    order_id = (getattr(payment_data, "razorpay_order_id", None) or "").strip()
+    pay_id = (getattr(payment_data, "razorpay_payment_id", None) or "").strip()
+    signature = (getattr(payment_data, "razorpay_signature", None) or "").strip()
+    if not order_id or not pay_id or not signature:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing Razorpay payment proof (order_id, payment_id, signature).",
+        )
+    if not verify_razorpay_signature(order_id, pay_id, signature):
+        raise HTTPException(status_code=400, detail="Invalid Razorpay payment signature.")
+
+    entity = _fetch_razorpay_payment_entity(pay_id)
+    if not entity:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to verify Razorpay payment with gateway. Please retry or contact support.",
+        )
+    status = str(entity.get("status") or "").lower()
+    captured = entity.get("captured")
+    if status not in {"captured", "authorized"} and captured is not True:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Razorpay payment is not captured (status={status or 'unknown'}).",
+        )
+    entity_order = str(entity.get("order_id") or "").strip()
+    if entity_order and entity_order != order_id:
+        raise HTTPException(status_code=400, detail="Razorpay payment does not match order.")
+
+    if expected_amount_inr is not None and expected_amount_inr > 0:
+        expected_paise = int(round(float(expected_amount_inr) * 100))
+        _validate_razorpay_captured_amount(
+            enrollment_expected_paise=expected_paise,
+            order_id=order_id,
+            payment_entity=entity,
+            enrollment_id="registration",
+        )
+
+
 def _validate_razorpay_captured_amount(
     *,
     enrollment_expected_paise: int,
@@ -1319,6 +1425,7 @@ class PaymentController:
                     or enrollment.get("amount")
                     or "",
                     failure_reason="Payment was not completed or checkout was dismissed",
+                    student_phone=current_user.get("phone"),
                 )
             except Exception:
                 logger.exception("ops email after cancel pending checkout failed")
@@ -1393,59 +1500,14 @@ class PaymentController:
         payment_data: StudentPaymentCreate,
         current_user: dict = Depends(require_role([UserRole.STUDENT]))
     ):
-        """Allow a student to process a payment for their enrollment."""
-        db = get_db()
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database connection not available")
-        student_id = current_user["id"]
-
-        # Validate enrollment and payment
-        enrollment = await db.enrollments.find_one({"id": payment_data.enrollment_id, "student_id": student_id})
-        if not enrollment:
-            raise HTTPException(status_code=404, detail="Enrollment not found or does not belong to you.")
-
-        # Find the pending payment for this enrollment
-        # This assumes there's a specific pending payment the student is trying to clear
-        # In a real system, you might have a more complex payment reconciliation logic
-        pending_payment = await db.payments.find_one({
-            "enrollment_id": payment_data.enrollment_id,
-            "student_id": student_id,
-            "payment_status": PaymentStatus.PENDING.value,
-            "amount": payment_data.amount  # Ensure the amount matches
-        })
-
-        if not pending_payment:
-            raise HTTPException(status_code=400, detail="No matching pending payment found for this enrollment and amount.")
-
-        # Simulate payment gateway interaction (update payment status)
-        update_data = {
-            "payment_status": PaymentStatus.PAID,
-            "payment_method": payment_data.payment_method,
-            "transaction_id": payment_data.transaction_id,
-            "payment_date": datetime.utcnow(),
-            "notes": payment_data.notes,
-            "updated_at": datetime.utcnow()
-        }
-
-        result = await db.payments.update_one(
-            {"id": pending_payment["id"]},
-            {"$set": update_data}
+        """Deprecated: students must complete payment via Razorpay confirm endpoint."""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Direct payment marking is disabled. "
+                "Use Razorpay checkout and POST /api/payments/confirm-razorpay."
+            ),
         )
-
-        if result.matched_count == 0:
-            raise HTTPException(status_code=500, detail="Failed to update payment status.")
-
-        # Update enrollment payment status if needed (e.g., if all payments are cleared)
-        # This logic might need to be more sophisticated in a real app
-        await db.enrollments.update_one(
-            {"id": enrollment["id"]},
-            {"$set": {"payment_status": PaymentStatus.PAID}}  # Simplified: mark enrollment paid if this payment clears it
-        )
-
-        # Send payment confirmation
-        await send_whatsapp(current_user["phone"], f"Payment of ₹{payment_data.amount} received for enrollment {payment_data.enrollment_id}. Thank you!")
-
-        return {"message": "Payment processed successfully", "payment_id": pending_payment["id"]}
 
     @staticmethod
     async def confirm_razorpay_payment(
@@ -1458,13 +1520,15 @@ class PaymentController:
             raise HTTPException(status_code=500, detail="Database connection not available")
         student_id = current_user["id"]
 
-        if data.razorpay_order_id:
-            if not data.razorpay_signature:
-                raise HTTPException(status_code=400, detail="Missing Razorpay signature")
-            if not verify_razorpay_signature(
-                data.razorpay_order_id, data.razorpay_payment_id, data.razorpay_signature
-            ):
-                raise HTTPException(status_code=400, detail="Invalid payment signature")
+        if not data.razorpay_order_id or not data.razorpay_payment_id or not data.razorpay_signature:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing Razorpay payment proof (order_id, payment_id, signature).",
+            )
+        if not verify_razorpay_signature(
+            data.razorpay_order_id, data.razorpay_payment_id, data.razorpay_signature
+        ):
+            raise HTTPException(status_code=400, detail="Invalid payment signature")
 
         # Prefer order linkage when present; fallback to requested enrollment_id.
         enrollment = None
@@ -1771,6 +1835,9 @@ class PaymentController:
                 partner_org_id=enrollment.get("partner_org_id")
                 or payment_doc.get("partner_org_id")
                 or student_doc.get("partner_org_id"),
+                student_phone=student_doc.get("phone")
+                or payment_doc.get("student_phone")
+                or payment_doc.get("phone"),
             )
         except Exception:
             logger.exception("ops email after razorpay confirm failed")
@@ -2630,11 +2697,30 @@ class PaymentController:
         return enrollment_id, payment_info.pricing.total_amount, payment_info, payment.id
 
     @staticmethod
-    async def _process_family_registration(payment_data: RegistrationPaymentCreate):
+    async def _process_family_registration(
+        payment_data: RegistrationPaymentCreate,
+        current_user: Optional[dict] = None,
+    ):
         db = get_db()
         family: List[FamilyStudentEnrollment] = list(payment_data.family_students or [])
         if not family:
             raise HTTPException(status_code=400, detail="family_students is required for family registration")
+
+        # P0: authorize before creating any users/enrollments
+        expected_total = 0.0
+        for member in family:
+            info = await PaymentController.get_course_payment_info(
+                member.course_id,
+                member.branch_id,
+                member.duration,
+                batch_ref=getattr(member, "batch_ref", None),
+            )
+            expected_total += float(info.pricing.total_amount or 0)
+        await _assert_registration_payment_authorized(
+            payment_data,
+            current_user,
+            expected_amount_inr=expected_total if expected_total > 0 else None,
+        )
 
         from controllers.auth_controller import AuthController
         from models.user_models import CourseInfo, BranchInfo
@@ -2769,6 +2855,8 @@ class PaymentController:
                 enrollment_course=(last_info.course_name if last_info else None) or "",
                 branch_name=(last_info.branch_name if last_info else None) or "",
                 branch_id=first.branch_id,
+                student_phone=holder.get("phone")
+                or first_payload.get("phone"),
             )
         except Exception:
             logger.exception("ops email after family registration failed")
@@ -2857,7 +2945,9 @@ class PaymentController:
         """Process payment for student registration"""
         if payment_data.family_students:
             try:
-                return await PaymentController._process_family_registration(payment_data)
+                return await PaymentController._process_family_registration(
+                    payment_data, current_user=current_user
+                )
             except HTTPException:
                 raise
             except Exception as e:
@@ -2883,6 +2973,14 @@ class PaymentController:
             creator_dict = dict(payment_data.created_by)
 
         active_batch_ref = payment_data.batch_ref or payment_data.batch_id
+
+        # P0 early gate (before course/capacity work): cash=staff, online=gateway triple present+valid
+        await _assert_registration_payment_authorized(
+            payment_data,
+            current_user,
+            expected_amount_inr=None,
+        )
+
         from utils.branch_courses import assert_batch_has_capacity
         await assert_batch_has_capacity(
             db, payment_data.branch_id, payment_data.course_id, active_batch_ref
@@ -2952,6 +3050,13 @@ class PaymentController:
                 payment_data.branch_id,
                 payment_data.duration,
                 batch_ref=active_batch_ref,
+            )
+
+            # Re-check with expected amount once pricing is known (online underpay guard)
+            await _assert_registration_payment_authorized(
+                payment_data,
+                current_user,
+                expected_amount_inr=float(payment_info.pricing.total_amount or 0),
             )
 
             # Generate transaction ID
@@ -3211,6 +3316,24 @@ class PaymentController:
                     creator_name=creator_dict.get("name") if creator_dict else None,
                     creator_role=creator_dict.get("role") if creator_dict else None,
                 )
+                # Companion WhatsApp/SMS (email owned by Resend welcome above)
+                try:
+                    from utils.ops_notify import notify_ops_mobile
+
+                    await notify_ops_mobile(
+                        "rock_student_welcome_admin",
+                        payment_data.student_data.get("phone"),
+                        {
+                            "student_name": payment_data.student_data.get("full_name")
+                            or payment_data.student_data.get("first_name")
+                            or "Student",
+                            "branch_name": payment_info.branch_name or "",
+                            "token": setup_token,
+                            "expiry_hours": "24",
+                        },
+                    )
+                except Exception:
+                    logger.exception("ops mobile after student welcome setup failed")
             except Exception as mail_err:
                 logger.warning("Could not dispatch student setup email: %s", mail_err)
 
@@ -3224,12 +3347,6 @@ class PaymentController:
             await PaymentController.create_payment_notification(
                 payment.id, student_id, payment_info, student_data
             )
-
-            # Send confirmation message
-            phone = payment_data.student_data.get("phone", "")
-            if phone:
-                message = f"Welcome! Your registration is complete. Payment of ₹{payment_info.pricing.total_amount} received. Transaction ID: {transaction_id}"
-                await send_whatsapp(phone, message)
 
             try:
                 from utils.ops_email_hooks import fire_payment_success
@@ -3251,6 +3368,7 @@ class PaymentController:
                     branch_id=payment_data.branch_id,
                     partner_org_id=getattr(payment_data, "partner_org_id", None)
                     or (creator_dict or {}).get("partner_org_id"),
+                    student_phone=payment_data.student_data.get("phone"),
                 )
             except Exception:
                 logger.exception("ops email after registration payment failed")
@@ -4248,11 +4366,11 @@ class PaymentController:
                 if inv.get("student_id") != uid and inv.get("account_user_id") != uid:
                     raise HTTPException(status_code=403, detail="Not allowed to view this payment")
             elif role == "branch_manager":
-                from utils.student_status_service import get_managed_branch_ids_for_user
+                from utils.partner_org_access import assert_partner_branch_manager_financial_access
 
-                managed = await get_managed_branch_ids_for_user(db, current_user) or []
-                if inv.get("branch_id") and managed and inv.get("branch_id") not in managed:
-                    raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+                await assert_partner_branch_manager_financial_access(
+                    db, current_user, inv.get("branch_id")
+                )
             elif role not in {"super_admin", "coach_admin", "coach", "partner_super_admin"}:
                 raise HTTPException(status_code=403, detail="Not allowed to view this payment")
 
@@ -4287,15 +4405,13 @@ class PaymentController:
             if payment.get("student_id") != uid and payment.get("user_id") != uid:
                 raise HTTPException(status_code=403, detail="Not allowed to view this payment")
         elif role == "branch_manager":
-            from utils.student_status_service import get_managed_branch_ids_for_user
+            from utils.partner_org_access import assert_partner_branch_manager_financial_access
 
-            managed = await get_managed_branch_ids_for_user(db, current_user) or []
             branch_id = (
                 (payment.get("branch_details") or {}).get("branch_id")
                 or payment.get("branch_id")
             )
-            if branch_id and managed and branch_id not in managed:
-                raise HTTPException(status_code=403, detail="Not allowed to view this payment")
+            await assert_partner_branch_manager_financial_access(db, current_user, branch_id)
         elif role not in {"super_admin", "coach_admin", "coach", "partner_super_admin"}:
             raise HTTPException(status_code=403, detail="Not allowed to view this payment")
 

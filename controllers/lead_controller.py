@@ -33,6 +33,10 @@ from utils.lead_service import (
     list_leads_service,
     update_lead_status_with_history,
 )
+from utils.lead_notification_service import (
+    get_lead_notifications as fetch_lead_notifications,
+    mark_lead_notification_read as mark_lead_notification_read_service,
+)
 from utils.student_status_service import get_managed_branch_ids_for_user
 from utils.reg_checkout_sms import (
     public_sms_failure_hint,
@@ -119,6 +123,10 @@ class LeadController:
         current_user: Optional[dict] = None,
     ) -> Dict[str, Any]:
         try:
+            from utils.database import get_db
+            from utils.partner_org_access import assert_partner_feature_for_user
+
+            await assert_partner_feature_for_user(get_db(), current_user, "leads")
             data = await list_leads_service(
                 skip=skip,
                 limit=limit,
@@ -283,3 +291,17 @@ class LeadController:
             "verification_token": token,
             "expires_in": _lead_otp_ttl_seconds(),
         }
+
+    @staticmethod
+    async def get_lead_notifications(
+        current_user: dict, skip: int = 0, limit: int = 50
+    ) -> Dict[str, Any]:
+        return await fetch_lead_notifications(current_user, skip=skip, limit=limit)
+
+    @staticmethod
+    async def mark_lead_notification_read(
+        notification_id: str, current_user: dict
+    ) -> Dict[str, Any]:
+        return await mark_lead_notification_read_service(
+            notification_id, current_user
+        )

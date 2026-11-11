@@ -85,10 +85,10 @@ def _derive_enrollment_status(enrollment: dict) -> str:
     """
     Derive human status from persisted fields when `status` is missing/stale.
     Priority:
-    1) explicit `status` (if present)
-    2) canceled / paused by payment_status
-    3) expired by end_date
-    4) active/inactive by is_active
+    1) canceled / paused / pending by payment_status
+    2) expired by end_date
+    3) active/inactive by is_active
+    4) explicit `status` (if present)
     """
     explicit = str(enrollment.get("status") or "").strip().lower()
     is_active = bool(enrollment.get("is_active", True))
@@ -97,6 +97,8 @@ def _derive_enrollment_status(enrollment: dict) -> str:
         return "cancelled"
     if payment_status == "paused":
         return "paused"
+    if payment_status in {"pending", "processing", "failed"}:
+        return "pending"
 
     if is_subscription_period_over(enrollment.get("end_date")):
         return "expired"
@@ -104,10 +106,58 @@ def _derive_enrollment_status(enrollment: dict) -> str:
     if not is_active:
         return "inactive"
 
-    if explicit in {"completed", "paused", "cancelled", "canceled", "inactive", "active"}:
+    if explicit in {"completed", "paused", "cancelled", "canceled", "inactive", "active", "pending"}:
         return explicit.replace("canceled", "cancelled")
 
     return "active"
+
+
+def _resolve_duration_label(duration_row: Optional[dict], enrollment: dict) -> Optional[str]:
+    if duration_row:
+        name = duration_row.get("name") or duration_row.get("label") or duration_row.get("code")
+        if name:
+            return str(name)
+    months = enrollment.get("duration_months")
+    if months is None:
+        raw = str(enrollment.get("duration_id") or enrollment.get("duration") or "").strip()
+        if raw.isdigit():
+            try:
+                months = int(raw)
+            except ValueError:
+                months = None
+    if months is None:
+        start = _parse_enrollment_dt_field(enrollment.get("start_date"))
+        end = _parse_enrollment_dt_field(enrollment.get("end_date"))
+        if start and end and end > start:
+            # Approximate calendar months for display when tenure master row is missing
+            months = max(1, (end.year - start.year) * 12 + (end.month - start.month))
+    try:
+        months_i = int(months) if months is not None else None
+    except (TypeError, ValueError):
+        months_i = None
+    if months_i and months_i > 0:
+        return f"{months_i} Month{'s' if months_i != 1 else ''}"
+    return None
+
+
+def _enrolled_at_for_display(enrollment: dict):
+    """
+    Registration timestamp for UI "Enrolled".
+    Prefer created_at so renewal stacking (future start_date copied into enrollment_date)
+    does not show a future "enrolled" date.
+    """
+    created = enrollment.get("created_at")
+    enrolled = enrollment.get("enrollment_date")
+    start = enrollment.get("start_date")
+    created_dt = _parse_enrollment_dt_field(created)
+    enrolled_dt = _parse_enrollment_dt_field(enrolled)
+    start_dt = _parse_enrollment_dt_field(start)
+    # Pending / renewal rows often set enrollment_date == future start_date
+    if created_dt and enrolled_dt and start_dt and enrolled_dt.date() == start_dt.date() and enrolled_dt > created_dt:
+        return created
+    if created_dt and enrolled_dt and enrolled_dt > created_dt and (enrolled_dt - created_dt).days > 30:
+        return created
+    return enrolled or created
 
 
 def _student_age(date_of_birth):
@@ -227,13 +277,21 @@ async def _enrich_students_for_list(db, students: list) -> list:
                 )
 
             courses_info.append({
+                "id": enrollment.get("id"),
                 "enrollment_id": enrollment.get("id"),
                 "course_id": enrollment["course_id"],
                 "course_name": course.get("title", "Unknown Course"),
                 "level": course.get("difficulty_level", "Beginner"),
                 "duration": duration_label or (f"{duration_days} days" if duration_days is not None else "Not specified"),
+                "duration_id": enrollment.get("duration_id") or enrollment.get("duration"),
+                "duration_months": enrollment.get("duration_months"),
+                "batch_ref": enrollment.get("batch_ref"),
+                "fee_amount": enrollment.get("fee_amount"),
                 "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
                 "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
+                "next_due_date": _enrollment_date_to_iso(
+                    enrollment.get("next_due_date") or enrollment.get("end_date")
+                ),
                 "enrollment_date": enrollment.get("enrollment_date"),
                 "payment_status": enrollment.get("payment_status", "pending"),
                 "is_active": enrollment.get("is_active", True),
@@ -1029,62 +1087,57 @@ class UserController:
 
         elif current_role == UserRole.BRANCH_MANAGER:
             # Branch Managers can only update students in their managed branches
-            print(f"🔍 DEBUG UPDATE: Branch manager attempting to update user {user_id}")
-            print(f"🔍 DEBUG UPDATE: Target user role: {target_user.get('role')}")
-            print(f"🔍 DEBUG UPDATE: Current user: {current_user}")
-
             if target_user["role"] != UserRole.STUDENT.value:
-                print(f"🔍 DEBUG UPDATE: Blocking - target user is not a student")
                 raise HTTPException(status_code=403, detail="Branch Managers can only update student profiles.")
 
-            # TEMPORARY: Allow all student updates for branch managers to test the basic functionality
-            print(f"🔍 DEBUG UPDATE: TEMPORARY - Allowing all student updates for branch managers")
-            # TODO: Re-enable branch-based filtering after basic functionality is confirmed
+            branch_manager_id = current_user.get("id")
+            if not branch_manager_id:
+                raise HTTPException(status_code=403, detail="Branch manager ID not found")
 
-            # # Check if the student is in a branch managed by this branch manager
-            # branch_manager_id = current_user.get("id")
-            # print(f"🔍 DEBUG UPDATE: Branch manager ID: {branch_manager_id}")
+            db = get_db()
 
-            # if not branch_manager_id:
-            #     raise HTTPException(status_code=403, detail="Branch manager ID not found")
+            managed_branches = await db.branches.find(
+                {"manager_id": branch_manager_id, "is_active": True}
+            ).to_list(length=None)
 
-            # db = get_db()
+            if not managed_branches:
+                branch_assignment = current_user.get("branch_assignment")
+                if branch_assignment and branch_assignment.get("branch_id"):
+                    fallback_branch = await db.branches.find_one(
+                        {"id": branch_assignment["branch_id"], "is_active": True}
+                    )
+                    if fallback_branch:
+                        managed_branches = [fallback_branch]
 
-            # # Find all branches managed by this branch manager
-            # managed_branches = await db.branches.find({"manager_id": branch_manager_id, "is_active": True}).to_list(length=None)
-            # print(f"🔍 DEBUG UPDATE: Found {len(managed_branches)} managed branches by manager_id")
+            if not managed_branches:
+                from utils.student_status_service import get_managed_branch_ids_for_user
 
-            # # Fallback: If no branches found by manager_id, try the old branch_assignment approach
-            # if not managed_branches:
-            #     print(f"🔍 DEBUG UPDATE: No branches found by manager_id, trying branch_assignment fallback")
-            #     branch_assignment = current_user.get("branch_assignment")
-            #     print(f"🔍 DEBUG UPDATE: Branch assignment: {branch_assignment}")
-            #     if branch_assignment and branch_assignment.get("branch_id"):
-            #         fallback_branch = await db.branches.find_one({"id": branch_assignment["branch_id"], "is_active": True})
-            #         if fallback_branch:
-            #             managed_branches = [fallback_branch]
-            #             print(f"🔍 DEBUG UPDATE: Using fallback branch: {fallback_branch['id']}")
+                allowed_ids = await get_managed_branch_ids_for_user(db, current_user)
+                if allowed_ids:
+                    managed_branches = await db.branches.find(
+                        {"id": {"$in": allowed_ids}, "is_active": True}
+                    ).to_list(length=None)
 
-            # if not managed_branches:
-            #     print(f"🔍 DEBUG UPDATE: No branches assigned to this manager")
-            #     raise HTTPException(status_code=403, detail="No branches assigned to this manager")
+            if not managed_branches:
+                raise HTTPException(status_code=403, detail="No branches assigned to this manager")
 
-            # managed_branch_ids = [branch["id"] for branch in managed_branches]
-            # print(f"🔍 DEBUG UPDATE: Managed branch IDs: {managed_branch_ids}")
+            managed_branch_ids = [branch["id"] for branch in managed_branches]
 
-            # # Check if the student is enrolled in any of the managed branches
-            # student_enrollments = await db.enrollments.find({"student_id": user_id, "is_active": True}).to_list(100)
-            # student_branch_ids = [enrollment["branch_id"] for enrollment in student_enrollments if enrollment.get("branch_id")]
-            # print(f"🔍 DEBUG UPDATE: Student enrolled in branches: {student_branch_ids}")
-            # print(f"🔍 DEBUG UPDATE: Student enrollments: {student_enrollments}")
+            student_enrollments = await db.enrollments.find(
+                {"student_id": user_id, "is_active": True}
+            ).to_list(100)
+            student_branch_ids = [
+                enrollment["branch_id"]
+                for enrollment in student_enrollments
+                if enrollment.get("branch_id")
+            ]
 
-            # # Check if any of the student's enrollments are in the managed branches
-            # has_permission = any(branch_id in managed_branch_ids for branch_id in student_branch_ids)
-            # print(f"🔍 DEBUG UPDATE: Has permission to update: {has_permission}")
-
-            # if not has_permission:
-            #     print(f"🔍 DEBUG UPDATE: Blocking - student not enrolled in managed branches")
-            #     raise HTTPException(status_code=403, detail="Branch Managers can only update students enrolled in their managed branches.")
+            has_permission = any(bid in managed_branch_ids for bid in student_branch_ids)
+            if not has_permission:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Branch Managers can only update students enrolled in their managed branches.",
+                )
 
         # Convert user_update to dict and handle date serialization
         update_dict = user_update.dict(exclude_unset=True)
@@ -1344,24 +1397,26 @@ class UserController:
 
         email_ok = False
         try:
-            if kind == "payment_reminder" and user.get("email"):
+            if kind == "payment_reminder" and (user.get("email") or phone):
                 from utils.ops_email_hooks import fire_payment_reminder
 
+                # Email catalog only — WA/SMS already sent above with admin message
                 await fire_payment_reminder(
                     student_email=user.get("email"),
                     student_name=name,
                     amount="",
                     due_date=None,
+                    channels=["email"],
                 )
                 email_ok = True
-            elif kind == "welcome" and user.get("email"):
+            elif kind == "welcome" and (user.get("email") or phone):
                 from utils.ops_email_hooks import fire_student_self_welcome
 
                 await fire_student_self_welcome(
                     student_email=user.get("email"),
                     student_name=name,
                 )
-                email_ok = True
+                email_ok = bool(user.get("email"))
         except Exception:
             logger.exception("ops email admin student notify failed")
 
@@ -2033,28 +2088,82 @@ class UserController:
                 if not enr:
                     raise HTTPException(status_code=403, detail="You can only view students from your branch")
         elif current_role == "branch_manager":
-            # Branch managers can only view enrollments for students in branches they manage
-            branch_assignment = current_user.get("branch_assignment", {})
-            managed_branch_id = branch_assignment.get("branch_id")
+            # Branch managers: any enrollment in managed branches (active or expired)
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            if not managed_branch_id:
+            managed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if not managed_ids:
                 raise HTTPException(status_code=403, detail="No branch assignment found for branch manager")
 
-            # Check if student has any enrollments in the managed branch
             student_enrollments = await db.enrollments.find({
                 "student_id": user_id,
-                "branch_id": managed_branch_id,
-                "is_active": True
+                "branch_id": {"$in": managed_ids},
             }).to_list(1)
 
             if not student_enrollments:
                 raise HTTPException(status_code=403, detail="You can only view enrollments for students in branches you manage")
 
         try:
+            # Hygiene: unpaid checkouts must never appear as active plans
+            try:
+                await db.enrollments.update_many(
+                    {
+                        "student_id": user_id,
+                        "payment_status": {"$in": ["pending", "processing", "failed"]},
+                        "is_active": True,
+                    },
+                    {
+                        "$set": {
+                            "is_active": False,
+                            "updated_at": datetime.utcnow(),
+                        }
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to normalize pending enrollment is_active for %s", user_id)
+
             # Get enrollments for this student
             enrollments = await db.enrollments.find({
                 "student_id": user_id
             }).sort("created_at", -1).to_list(length=100)
+
+            # Batch duration lookup
+            duration_keys = set()
+            for enrollment in enrollments:
+                did = enrollment.get("duration_id") or enrollment.get("duration")
+                if did:
+                    duration_keys.add(str(did))
+            duration_map: Dict[str, dict] = {}
+            if duration_keys:
+                async for drow in db.durations.find(
+                    {"$or": [{"id": {"$in": list(duration_keys)}}, {"code": {"$in": list(duration_keys)}}]}
+                ):
+                    if drow.get("id"):
+                        duration_map[str(drow["id"])] = drow
+                    if drow.get("code"):
+                        duration_map[str(drow["code"])] = drow
+
+            # Latest paid payment amount per enrollment (authoritative fee display)
+            enr_ids = [e.get("id") for e in enrollments if e.get("id")]
+            paid_fee_by_enrollment: Dict[str, float] = {}
+            if enr_ids:
+                async for pay in db.payments.find(
+                    {
+                        "enrollment_id": {"$in": enr_ids},
+                        "payment_status": {"$in": ["paid", "completed"]},
+                    },
+                    {"enrollment_id": 1, "amount": 1, "course_fee": 1, "payment_date": 1, "created_at": 1},
+                ).sort("payment_date", -1):
+                    eid = str(pay.get("enrollment_id") or "")
+                    if not eid or eid in paid_fee_by_enrollment:
+                        continue
+                    amt = pay.get("course_fee")
+                    if amt is None:
+                        amt = pay.get("amount")
+                    try:
+                        paid_fee_by_enrollment[eid] = float(amt or 0)
+                    except (TypeError, ValueError):
+                        continue
 
             # Enhance enrollments with course and branch information
             enhanced_enrollments = []
@@ -2065,22 +2174,72 @@ class UserController:
                 # Get branch details
                 branch = await db.branches.find_one({"id": enrollment.get("branch_id")})
 
-                derived_status = _derive_enrollment_status(enrollment)
+                pay_status = str(enrollment.get("payment_status") or "").lower()
+                # Response-level: unpaid is never active
+                effective_active = bool(enrollment.get("is_active", True)) and pay_status in {
+                    "paid",
+                    "completed",
+                }
+                enrollment_for_status = dict(enrollment)
+                enrollment_for_status["is_active"] = effective_active
+                derived_status = _derive_enrollment_status(enrollment_for_status)
+
+                did = str(enrollment.get("duration_id") or enrollment.get("duration") or "")
+                duration_row = duration_map.get(did)
+                duration_label = _resolve_duration_label(duration_row, enrollment)
+
+                enrolled_at = _enrolled_at_for_display(enrollment)
+                end_iso = _enrollment_date_to_iso(enrollment.get("end_date"))
+                # next_due only for paid plans; pending checkouts should not invent a due date
+                next_due_raw = None
+                if pay_status in {"paid", "completed"}:
+                    next_due_raw = enrollment.get("next_due_date") or enrollment.get("end_date")
+
+                paid_fee = paid_fee_by_enrollment.get(str(enrollment.get("id") or ""))
+                fee_amount = enrollment.get("fee_amount")
+                if paid_fee is not None and paid_fee > 0:
+                    fee_amount = paid_fee
+
                 enhanced_enrollment = serialize_doc(enrollment)
                 enhanced_enrollment.update({
                     "course_name": course.get("title", course.get("name", "Unknown Course")) if course else "Unknown Course",
                     "course_difficulty": course.get("difficulty_level", "Beginner") if course else "Beginner",
-                    "branch_name": branch.get("branch", {}).get("name", "Unknown Branch") if branch else "Unknown Branch",
-                    "enrollment_date": enrollment.get("enrollment_date", enrollment.get("created_at", "")),
+                    "branch_name": (
+                        (branch.get("branch", {}) or {}).get("name")
+                        or branch.get("name")
+                        or "Unknown Branch"
+                    ) if branch else "Unknown Branch",
+                    # Enrolled = registration time (created_at), not future renewal start
+                    "enrollment_date": _enrollment_date_to_iso(enrolled_at),
+                    "registered_at": _enrollment_date_to_iso(enrollment.get("created_at") or enrolled_at),
                     "start_date": _enrollment_date_to_iso(enrollment.get("start_date")),
-                    "end_date": _enrollment_date_to_iso(enrollment.get("end_date")),
+                    "end_date": end_iso,
+                    "next_due_date": _enrollment_date_to_iso(next_due_raw) if next_due_raw else None,
                     "completion_date": enrollment.get("completion_date"),
                     "status": derived_status,
                     "progress": enrollment.get("progress", 0),
-                    "is_active": enrollment.get("is_active", True),
+                    "is_active": effective_active,
                     "payment_status": enrollment.get("payment_status"),
+                    "fee_amount": fee_amount,
+                    "duration_id": enrollment.get("duration_id") or enrollment.get("duration"),
+                    "duration_label": duration_label,
+                    "duration_months": (
+                        (duration_row or {}).get("duration_months")
+                        if duration_row
+                        else enrollment.get("duration_months")
+                    ),
+                    "batch_ref": enrollment.get("batch_ref"),
+                    "course_id": enrollment.get("course_id"),
+                    "branch_id": enrollment.get("branch_id"),
                     "updated_at": _enrollment_date_to_iso(enrollment.get("updated_at")),
                     "created_at": _enrollment_date_to_iso(enrollment.get("created_at")),
+                    "is_renewal": bool(enrollment.get("is_renewal")),
+                    "include_in_history": pay_status in {
+                        "paid",
+                        "completed",
+                        "cancelled",
+                        "canceled",
+                    },
                 })
                 enhanced_enrollments.append(enhanced_enrollment)
 
@@ -2122,18 +2281,15 @@ class UserController:
                 if not enr:
                     raise HTTPException(status_code=403, detail="You can only view students from your branch")
         elif current_role == "branch_manager":
-            # Branch managers can only view payments for students in branches they manage
-            branch_assignment = current_user.get("branch_assignment", {})
-            managed_branch_id = branch_assignment.get("branch_id")
+            from utils.student_status_service import get_managed_branch_ids_for_user
 
-            if not managed_branch_id:
+            managed_ids = await get_managed_branch_ids_for_user(db, current_user)
+            if not managed_ids:
                 raise HTTPException(status_code=403, detail="No branch assignment found for branch manager")
 
-            # Check if student has any enrollments in the managed branch
             student_enrollments = await db.enrollments.find({
                 "student_id": user_id,
-                "branch_id": managed_branch_id,
-                "is_active": True
+                "branch_id": {"$in": managed_ids},
             }).to_list(1)
 
             if not student_enrollments:

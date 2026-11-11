@@ -595,6 +595,28 @@ This is an automated message. Please do not reply to this email.
             import logging
             logging.info(f"Branch manager credentials email requested for {manager_email}. Email sent: {email_sent}")
 
+            try:
+                from utils.ops_notify import notify_ops_mobile
+
+                contact = manager.get("contact_info") if isinstance(manager.get("contact_info"), dict) else {}
+                bm_phone = (
+                    manager.get("phone") or contact.get("phone") or contact.get("mobile") or ""
+                ).strip() or None
+                branch_name = ""
+                if manager.get("branch_assignment"):
+                    branch_name = manager["branch_assignment"].get("branch_name") or ""
+                await notify_ops_mobile(
+                    "rock_bm_welcome",
+                    bm_phone,
+                    {
+                        "bm_name": manager_name,
+                        "branch_name": branch_name,
+                        "token": reset_token,
+                    },
+                )
+            except Exception:
+                logging.exception("ops mobile after branch manager credentials failed")
+
             # Log the activity in database
             await log_activity(
                 request=request,

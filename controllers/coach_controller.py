@@ -107,6 +107,7 @@ class CoachController:
             featured_on_homepage=coach_data.featured_on_homepage,
             homepage_rating=coach_data.homepage_rating,
             display_order=coach_data.display_order,
+            training_mode=coach_data.training_mode,
         )
         
         # Convert to dict for storage (exclude password from contact_info)
@@ -171,6 +172,8 @@ class CoachController:
         branch_id: Optional[str] = None,
         course_id: Optional[str] = None,
         all_tenants: bool = False,
+        training_mode: Optional[str] = None,
+        registration_source: Optional[str] = None,
     ):
         """Get coaches with filters. Branch managers see only coaches in their managed branches."""
         db = get_db()
@@ -180,6 +183,27 @@ class CoachController:
             filter_query["is_active"] = True
         if area_of_expertise:
             filter_query["areas_of_expertise"] = {"$in": [area_of_expertise]}
+        if training_mode:
+            tm = str(training_mode).strip().lower()
+            if tm in ("online", "offline"):
+                filter_query["training_mode"] = tm
+        # In-house (admin-created) vs Online Coaches (self-enrolled) — keep products separate
+        if registration_source:
+            src = str(registration_source).lower().strip()
+            if src == "self":
+                filter_query["registration_source"] = "self"
+            elif src == "admin":
+                # Legacy in-house rows may omit registration_source
+                filter_query.setdefault("$and", []).append(
+                    {
+                        "$or": [
+                            {"registration_source": "admin"},
+                            {"registration_source": {"$exists": False}},
+                            {"registration_source": None},
+                            {"registration_source": ""},
+                        ]
+                    }
+                )
         # M14-S02 additive filter (default: no change to existing list behavior)
         if approval_status:
             status = str(approval_status).lower().strip()
@@ -303,6 +327,7 @@ class CoachController:
                 user_id=coach.get("user_id"),
                 service_location_ids=coach.get("service_location_ids"),
                 registration_source=coach.get("registration_source"),
+                training_mode=coach.get("training_mode"),
                 created_at=coach["created_at"],
                 updated_at=coach["updated_at"]
             )
@@ -352,6 +377,7 @@ class CoachController:
             user_id=coach.get("user_id"),
             service_location_ids=coach.get("service_location_ids"),
             registration_source=coach.get("registration_source"),
+            training_mode=coach.get("training_mode"),
             created_at=coach["created_at"],
             updated_at=coach["updated_at"]
         )
@@ -534,6 +560,11 @@ class CoachController:
                     db, patch["display_order"], coach_id
                 )
                 update_data["display_order"] = patch["display_order"]
+        if "training_mode" in patch:
+            tm = patch["training_mode"]
+            update_data["training_mode"] = (
+                str(tm).strip().lower() if tm not in (None, "") else None
+            )
 
         if not update_data and not mongo_unset:
             raise HTTPException(status_code=400, detail="No update data provided")
@@ -1624,7 +1655,7 @@ class CoachController:
         login_link = login_urls.get("coach") or f"{frontend_url}/coach/login"
 
         # Prepare email content
-        subject = "Your Coach Login Credentials - Marshalarts Academy"
+        subject = "Your Coach Login Credentials - Rock Martial Arts Academy"
 
         # Create HTML email content (consistent with forgot password styling)
         html_message = f"""<!DOCTYPE html>
@@ -1649,7 +1680,7 @@ class CoachController:
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin: 0; color: #ea580c;">🥋 Marshalarts Academy</h1>
+            <h1 style="margin: 0; color: #111827;">Rock Martial Arts Academy</h1>
             <p style="margin: 5px 0 0 0; color: #666;">Coach Portal</p>
         </div>
 
@@ -1685,7 +1716,7 @@ class CoachController:
         </div>
 
         <div class="footer">
-            <p style="margin: 0;">© 2025 Marshalarts Academy. All rights reserved.</p>
+            <p style="margin: 0;">© 2026 Rock Martial Arts Academy. All rights reserved.</p>
             <p style="margin: 5px 0 0 0;">This is an automated message, please do not reply.</p>
         </div>
     </div>
@@ -1693,7 +1724,7 @@ class CoachController:
 </html>""".strip()
 
         # Plain text version (consistent with forgot password format)
-        plain_message = f"""🥋 Welcome to Marshalarts Academy - Coach Portal
+        plain_message = f"""Welcome to Rock Martial Arts Academy - Coach Portal
 
 Hello {coach_name},
 
@@ -1716,9 +1747,9 @@ IMPORTANT: The password setup link expires in 15 minutes. If it expires, please 
 If you have any questions or need assistance, please contact our support team.
 
 Best regards,
-Marshalarts Academy Team
+Rock Martial Arts Academy Team
 
-© 2025 Marshalarts Academy. All rights reserved.
+© 2026 Rock Martial Arts Academy. All rights reserved.
 This is an automated message, please do not reply.""".strip()
 
         try:
@@ -1734,6 +1765,25 @@ This is an automated message, please do not reply.""".strip()
             # Log the credentials email attempt (same as forgot password implementation)
             import logging
             logging.info(f"Coach credentials email requested for {coach_email}. Email sent: {email_sent}")
+
+            try:
+                from utils.ops_notify import notify_ops_mobile
+
+                contact = coach.get("contact_info") if isinstance(coach.get("contact_info"), dict) else {}
+                coach_phone = (
+                    coach.get("phone") or contact.get("phone") or contact.get("mobile") or ""
+                ).strip() or None
+                await notify_ops_mobile(
+                    "rock_coach_password_setup",
+                    coach_phone,
+                    {
+                        "coach_name": coach_name,
+                        "token": reset_token,
+                        "expiry_hours": "0.25",
+                    },
+                )
+            except Exception:
+                logging.exception("ops mobile after coach credentials failed")
 
             # Log the activity in database
             await log_activity(

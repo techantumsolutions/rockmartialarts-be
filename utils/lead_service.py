@@ -414,7 +414,14 @@ async def create_or_merge_lead(
             return serialize_doc(updated) or {}, True
 
     await db[COL].insert_one(draft)
-    return serialize_doc(draft) or {}, False
+    ser = serialize_doc(draft) or {}
+    try:
+        from utils.lead_notification_service import create_new_lead_notifications
+
+        await create_new_lead_notifications(ser)
+    except Exception:
+        logger.exception("in-app lead notification after insert failed")
+    return ser, False
 
 
 async def create_lead_from_payload(data: LeadCreate) -> Dict[str, Any]:

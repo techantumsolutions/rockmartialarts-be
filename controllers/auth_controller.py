@@ -341,6 +341,7 @@ class AuthController:
                 await fire_student_self_welcome(
                     student_email=user_dict.get("email"),
                     student_name=user_dict.get("full_name") or "Student",
+                    student_phone=user_dict.get("phone"),
                 )
         except Exception:
             logger.exception("ops email after self registration failed")
@@ -640,6 +641,7 @@ class AuthController:
                 await fire_student_account_ready(
                     student_email=user.get("email"),
                     student_name=user.get("full_name") or user.get("first_name") or "Student",
+                    student_phone=user.get("phone"),
                 )
         except Exception:
             logger.exception("ops email after password reset failed")
@@ -1337,6 +1339,7 @@ class AuthController:
                 parent_email=acc.get("email") or user_dict.get("email"),
                 parent_name=acc.get("full_name") or acc.get("name") or "Parent",
                 student_name=full_name or "Student",
+                parent_phone=acc.get("phone") or user_dict.get("phone"),
             )
         except Exception:
             logger.exception("ops email after linked student create failed")

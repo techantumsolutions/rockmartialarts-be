@@ -380,7 +380,11 @@ class CourseController:
             stamp_tenant,
             partner_branch_ids,
             assert_tenant_doc_access,
+            is_partner_super_admin,
         )
+        from utils.partner_org_access import assert_partner_feature_for_user, is_partner_feature_enabled
+
+        await assert_partner_feature_for_user(db, current_user, "courses")
 
         # Check for duplicate course title (scoped per partner tenant)
         title_query = {
@@ -400,6 +404,7 @@ class CourseController:
             sub_doc = await db.categories.find_one({"id": sub_category})
             assert_tenant_doc_access(sub_doc, current_user, entity="category")
         payload = course_data.dict()
+        explicit_partner_org = str(payload.pop("partner_org_id", None) or "").strip()
         payload["category_id"] = category_id
         payload["sub_category"] = sub_category
         payload["slug"] = await ensure_course_slug(
@@ -423,6 +428,43 @@ class CourseController:
         course_dict["created_by_role"] = str(creator_role) if creator_role else None
         course_dict["created_by_name"] = creator_name or None
         stamp_tenant(course_dict, current_user)
+
+        target_partner_org = explicit_partner_org or str(
+            getattr(course_data, "partner_org_id", None) or ""
+        ).strip()
+        current_role = current_user.get("role")
+        if target_partner_org:
+            if is_partner_super_admin(current_user):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Partner admins cannot create courses for another organization",
+                )
+            if str(current_role) not in ("super_admin", "superadmin"):
+                raise HTTPException(status_code=403, detail="Only Rock Super Admin can target a partner org")
+            org = await db.partner_organizations.find_one({"id": target_partner_org})
+            if not org:
+                raise HTTPException(status_code=404, detail="Partner organization not found")
+            if not is_partner_feature_enabled(org, "courses"):
+                raise HTTPException(status_code=403, detail="Courses are disabled for this partner")
+            course_dict["partner_org_id"] = target_partner_org
+            requested_branches = [str(b).strip() for b in (course_data.branch_ids or []) if str(b).strip()]
+            if requested_branches:
+                branch_rows = await db.branches.find(
+                    {"id": {"$in": requested_branches}, "partner_org_id": target_partner_org},
+                    {"id": 1},
+                ).to_list(length=len(requested_branches) + 5)
+                found = {str(b.get("id")) for b in branch_rows}
+                missing = [b for b in requested_branches if b not in found]
+                if missing:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="One or more branches do not belong to the selected partner",
+                    )
+                course_dict["branch_ids"] = requested_branches
+            else:
+                course_dict["branch_ids"] = await db.branches.distinct(
+                    "id", {"partner_org_id": target_partner_org, "is_active": True}
+                )
 
         current_role = current_user.get("role")
         if current_role == UserRole.BRANCH_MANAGER or str(current_role) == "branch_manager":
@@ -468,6 +510,9 @@ class CourseController:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
+        from utils.partner_org_access import assert_partner_feature_for_user
+
+        await assert_partner_feature_for_user(db, current_user, "courses")
         filter_query = {}
 
         if active_only:

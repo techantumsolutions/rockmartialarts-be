@@ -207,6 +207,13 @@ async def get_coaches(
     course_id: Optional[str] = Query(
         None, description="Only coaches assigned to this course"
     ),
+    training_mode: Optional[str] = Query(
+        None, description="Filter by training mode: online | offline"
+    ),
+    registration_source: Optional[str] = Query(
+        None,
+        description="Filter by how the coach was created: admin (in-house) | self (online enrollment)",
+    ),
     all_tenants: bool = Query(
         False, description="Super admin only: include coaches across all partner tenants"
     ),
@@ -214,7 +221,17 @@ async def get_coaches(
 ):
     """Get coaches with filtering options"""
     return await CoachController.get_coaches(
-        skip, limit, active_only, area_of_expertise, current_user, approval_status, branch_id, course_id, all_tenants
+        skip,
+        limit,
+        active_only,
+        area_of_expertise,
+        current_user,
+        approval_status,
+        branch_id,
+        course_id,
+        all_tenants,
+        training_mode,
+        registration_source,
     )
 
 @router.get("/me")
