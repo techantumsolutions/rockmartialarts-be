@@ -221,10 +221,19 @@ class BranchController:
                     "limit": limit,
                     "message": "No branches assigned to this manager"
                 }
-        from utils.partner_tenant import tenant_or_rock_owned_filter
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_org_id_of,
+            rock_dashboard_branch_clause,
+            tenant_or_rock_owned_filter,
+        )
 
-        # Partner → own tenant only; Rock SA/BM → rock-owned only (no partner branches).
-        filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
+        # Partner → own tenant only; Rock SA/BM → rock-owned only (no partner /
+        # collaboration-partner branches on the main RMA dashboard).
+        if partner_org_id_of(current_user):
+            filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
+        else:
+            filter_query = merge_and_clause(filter_query, rock_dashboard_branch_clause())
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 

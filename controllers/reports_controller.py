@@ -429,8 +429,23 @@ class ReportsController:
                     "generated_at": dt.datetime.utcnow(),
                     "message": "No branches assigned to this partner"
                 }
-        elif branch_id and current_user["role"] in ("superadmin", "super_admin"):
-            managed_branch_ids = [branch_id] if branch_id else []
+        elif current_user["role"] in ("superadmin", "super_admin"):
+            from utils.partner_tenant import (
+                merge_and_clause,
+                rock_dashboard_branch_clause,
+                rock_owned_clause,
+            )
+
+            rock_ids = [
+                str(b)
+                for b in (await db.branches.distinct("id", rock_dashboard_branch_clause()) or [])
+                if b
+            ]
+            if branch_id:
+                managed_branch_ids = [branch_id] if str(branch_id) in set(rock_ids) else []
+            else:
+                managed_branch_ids = rock_ids
+            filter_query = merge_and_clause(filter_query, rock_owned_clause())
 
         try:
             # Build enrollment filter for branch managers
@@ -481,8 +496,7 @@ class ReportsController:
             ]).to_list(1000)
 
             # Active students by branch - use enrollments for accurate branch filtering
-            if current_user["role"] in ("branch_manager", "partner_super_admin") and managed_branch_ids:
-                # For branch managers, get students through enrollments to ensure accurate branch association
+            if managed_branch_ids:
                 students_by_branch = await db.enrollments.aggregate([
                     {"$match": {"is_active": True, "branch_id": {"$in": managed_branch_ids}}},
                     {"$group": {
@@ -502,7 +516,7 @@ class ReportsController:
                     {"$unwind": "$branch_info"}
                 ]).to_list(20)
             else:
-                # For superadmin and coach_admin, use the original approach
+                # Coach admin without managed list — original approach
                 students_by_branch = await db.users.aggregate([
                     {"$match": filter_query},
                     {"$group": {
@@ -633,9 +647,22 @@ class ReportsController:
                         },
                         "message": "No branches assigned to this partner"
                     }
-            # For superadmin, no branch filtering needed (managed_branch_ids stays empty)
+            elif current_user["role"] in ("superadmin", "super_admin"):
+                from utils.partner_tenant import rock_dashboard_branch_clause
 
-            # Get branches (filtered for branch managers)
+                managed_branch_ids = [
+                    str(b)
+                    for b in (
+                        await db.branches.distinct(
+                            "id",
+                            {"$and": [{"is_active": True}, rock_dashboard_branch_clause()]},
+                        )
+                        or []
+                    )
+                    if b
+                ]
+
+            # Get branches (filtered for branch managers / Rock SA isolation)
             branch_filter = {"is_active": True}
             if managed_branch_ids:
                 branch_filter["id"] = {"$in": managed_branch_ids}
@@ -811,14 +838,41 @@ class ReportsController:
         db = get_db()
 
         # Build filter query for branches
-        branch_filter = {}
-        if current_user["role"] == "coach_admin" and current_user.get("branch_id"):
+        branch_filter: Dict[str, Any] = {}
+        role = str(current_user.get("role") or "")
+        if role == "coach_admin" and current_user.get("branch_id"):
             branch_filter["id"] = current_user["branch_id"]
-        elif current_user["role"] == "partner_super_admin":
+        elif role == "partner_super_admin":
             from utils.partner_tenant import partner_report_branch_ids
 
             scoped_ids = await partner_report_branch_ids(db, current_user, branch_id) or []
             branch_filter["id"] = {"$in": scoped_ids}
+        elif role == "branch_manager":
+            managed = current_user.get("managed_branches") or []
+            if branch_id and branch_id != "all":
+                if str(branch_id) not in {str(b) for b in managed}:
+                    branch_filter["id"] = {"$in": []}
+                else:
+                    branch_filter["id"] = branch_id
+            else:
+                branch_filter["id"] = {"$in": list(managed)}
+        elif role in ("super_admin", "superadmin"):
+            from utils.partner_tenant import merge_and_clause, rock_dashboard_branch_clause
+
+            # Rock SA: RMA branches only (exclude partner / collaboration partners).
+            rock_clause = rock_dashboard_branch_clause()
+            if branch_id and branch_id != "all":
+                rock_ids = {
+                    str(b)
+                    for b in (await db.branches.distinct("id", rock_clause) or [])
+                    if b
+                }
+                if str(branch_id) not in rock_ids:
+                    branch_filter["id"] = {"$in": []}
+                else:
+                    branch_filter["id"] = branch_id
+            else:
+                branch_filter = merge_and_clause(branch_filter, rock_clause)
         elif branch_id and branch_id != "all":
             branch_filter["id"] = branch_id
 
@@ -983,16 +1037,32 @@ class ReportsController:
         db = get_db()
 
         try:
-            from utils.partner_tenant import partner_report_branch_ids
+            from utils.partner_tenant import (
+                merge_and_clause,
+                partner_report_branch_ids,
+                rock_dashboard_branch_clause,
+            )
 
             branch_list_filter: Dict[str, Any] = {}
+            role = str(current_user.get("role") or "")
             partner_branch_ids_for_filters = await partner_report_branch_ids(db, current_user)
             if partner_branch_ids_for_filters is not None:
                 branch_list_filter["id"] = {"$in": partner_branch_ids_for_filters}
+            elif role == "branch_manager":
+                managed = current_user.get("managed_branches") or []
+                branch_list_filter["id"] = {"$in": list(managed)}
+            elif role in ("super_admin", "superadmin"):
+                # Rock SA filter dropdown: RMA branches only
+                branch_list_filter = merge_and_clause(
+                    branch_list_filter, rock_dashboard_branch_clause()
+                )
+            elif role == "coach_admin" and current_user.get("branch_id"):
+                branch_list_filter["id"] = current_user["branch_id"]
+
             branches = await db.branches.find(
                 branch_list_filter,
                 {"id": 1, "branch.name": 1, "name": 1, "branch.code": 1, "code": 1}
-            ).to_list(100)
+            ).to_list(200)
 
             branch_options = []
             for branch in branches:
@@ -1661,7 +1731,8 @@ class ReportsController:
         active_only: bool = True,
         search: Optional[str] = None,
         skip: int = 0,
-        limit: int = 20
+        limit: int = 20,
+        course_id: Optional[str] = None,
     ):
         """Get course reports with filtering and search - matches branches page filtering pattern"""
         try:
@@ -1670,6 +1741,16 @@ class ReportsController:
             # Apply role-based filtering using the same pattern as branches page
             managed_branch_ids = []
             current_role = current_user.get("role")
+            empty_courses = {
+                "courses": [],
+                "pagination": {"total": 0, "skip": skip, "limit": limit, "has_more": False},
+                "summary": {
+                    "total_courses": 0,
+                    "active_courses": 0,
+                    "total_enrollments": 0,
+                    "active_enrollments": 0,
+                },
+            }
 
             if current_role == "branch_manager" or current_role == "partner_super_admin":
                 # Use the same pattern as branches controller
@@ -1683,18 +1764,14 @@ class ReportsController:
                 if not managed_branch_ids:
                     # Return empty result if no branches are managed (same as branches page)
                     return {
-                        "courses": [],
-                        "pagination": {"total": 0, "skip": skip, "limit": limit, "has_more": False},
-                        "summary": {"total_courses": 0, "active_courses": 0, "total_enrollments": 0, "active_enrollments": 0},
+                        **empty_courses,
                         "message": "No branches assigned to this manager"
                     }
 
                 # Validate branch_id if provided (same as branches page logic)
                 if branch_id and branch_id not in managed_branch_ids:
                     return {
-                        "courses": [],
-                        "pagination": {"total": 0, "skip": skip, "limit": limit, "has_more": False},
-                        "summary": {"total_courses": 0, "active_courses": 0, "total_enrollments": 0, "active_enrollments": 0},
+                        **empty_courses,
                         "message": "Access denied: Branch not managed by this branch manager"
                     }
 
@@ -1702,37 +1779,70 @@ class ReportsController:
             elif current_role == "coach_admin" and current_user.get("branch_id"):
                 # Coach admin filtering (existing logic)
                 managed_branch_ids = [current_user["branch_id"]]
+            elif current_role in ("super_admin", "superadmin"):
+                from utils.partner_tenant import rock_dashboard_branch_clause
 
-            # Partner courses are those assigned to their branches (or stamped to the org),
-            # not only courses that already have an enrollment.
-            partner_course_ids = None
-            if current_role == "partner_super_admin":
+                rock_ids = [
+                    str(b)
+                    for b in (await db.branches.distinct("id", rock_dashboard_branch_clause()) or [])
+                    if b
+                ]
+                if branch_id and str(branch_id) not in set(rock_ids):
+                    return {
+                        **empty_courses,
+                        "message": "Access denied: Branch is outside Rock Martial Arts scope",
+                    }
+                managed_branch_ids = [str(branch_id)] if branch_id else rock_ids
+
+            # Courses assigned to scoped branches (partner + Rock SA isolation).
+            scoped_course_ids = None
+            if current_role in ("partner_super_admin", "super_admin", "superadmin") and managed_branch_ids:
                 from utils.branch_courses import available_course_ids_for_branch
-                from utils.partner_tenant import partner_org_id_of
+                from utils.partner_tenant import partner_org_id_of, rock_owned_clause
 
                 related_ids = set()
-                org_id = partner_org_id_of(current_user)
-                if org_id:
-                    stamped = await db.courses.distinct("id", {"partner_org_id": org_id})
+                if current_role == "partner_super_admin":
+                    org_id = partner_org_id_of(current_user)
+                    if org_id:
+                        stamped = await db.courses.distinct("id", {"partner_org_id": org_id})
+                        related_ids.update(str(cid) for cid in (stamped or []) if cid)
+                else:
+                    # Rock SA: only rock-owned course docs (never partner-stamped).
+                    stamped = await db.courses.distinct("id", rock_owned_clause())
                     related_ids.update(str(cid) for cid in (stamped or []) if cid)
-                partner_branches = await db.branches.find(
-                    {"id": {"$in": list(managed_branch_ids)}}
+
+                scope_branch_ids = [branch_id] if branch_id else list(managed_branch_ids)
+                scoped_branches = await db.branches.find(
+                    {"id": {"$in": list(scope_branch_ids)}}
                 ).to_list(length=200)
-                for branch in partner_branches:
+                assigned_ids = set()
+                for branch in scoped_branches:
                     for cid in await available_course_ids_for_branch(db, branch):
                         if cid:
-                            related_ids.add(str(cid))
-                enrolled = await db.enrollments.distinct(
-                    "course_id",
-                    {"branch_id": {"$in": list(managed_branch_ids)}},
-                )
-                related_ids.update(str(cid) for cid in (enrolled or []) if cid)
-                partner_course_ids = list(related_ids)
+                            assigned_ids.add(str(cid))
+                if assigned_ids:
+                    # Prefer courses allocated to the branch(es); intersect with tenant stamp when present.
+                    if related_ids:
+                        related_ids = related_ids.intersection(assigned_ids) or assigned_ids
+                    else:
+                        related_ids = assigned_ids
+                elif current_role == "partner_super_admin":
+                    enrolled = await db.enrollments.distinct(
+                        "course_id",
+                        {"branch_id": {"$in": list(managed_branch_ids)}},
+                    )
+                    related_ids.update(str(cid) for cid in (enrolled or []) if cid)
+                scoped_course_ids = list(related_ids)
 
             # Build course filter
             course_filter = {}
-            if partner_course_ids is not None:
-                course_filter["id"] = {"$in": partner_course_ids}
+            if scoped_course_ids is not None:
+                course_filter["id"] = {"$in": scoped_course_ids}
+            if course_id:
+                cid = str(course_id).strip()
+                if scoped_course_ids is not None and cid not in set(scoped_course_ids):
+                    return {**empty_courses, "message": "Course not available for selected branch"}
+                course_filter["id"] = cid
             if active_only:
                 course_filter["settings.active"] = True
             if category_id:
@@ -1771,10 +1881,14 @@ class ReportsController:
             ]
 
             # Add branch filtering based on user role and permissions
-            if current_user["role"] in ("branch_manager", "partner_super_admin"):
-                # For branch managers and partner admins, filter enrollments to their branches
+            if current_user["role"] in (
+                "branch_manager",
+                "partner_super_admin",
+                "super_admin",
+                "superadmin",
+            ) and managed_branch_ids:
+                # Scope enrollments to managed / Rock / partner branches
                 if branch_id:
-                    # Specific branch requested
                     pipeline.append({
                         "$addFields": {
                             "enrollments": {
@@ -1786,7 +1900,6 @@ class ReportsController:
                         }
                     })
                 else:
-                    # Filter by all managed branches
                     pipeline.append({
                         "$addFields": {
                             "enrollments": {
@@ -1865,7 +1978,12 @@ class ReportsController:
             ]
 
             # Apply branch filtering for count
-            if current_user["role"] in ("branch_manager", "partner_super_admin"):
+            if current_user["role"] in (
+                "branch_manager",
+                "partner_super_admin",
+                "super_admin",
+                "superadmin",
+            ) and managed_branch_ids:
                 if branch_id:
                     count_pipeline.append({
                         "$addFields": {
@@ -1889,7 +2007,7 @@ class ReportsController:
                         }
                     })
                 # Branch managers: count only courses with enrollments.
-                # Partners: count every assigned course, even with zero enrollments.
+                # Partners / Rock SA: count every assigned course, even with zero enrollments.
                 if current_user["role"] == "branch_manager":
                     count_pipeline.append({
                         "$match": {
@@ -1962,19 +2080,27 @@ class ReportsController:
             raise HTTPException(status_code=500, detail=f"Error getting course reports: {str(e)}")
 
     @staticmethod
-    async def get_course_report_filters(current_user: dict):
-        """Get filter options for course reports"""
+    async def get_course_report_filters(
+        current_user: dict, branch_id: Optional[str] = None
+    ):
+        """Get filter options for course reports (RMA branches only for Rock SA)."""
         try:
             db = get_db()
+            from utils.branch_courses import available_course_ids_for_branch
+            from utils.partner_tenant import (
+                merge_and_clause,
+                partner_report_branch_ids,
+                rock_dashboard_branch_clause,
+                rock_owned_clause,
+            )
 
             # Get branches (filtered by user role)
-            branch_filter = {}
+            branch_filter: dict = {"is_active": True}
             managed_branch_ids = []
+            role = str(current_user.get("role") or "")
 
-            if current_user["role"] == "branch_manager" or current_user["role"] == "partner_super_admin":
-                if current_user["role"] == "partner_super_admin":
-                    from utils.partner_tenant import partner_report_branch_ids
-
+            if role == "branch_manager" or role == "partner_super_admin":
+                if role == "partner_super_admin":
                     managed_branch_ids = await partner_report_branch_ids(db, current_user) or []
                 else:
                     managed_branch_ids = current_user.get("managed_branches", [])
@@ -1982,6 +2108,7 @@ class ReportsController:
                     return {
                         "filters": {
                             "branches": [],
+                            "courses": [],
                             "categories": [],
                             "difficulty_levels": [],
                             "active_status": [
@@ -1993,14 +2120,26 @@ class ReportsController:
                         "generated_at": dt.datetime.utcnow()
                     }
                 branch_filter["id"] = {"$in": managed_branch_ids}
-            elif current_user["role"] == "coach_admin" and current_user.get("branch_id"):
+            elif role == "coach_admin" and current_user.get("branch_id"):
+                managed_branch_ids = [current_user["branch_id"]]
                 branch_filter["id"] = current_user["branch_id"]
+            elif role in ("super_admin", "superadmin"):
+                # Rock SA: RMA-created branches only (exclude partner / collaboration).
+                branch_filter = merge_and_clause(
+                    {"is_active": True}, rock_dashboard_branch_clause()
+                )
+                managed_branch_ids = [
+                    str(b)
+                    for b in (await db.branches.distinct("id", branch_filter) or [])
+                    if b
+                ]
 
             branches_cursor = db.branches.find(branch_filter)
-            branches = await branches_cursor.to_list(length=100)
+            branches = await branches_cursor.to_list(length=200)
             branch_options = []
+            branches_by_id = {}
             for branch in branches:
-                # Handle both nested and direct branch structures
+                branches_by_id[str(branch.get("id"))] = branch
                 if 'branch' in branch and isinstance(branch['branch'], dict):
                     name = branch['branch'].get('name', 'Unknown')
                     code = branch['branch'].get('code', '')
@@ -2010,6 +2149,61 @@ class ReportsController:
 
                 display_name = f"{name} ({code})" if code else name
                 branch_options.append({"id": branch["id"], "name": display_name})
+
+            # Courses: when a branch is selected, only courses allocated to that branch.
+            course_ids: list = []
+            req_branch = str(branch_id or "").strip()
+            if req_branch in {"", "all"}:
+                req_branch = ""
+            if req_branch:
+                if managed_branch_ids and req_branch not in {str(b) for b in managed_branch_ids}:
+                    course_ids = []
+                else:
+                    branch_doc = branches_by_id.get(req_branch) or await db.branches.find_one(
+                        {"id": req_branch}
+                    )
+                    if branch_doc:
+                        course_ids = [
+                            str(cid)
+                            for cid in await available_course_ids_for_branch(db, branch_doc)
+                            if cid
+                        ]
+            elif managed_branch_ids:
+                seen = set()
+                for bid in managed_branch_ids:
+                    bdoc = branches_by_id.get(str(bid))
+                    if not bdoc:
+                        continue
+                    for cid in await available_course_ids_for_branch(db, bdoc):
+                        if cid and str(cid) not in seen:
+                            seen.add(str(cid))
+                            course_ids.append(str(cid))
+            else:
+                course_q = {"settings.active": True}
+                if role in ("super_admin", "superadmin"):
+                    course_q = merge_and_clause(course_q, rock_owned_clause())
+                course_ids = [
+                    str(c)
+                    for c in (await db.courses.distinct("id", course_q) or [])
+                    if c
+                ]
+
+            course_options = []
+            if course_ids:
+                course_docs = await db.courses.find(
+                    {"id": {"$in": course_ids}},
+                    {"id": 1, "title": 1, "name": 1, "code": 1},
+                ).to_list(length=500)
+                for c in course_docs:
+                    title = c.get("title") or c.get("name") or "Course"
+                    code = c.get("code") or ""
+                    course_options.append(
+                        {
+                            "id": c["id"],
+                            "name": f"{title} ({code})" if code else title,
+                        }
+                    )
+                course_options.sort(key=lambda x: x["name"])
 
             # Get categories
             categories_cursor = db.categories.find({"is_active": True}, {"id": 1, "name": 1})
@@ -2035,6 +2229,7 @@ class ReportsController:
             return {
                 "filters": {
                     "branches": branch_options,
+                    "courses": course_options,
                     "categories": category_options,
                     "difficulty_levels": difficulty_options,
                     "active_status": [
@@ -2043,7 +2238,7 @@ class ReportsController:
                     ]
                 },
                 "user_role": current_user["role"],
-                "managed_branches": managed_branch_ids if current_user["role"] == "branch_manager" else None,
+                "managed_branches": managed_branch_ids if role == "branch_manager" else None,
                 "generated_at": dt.datetime.utcnow()
             }
 

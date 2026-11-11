@@ -85,25 +85,41 @@ async def _resolve_user_from_token(db, token: str) -> dict:
         manager_data = serialize_doc(branch_manager)
         manager_data["role"] = "branch_manager"
 
-        jwt_managed_branches = payload.get("managed_branches", [])
-        if jwt_managed_branches:
-            manager_data["managed_branches"] = jwt_managed_branches
-            print(f"Using managed branches from JWT token: {jwt_managed_branches}")
-        else:
-            managed_branches = await db.branches.find({"manager_id": user_id, "is_active": True}).to_list(length=None)
-            managed_branch_ids = [branch["id"] for branch in managed_branches]
+        # Always resolve from live active branches — never trust stale JWT managed_branches.
+        managed_branches = await db.branches.find(
+            {"manager_id": user_id, "is_active": True}
+        ).to_list(length=None)
+        managed_branch_ids = [branch["id"] for branch in managed_branches if branch.get("id")]
 
-            manager_data["managed_branches"] = managed_branch_ids
-            print(f"Using managed branches from database: {managed_branch_ids}")
+        if not managed_branch_ids:
+            branch_assignment = manager_data.get("branch_assignment") or {}
+            assignment_bid = branch_assignment.get("branch_id") or manager_data.get("branch_id")
+            if assignment_bid:
+                fallback_branch = await db.branches.find_one(
+                    {"id": assignment_bid, "is_active": True}
+                )
+                if fallback_branch:
+                    managed_branch_ids = [fallback_branch["id"]]
 
-            if not managed_branch_ids:
-                branch_assignment = manager_data.get("branch_assignment")
-                if branch_assignment and branch_assignment.get("branch_id"):
-                    fallback_branch = await db.branches.find_one({"id": branch_assignment["branch_id"], "is_active": True})
-                    if fallback_branch:
-                        manager_data["managed_branches"] = [fallback_branch["id"]]
-                        print(f"Using managed branches from branch assignment: {[fallback_branch['id']]}")
+        manager_data["managed_branches"] = managed_branch_ids
 
+        if branch_manager.get("is_active") is False:
+            raise HTTPException(
+                status_code=401,
+                detail="Account is inactive. Please contact administrator.",
+            )
+
+        if not managed_branch_ids:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "BRANCH_INACTIVE: This branch account is disabled. "
+                    "Please contact administrator."
+                ),
+            )
+
+        # Stale X-Active-Branch-Id (deactivated branch) is ignored here: helpers
+        # fall back to the first live active branch. FE shows Access Denied + switch.
         return manager_data
 
     # Check if it's a coach token

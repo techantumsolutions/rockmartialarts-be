@@ -402,15 +402,23 @@ class InvoiceController:
         if not doc:
             raise HTTPException(status_code=404, detail="Invoice not found")
         await InvoiceController._assert_can_access(doc, current_user)
-        html = doc.get("document_html")
-        if not html:
-            from utils.invoice_document import build_invoice_html
 
-            html = build_invoice_html(serialize_doc(doc))
-            await db.invoices.update_one(
-                {"id": invoice_id},
-                {"$set": {"document_html": html, "updated_at": datetime.utcnow()}},
-            )
+        from utils.invoice_document import (
+            build_invoice_html,
+            resolve_invoice_company_branding,
+        )
+
+        ser = serialize_doc(doc)
+        company = await resolve_invoice_company_branding(db, ser)
+        ser["company"] = company
+        html = build_invoice_html(ser)
+        try:
+            update_fields: Dict[str, Any] = {"document_html": html, "company": company, "updated_at": datetime.utcnow()}
+            if company.get("partner_org_id"):
+                update_fields["partner_org_id"] = company["partner_org_id"]
+            await db.invoices.update_one({"id": invoice_id}, {"$set": update_fields})
+        except Exception:
+            pass
         return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
 
     @staticmethod

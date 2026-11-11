@@ -159,6 +159,7 @@ class AttendanceController:
                 apply_partner_branch_scope,
                 merge_and_clause,
                 partner_branch_ids,
+                rock_dashboard_branch_clause,
                 rock_owned_clause,
             )
 
@@ -169,12 +170,14 @@ class AttendanceController:
                 branch_id=branch_id if role != "branch_manager" else None,
             )
 
-            # Rock SA/BM: attendance rows are branch-scoped — exclude partner-tenant branches.
+            # Rock SA/BM: attendance rows are branch-scoped — exclude partner-tenant
+            # and collaboration-partner branches (RMA main dashboard isolation).
             partner_bids = await partner_branch_ids(db, current_user)
-            if partner_bids is None:
-                rock_bids = await db.branches.distinct(
-                    "id", merge_and_clause({"is_active": True}, rock_owned_clause())
-                )
+            rock_scope = partner_bids is None
+            if rock_scope:
+                # Include inactive Rock branches for historical reports; never partner /
+                # collaboration-partner branches.
+                rock_bids = await db.branches.distinct("id", rock_dashboard_branch_clause())
                 rock_set = {str(b) for b in (rock_bids or []) if b}
                 existing = filter_query.get("branch_id")
                 if isinstance(existing, str) and existing:
@@ -198,6 +201,8 @@ class AttendanceController:
                     filter_query["branch_id"] = {"$in": allowed}
                 else:
                     filter_query["branch_id"] = {"$in": list(rock_bids or [])}
+                # Attendance docs stamped to a partner org must never appear on Rock SA.
+                filter_query = merge_and_clause(filter_query, rock_owned_clause())
 
             apply_status_filter(filter_query, status)
             apply_method_filter(filter_query, method)
@@ -260,66 +265,93 @@ class AttendanceController:
                         }
                     },
                     {"$unwind": {"path": "$student_info", "preserveNullAndEmptyArrays": True}},
-                    {
-                        "$lookup": {
-                            "from": "courses",
-                            "localField": "course_id",
-                            "foreignField": "id",
-                            "as": "course_info",
-                        }
-                    },
-                    {"$unwind": {"path": "$course_info", "preserveNullAndEmptyArrays": True}},
-                    {
-                        "$lookup": {
-                            "from": "branches",
-                            "localField": "branch_id",
-                            "foreignField": "id",
-                            "as": "branch_info",
-                        }
-                    },
-                    {"$unwind": {"path": "$branch_info", "preserveNullAndEmptyArrays": True}},
-                    {
-                        "$project": {
-                            "id": 1,
-                            "student_id": 1,
-                            "student_name": {
-                                "$ifNull": [
-                                    "$student_info.full_name",
-                                    {
-                                        "$concat": [
-                                            "$student_info.first_name",
-                                            " ",
-                                            "$student_info.last_name",
-                                        ]
-                                    },
-                                ]
-                            },
-                            "course_id": 1,
-                            "course_name": {
-                                "$ifNull": ["$course_info.title", "$course_info.name"]
-                            },
-                            "branch_id": 1,
-                            "branch_name": {
-                                "$ifNull": [
-                                    "$branch_info.branch.name",
-                                    "$branch_info.name",
-                                ]
-                            },
-                            "attendance_date": 1,
-                            "check_in_time": 1,
-                            "check_out_time": 1,
-                            "is_present": 1,
-                            "status": 1,
-                            "method": 1,
-                            "notes": 1,
-                            "created_at": 1,
-                            "admin_adjusted": 1,
-                            "attendance_modified_at": 1,
-                            "attendance_modified_by": 1,
-                            "updated_at": 1,
-                        }
-                    },
                 ]
+                if rock_scope:
+                    # Drop partner-tenant students even if they attended a Rock branch.
+                    pipeline.append(
+                        {
+                            "$match": {
+                                "$or": [
+                                    {"student_info.partner_org_id": {"$exists": False}},
+                                    {"student_info.partner_org_id": None},
+                                    {"student_info.partner_org_id": ""},
+                                ]
+                            }
+                        }
+                    )
+                pipeline.extend(
+                    [
+                        {
+                            "$lookup": {
+                                "from": "courses",
+                                "localField": "course_id",
+                                "foreignField": "id",
+                                "as": "course_info",
+                            }
+                        },
+                        {
+                            "$unwind": {
+                                "path": "$course_info",
+                                "preserveNullAndEmptyArrays": True,
+                            }
+                        },
+                        {
+                            "$lookup": {
+                                "from": "branches",
+                                "localField": "branch_id",
+                                "foreignField": "id",
+                                "as": "branch_info",
+                            }
+                        },
+                        {
+                            "$unwind": {
+                                "path": "$branch_info",
+                                "preserveNullAndEmptyArrays": True,
+                            }
+                        },
+                        {
+                            "$project": {
+                                "id": 1,
+                                "student_id": 1,
+                                "student_name": {
+                                    "$ifNull": [
+                                        "$student_info.full_name",
+                                        {
+                                            "$concat": [
+                                                "$student_info.first_name",
+                                                " ",
+                                                "$student_info.last_name",
+                                            ]
+                                        },
+                                    ]
+                                },
+                                "course_id": 1,
+                                "course_name": {
+                                    "$ifNull": ["$course_info.title", "$course_info.name"]
+                                },
+                                "branch_id": 1,
+                                "branch_name": {
+                                    "$ifNull": [
+                                        "$branch_info.branch.name",
+                                        "$branch_info.name",
+                                    ]
+                                },
+                                "attendance_date": 1,
+                                "check_in_time": 1,
+                                "check_out_time": 1,
+                                "is_present": 1,
+                                "status": 1,
+                                "method": 1,
+                                "notes": 1,
+                                "created_at": 1,
+                                "admin_adjusted": 1,
+                                "attendance_modified_at": 1,
+                                "attendance_modified_by": 1,
+                                "updated_at": 1,
+                            }
+                        },
+                    ]
+                )
                 student_rows = await db.attendance.aggregate(pipeline).to_list(
                     length=fetch_limit
                 )
@@ -351,87 +383,103 @@ class AttendanceController:
                             "preserveNullAndEmptyArrays": True,
                         }
                     },
-                    {
-                        "$lookup": {
-                            "from": "branches",
-                            "localField": "branch_id",
-                            "foreignField": "id",
-                            "as": "branch_info",
-                        }
-                    },
-                    {
-                        "$unwind": {
-                            "path": "$branch_info",
-                            "preserveNullAndEmptyArrays": True,
-                        }
-                    },
-                    {
-                        "$project": {
-                            "id": 1,
-                            "coach_id": 1,
-                            "student_id": {"$literal": None},
-                            "student_name": {
-                                "$ifNull": [
-                                    "$coach_info.full_name",
-                                    {
-                                        "$ifNull": [
-                                            "$coach_info.personal_info.full_name",
-                                            {
-                                                "$trim": {
-                                                    "input": {
-                                                        "$concat": [
-                                                            {
-                                                                "$ifNull": [
-                                                                    "$coach_info.first_name",
-                                                                    {
-                                                                        "$ifNull": [
-                                                                            "$coach_info.personal_info.first_name",
-                                                                            "",
-                                                                        ]
-                                                                    },
-                                                                ]
-                                                            },
-                                                            " ",
-                                                            {
-                                                                "$ifNull": [
-                                                                    "$coach_info.last_name",
-                                                                    {
-                                                                        "$ifNull": [
-                                                                            "$coach_info.personal_info.last_name",
-                                                                            "",
-                                                                        ]
-                                                                    },
-                                                                ]
-                                                            },
-                                                        ]
-                                                    }
-                                                }
-                                            },
-                                        ]
-                                    },
-                                ]
-                            },
-                            "course_id": {"$literal": None},
-                            "course_name": {"$literal": "—"},
-                            "branch_id": 1,
-                            "branch_name": {
-                                "$ifNull": [
-                                    "$branch_info.branch.name",
-                                    "$branch_info.name",
-                                ]
-                            },
-                            "attendance_date": 1,
-                            "check_in_time": 1,
-                            "check_out_time": 1,
-                            "is_present": 1,
-                            "status": 1,
-                            "method": 1,
-                            "notes": 1,
-                            "created_at": 1,
-                            "updated_at": 1,
-                        }
-                    },
                 ]
+                if rock_scope:
+                    coach_pipeline.append(
+                        {
+                            "$match": {
+                                "$or": [
+                                    {"coach_info.partner_org_id": {"$exists": False}},
+                                    {"coach_info.partner_org_id": None},
+                                    {"coach_info.partner_org_id": ""},
+                                ]
+                            }
+                        }
+                    )
+                coach_pipeline.extend(
+                    [
+                        {
+                            "$lookup": {
+                                "from": "branches",
+                                "localField": "branch_id",
+                                "foreignField": "id",
+                                "as": "branch_info",
+                            }
+                        },
+                        {
+                            "$unwind": {
+                                "path": "$branch_info",
+                                "preserveNullAndEmptyArrays": True,
+                            }
+                        },
+                        {
+                            "$project": {
+                                "id": 1,
+                                "coach_id": 1,
+                                "student_id": {"$literal": None},
+                                "student_name": {
+                                    "$ifNull": [
+                                        "$coach_info.full_name",
+                                        {
+                                            "$ifNull": [
+                                                "$coach_info.personal_info.full_name",
+                                                {
+                                                    "$trim": {
+                                                        "input": {
+                                                            "$concat": [
+                                                                {
+                                                                    "$ifNull": [
+                                                                        "$coach_info.first_name",
+                                                                        {
+                                                                            "$ifNull": [
+                                                                                "$coach_info.personal_info.first_name",
+                                                                                "",
+                                                                            ]
+                                                                        },
+                                                                    ]
+                                                                },
+                                                                " ",
+                                                                {
+                                                                    "$ifNull": [
+                                                                        "$coach_info.last_name",
+                                                                        {
+                                                                            "$ifNull": [
+                                                                                "$coach_info.personal_info.last_name",
+                                                                                "",
+                                                                            ]
+                                                                        },
+                                                                    ]
+                                                                },
+                                                            ]
+                                                        }
+                                                    }
+                                                },
+                                            ]
+                                        },
+                                    ]
+                                },
+                                "course_id": {"$literal": None},
+                                "course_name": {"$literal": "—"},
+                                "branch_id": 1,
+                                "branch_name": {
+                                    "$ifNull": [
+                                        "$branch_info.branch.name",
+                                        "$branch_info.name",
+                                    ]
+                                },
+                                "attendance_date": 1,
+                                "check_in_time": 1,
+                                "check_out_time": 1,
+                                "is_present": 1,
+                                "status": 1,
+                                "method": 1,
+                                "notes": 1,
+                                "created_at": 1,
+                                "updated_at": 1,
+                            }
+                        },
+                    ]
+                )
                 coach_rows = await db.coach_attendance.aggregate(coach_pipeline).to_list(
                     length=fetch_limit
                 )
