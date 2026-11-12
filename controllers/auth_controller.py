@@ -1098,6 +1098,12 @@ class AuthController:
             "address": user.get("address"),
             "emergency_contact": user.get("emergency_contact"),
             "medical_info": user.get("medical_info"),
+            "partner_org_id": (
+                user.get("partner_org_id")
+                or (user.get("created_by") or {}).get("partner_org_id")
+                or (user.get("partner_org") or {}).get("id")
+                or user.get("partner_id")
+            ),
             "is_active": user["is_active"],
             "created_at": user["created_at"],
             "updated_at": user["updated_at"],

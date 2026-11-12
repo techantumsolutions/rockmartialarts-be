@@ -115,6 +115,7 @@ from routes.collaboration_partner_routes import (
     router as collaboration_partner_router,
 )
 from routes.partner_org_routes import router as partner_org_router
+from routes.store_routes import router as store_router
 
 # Import database utility
 from utils.database import db
@@ -534,6 +535,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         logging.exception("Failed to ensure champion indexes")
 
+    try:
+        from controllers.store_controller import seed_store_if_empty
+        await seed_store_if_empty(app.mongodb)
+    except Exception:
+        logging.exception("Failed to seed store data")
+
     # Start scheduled reconciliation (additive; safe when disabled)
     reconcile_task = asyncio.create_task(_payments_reconciliation_loop(app.mongodb))
     
@@ -748,6 +755,7 @@ app.include_router(
 )
 app.include_router(camp_registration_router, prefix="/api/camp-registrations", tags=["Camp Registrations"])
 app.include_router(homepage_content_router, prefix="/api/homepage", tags=["Homepage Content"])
+app.include_router(store_router, prefix="/api/store", tags=["Store"])
 app.include_router(achievement_router, prefix="/api/achievements", tags=["Achievements"])
 app.include_router(student_testimonial_router, prefix="/api/testimonials", tags=["Marketing Testimonials"])
 app.include_router(registration_form_router, prefix="/api/registration-forms", tags=["Registration Forms"])

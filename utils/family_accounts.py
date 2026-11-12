@@ -276,5 +276,11 @@ def student_login_user_payload(user: Dict[str, Any]) -> Dict[str, Any]:
         "profile_image": profile_img,
         "account_id": user.get("account_id"),
         "relationship": user.get("relationship") or "self",
+        "partner_org_id": (
+            user.get("partner_org_id")
+            or (user.get("created_by") or {}).get("partner_org_id")
+            or (user.get("partner_org") or {}).get("id")
+            or user.get("partner_id")
+        ),
         "is_active": user.get("is_active") is not False,
     }
