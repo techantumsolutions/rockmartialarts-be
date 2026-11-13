@@ -92,6 +92,8 @@ class HomeTrainingRequestCreate(BaseModel):
     contact_name: str = Field(..., min_length=1, max_length=200)
     contact_phone: str = Field(..., min_length=5, max_length=32)
     contact_email: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    is_phone_verified: Optional[bool] = False
     branch_id: Optional[str] = Field(default=None, max_length=64)
     branch_name: Optional[str] = Field(default=None, max_length=200)
     source: Optional[str] = Field(default="website", max_length=80)
@@ -142,6 +144,8 @@ class SchoolTrainingRequestCreate(BaseModel):
     contact_name: str = Field(..., min_length=1, max_length=200)
     contact_phone: str = Field(..., min_length=5, max_length=32)
     contact_email: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    is_phone_verified: Optional[bool] = False
     branch_id: Optional[str] = Field(default=None, max_length=64)
     branch_name: Optional[str] = Field(default=None, max_length=200)
     source: Optional[str] = Field(default="website", max_length=80)
@@ -199,6 +203,8 @@ class CollegeTrainingRequestCreate(BaseModel):
     contact_name: str = Field(..., min_length=1, max_length=200)
     contact_phone: str = Field(..., min_length=5, max_length=32)
     contact_email: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    is_phone_verified: Optional[bool] = False
     branch_id: Optional[str] = Field(default=None, max_length=64)
     branch_name: Optional[str] = Field(default=None, max_length=200)
     source: Optional[str] = Field(default="website", max_length=80)
@@ -256,6 +262,8 @@ class CorporateTrainingRequestCreate(BaseModel):
     contact_name: str = Field(..., min_length=1, max_length=200)
     contact_phone: str = Field(..., min_length=5, max_length=32)
     contact_email: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    is_phone_verified: Optional[bool] = False
     branch_id: Optional[str] = Field(default=None, max_length=64)
     branch_name: Optional[str] = Field(default=None, max_length=200)
     source: Optional[str] = Field(default="website", max_length=80)
@@ -383,6 +391,8 @@ class ResidentialTrainingRequestCreate(BaseModel):
     contact_name: str = Field(..., min_length=1, max_length=200)
     contact_phone: str = Field(..., min_length=5, max_length=32)
     contact_email: Optional[str] = Field(default=None, max_length=200)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    is_phone_verified: Optional[bool] = False
     branch_id: Optional[str] = Field(default=None, max_length=64)
     branch_name: Optional[str] = Field(default=None, max_length=200)
     source: Optional[str] = Field(default="website", max_length=80)
@@ -459,6 +469,7 @@ class TrainingRequestDocument(BaseModel):
     coach_rejection_reason: Optional[str] = None
     coach_response_note: Optional[str] = None
     coach_responded_at: Optional[datetime] = None
+    user_id: Optional[str] = None  # linked training_student account id
     created_by: Optional[str] = None  # logged-in student id if any
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -472,5 +483,10 @@ class CreateTrainingOrderBody(BaseModel):
     contact_name: Optional[str] = None
     contact_email: Optional[str] = None
     contact_phone: Optional[str] = None
+
+
+class TrainingLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=200)
+    password: str = Field(..., min_length=1)
 
 

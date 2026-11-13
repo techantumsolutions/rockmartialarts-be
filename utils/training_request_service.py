@@ -24,12 +24,15 @@ from models.training_request_models import (
     HomeTrainingRequestCreate,
     ResidentialTrainingRequestCreate,
     SchoolTrainingRequestCreate,
+    TrainingLoginRequest,
     TrainingRequestCoachAssign,
     TrainingRequestPaymentVerify,
     TrainingRequestStatus,
     TrainingRequestStatusUpdate,
     TrainingRequestType,
 )
+from utils.auth import hash_password, verify_password
+from utils.unified_auth import create_access_token
 from utils.database import get_db
 from utils.helpers import serialize_doc
 from utils.student_status_service import get_managed_branch_ids_for_user
@@ -309,6 +312,8 @@ async def _insert_training_request(
     razorpay_order_id: Optional[str] = None,
     razorpay_payment_id: Optional[str] = None,
     razorpay_signature: Optional[str] = None,
+    password: Optional[str] = None,
+    is_phone_verified: Optional[bool] = False,
     extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     db = get_db()
@@ -334,14 +339,60 @@ async def _insert_training_request(
         now,
     )
 
+    norm_phone = _normalize_phone(contact_phone)
+    norm_email = (contact_email or "").strip().lower()
+
+    # Link to authenticated user or create/update training_student user
+    user_id = None
+    if current_user and current_user.get("id"):
+        user_id = current_user.get("id")
+    elif password and password.strip():
+        existing_user = None
+        if norm_email:
+            existing_user = await db.users.find_one({"email": norm_email})
+        if not existing_user and norm_phone:
+            existing_user = await db.users.find_one({"phone": norm_phone})
+
+        if existing_user:
+            user_id = existing_user["id"]
+            update_data: Dict[str, Any] = {
+                "password": hash_password(password.strip()),
+                "is_phone_verified": True,
+                "updated_at": now,
+            }
+            if not existing_user.get("role"):
+                update_data["role"] = "training_student"
+            await db.users.update_one({"id": user_id}, {"$set": update_data})
+        else:
+            user_id = str(uuid.uuid4())
+            full_name = contact_name.strip()
+            name_parts = full_name.split(" ", 1)
+            first_name = name_parts[0]
+            last_name = name_parts[1] if len(name_parts) > 1 else ""
+            new_user = {
+                "id": user_id,
+                "email": norm_email or f"training_{user_id[:8]}@rockmartialarts.com",
+                "phone": norm_phone,
+                "first_name": first_name,
+                "last_name": last_name,
+                "full_name": full_name,
+                "role": "training_student",
+                "password": hash_password(password.strip()),
+                "is_active": True,
+                "is_phone_verified": bool(is_phone_verified),
+                "created_at": now,
+                "updated_at": now,
+            }
+            await db.users.insert_one(new_user)
+
     doc_id = str(uuid.uuid4())
     doc = {
         "id": doc_id,
         "type": request_type,
         "status": TrainingRequestStatus.SUBMITTED.value,
         "contact_name": contact_name.strip(),
-        "contact_phone": _normalize_phone(contact_phone),
-        "contact_email": (contact_email or "").strip() or None,
+        "contact_phone": norm_phone,
+        "contact_email": norm_email or None,
         "branch_id": bid,
         "branch_name": bname,
         "source": (source or "website").strip() or "website",
@@ -359,7 +410,8 @@ async def _insert_training_request(
         "assigned_coach_name": None,
         "assigned_at": None,
         "assigned_by": None,
-        "created_by": actor.get("id") if _role(current_user) == "student" else None,
+        "user_id": user_id,
+        "created_by": user_id or (actor.get("id") if _role(current_user) in {"student", "training_student"} else None),
         "created_at": now,
         "updated_at": now,
     }
@@ -516,6 +568,8 @@ async def create_home_training_request(
         razorpay_order_id=body.razorpay_order_id,
         razorpay_payment_id=body.razorpay_payment_id,
         razorpay_signature=body.razorpay_signature,
+        password=body.password,
+        is_phone_verified=body.is_phone_verified,
     )
 
 
@@ -539,6 +593,8 @@ async def create_school_training_request(
         razorpay_order_id=body.razorpay_order_id,
         razorpay_payment_id=body.razorpay_payment_id,
         razorpay_signature=body.razorpay_signature,
+        password=body.password,
+        is_phone_verified=body.is_phone_verified,
     )
 
 
@@ -562,6 +618,8 @@ async def create_college_training_request(
         razorpay_order_id=body.razorpay_order_id,
         razorpay_payment_id=body.razorpay_payment_id,
         razorpay_signature=body.razorpay_signature,
+        password=body.password,
+        is_phone_verified=body.is_phone_verified,
     )
 
 
@@ -585,6 +643,8 @@ async def create_corporate_training_request(
         razorpay_order_id=body.razorpay_order_id,
         razorpay_payment_id=body.razorpay_payment_id,
         razorpay_signature=body.razorpay_signature,
+        password=body.password,
+        is_phone_verified=body.is_phone_verified,
     )
 
 
@@ -638,6 +698,8 @@ async def create_residential_training_request(
         razorpay_order_id=body.razorpay_order_id,
         razorpay_payment_id=body.razorpay_payment_id,
         razorpay_signature=body.razorpay_signature,
+        password=body.password,
+        is_phone_verified=body.is_phone_verified,
     )
 
 
@@ -1538,3 +1600,108 @@ async def coach_respond_to_request(
         "message": "Training request rejected successfully",
         "request": serialize_doc(updated),
     }
+
+
+async def training_client_login(
+    credentials: TrainingLoginRequest,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    login_identifier = (credentials.email or "").strip().lower()
+    norm_phone = _normalize_phone(credentials.email)
+
+    user = await db.users.find_one({"email": login_identifier})
+    if not user and norm_phone:
+        user = await db.users.find_one({"phone": norm_phone})
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email/phone or password")
+
+    stored_hash = user.get("password") or user.get("password_hash")
+    if not stored_hash or not verify_password(credentials.password, stored_hash):
+        raise HTTPException(status_code=401, detail="Invalid email/phone or password")
+
+    if user.get("is_active") is False:
+        raise HTTPException(status_code=400, detail="Account is deactivated. Please contact support.")
+
+    user_role = str(user.get("role") or "training_student")
+    token = create_access_token(
+        data={"sub": user["id"], "role": user_role}
+    )
+
+    user_out = serialize_doc(user)
+    user_out.pop("password", None)
+    user_out.pop("password_hash", None)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user_out,
+    }
+
+
+async def list_my_training_requests(
+    current_user: dict,
+    status_filter: Optional[str] = None,
+    type_filter: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    uid = current_user.get("id")
+    uemail = (current_user.get("email") or "").strip().lower()
+    uphone = _normalize_phone(current_user.get("phone") or "")
+
+    or_clauses: List[Dict[str, Any]] = []
+    if uid:
+        or_clauses.append({"user_id": uid})
+        or_clauses.append({"created_by": uid})
+    if uemail:
+        or_clauses.append({"contact_email": {"$regex": f"^{re.escape(uemail)}$", "$options": "i"}})
+    if uphone:
+        or_clauses.append({"contact_phone": uphone})
+
+    if not or_clauses:
+        return {"requests": [], "total": 0}
+
+    q: Dict[str, Any] = {"$or": or_clauses}
+
+    if status_filter and status_filter != "all":
+        q["status"] = status_filter
+    if type_filter and type_filter != "all":
+        q["type"] = type_filter
+    if search and search.strip():
+        s = search.strip()
+        q = {
+            "$and": [
+                {"$or": or_clauses},
+                {
+                    "$or": [
+                        {"id": {"$regex": re.escape(s), "$options": "i"}},
+                        {"contact_name": {"$regex": re.escape(s), "$options": "i"}},
+                        {"contact_phone": {"$regex": re.escape(s), "$options": "i"}},
+                        {"branch_name": {"$regex": re.escape(s), "$options": "i"}},
+                        {"details.organization_name": {"$regex": re.escape(s), "$options": "i"}},
+                        {"details.college_name": {"$regex": re.escape(s), "$options": "i"}},
+                        {"details.school_name": {"$regex": re.escape(s), "$options": "i"}},
+                        {"details.participant_name": {"$regex": re.escape(s), "$options": "i"}},
+                    ]
+                }
+            ]
+        }
+
+    total = await db[COL].count_documents(q)
+    cursor = db[COL].find(q).sort("created_at", -1).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    return {
+        "requests": [serialize_doc(d) for d in docs],
+        "total": total,
+    }
+
