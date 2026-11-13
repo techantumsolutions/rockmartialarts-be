@@ -69,6 +69,7 @@ from routes.kpi_rating_routes import router as kpi_ratings_router
 from routes.kpi_ranking_routes import router as kpi_rankings_router
 from routes.course_syllabus_routes import router as course_syllabus_router
 from routes.training_request_routes import router as training_request_router
+from routes.training_chat_routes import router as training_chat_router
 from routes.demo_schedule_routes import router as demo_schedule_router
 from routes.demo_session_routes import router as demo_session_router
 from routes.demo_booking_admin_routes import router as demo_booking_admin_router
@@ -789,6 +790,9 @@ app.include_router(
     training_request_router, prefix="/api/training-requests", tags=["Training Requests"]
 )
 app.include_router(
+    training_chat_router, prefix="/api/training-requests", tags=["Training Chat"]
+)
+app.include_router(
     demo_schedule_router, prefix="/api/demo-schedules", tags=["Demo Schedules"]
 )
 app.include_router(
@@ -853,6 +857,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# Mount Socket.IO ASGI app to handle real-time chat (/socket.io) alongside FastAPI
+from utils.socket_server import sio
+import socketio
+app = socketio.ASGIApp(sio, other_asgi_app=app)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8003)
+    uvicorn.run(app, host="127.0.0.1", port=8003)
