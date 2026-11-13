@@ -254,19 +254,20 @@ class AchievementController:
         return {"achievements": result, "total": total }
 
     @staticmethod
-    async def get_global_public(skip: int = 0, limit: int = 6):
-        """Public: featured achievements for homepage (is_featured=True)."""
+    async def get_global_public(skip: int = 0, limit: int = 6, include_all: bool = False):
+        """Public: featured achievements for homepage (or all non-deleted Rock achievements when include_all=True)."""
         db = get_db()
-        q = {
-            "is_deleted": False,
-            "is_featured": True,
-        }
+        base_filter: dict = {"is_deleted": False}
+        if not include_all:
+            base_filter["is_featured"] = True
+        q = dict(base_filter)
         q.update(await _rock_achievement_scope(db))
-        # $nor from the scope must AND with the featured filter
-        if "$nor" in q and ("is_deleted" in q or "is_featured" in q):
+        # $nor from the scope must AND with the base filter
+        if "$nor" in q:
             nor = q.pop("$nor")
-            q = {"$and": [{"is_deleted": False, "is_featured": True}, {"$nor": nor}]}
-        cursor = db.student_achievements.find(q).sort("created_at", -1).skip(skip).limit(limit)
+            q = {"$and": [base_filter, {"$nor": nor}]}
+        sort_spec = [("is_featured", -1), ("created_at", -1)] if include_all else [("created_at", -1)]
+        cursor = db.student_achievements.find(q).sort(sort_spec).skip(skip).limit(limit)
         items = await cursor.to_list(length=limit)
         # Enrich with student names
         student_ids = list({a["student_id"] for a in items})

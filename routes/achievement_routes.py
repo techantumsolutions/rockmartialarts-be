@@ -70,10 +70,11 @@ async def set_achievement_featured(
 @router.get("/public/global")
 async def get_global_achievements_public(
     skip: int = Query(0, ge=0),
-    limit: int = Query(6, ge=1, le=50),
+    limit: int = Query(6, ge=1, le=500),
+    include_all: bool = Query(False),
 ):
-    """Public: featured achievements for homepage. No auth."""
-    return await AchievementController.get_global_public(skip=skip, limit=limit)
+    """Public: featured achievements for homepage (or all when include_all=True). No auth."""
+    return await AchievementController.get_global_public(skip=skip, limit=limit, include_all=include_all)
 
 
 @router.get("/public/branch/{branch_id}")
