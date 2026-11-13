@@ -11,6 +11,7 @@ from models.training_request_models import (
     SchoolTrainingRequestCreate,
     CreateTrainingOrderBody,
     CoachTrainingRequestResponse,
+    TrainingLoginRequest,
     TrainingRequestCoachAssign,
     TrainingRequestPaymentVerify,
     TrainingRequestStatusUpdate,
@@ -28,6 +29,8 @@ from utils.training_request_service import (
     get_training_request,
     list_residential_packages,
     list_coach_training_requests,
+    list_my_training_requests,
+    training_client_login,
     coach_respond_to_request,
     list_status_history,
     list_training_requests,
@@ -35,9 +38,41 @@ from utils.training_request_service import (
     update_training_request_status,
     verify_residential_payment,
 )
-from utils.unified_auth import get_optional_current_user_or_superadmin, require_role_unified
+from utils.unified_auth import (
+    get_current_user_or_superadmin,
+    get_optional_current_user_or_superadmin,
+    require_role_unified,
+)
 
 router = APIRouter()
+
+
+@router.post("/auth/login")
+async def api_training_login(body: TrainingLoginRequest):
+    """Training student authentication with email/phone and password."""
+    return await training_client_login(body)
+
+
+@router.get("/my-requests")
+@router.get("/client/my-requests")
+async def api_my_training_requests(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    type_filter: Optional[str] = Query(None, alias="type"),
+    search: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_user_or_superadmin),
+):
+    """List training requests belonging to the logged-in student/client."""
+    return await list_my_training_requests(
+        current_user=current_user,
+        status_filter=status_filter,
+        type_filter=type_filter,
+        search=search,
+        skip=skip,
+        limit=limit,
+    )
+
 
 ADMIN_ROLES = [
     UserRole.SUPER_ADMIN,
