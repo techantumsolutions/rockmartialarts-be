@@ -106,6 +106,28 @@ def _normalize_phone(phone: str) -> str:
     return re.sub(r"\s+", "", (phone or "").strip())
 
 
+def _phone_match_variants(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    cleaned = re.sub(r"\s+", "", str(raw).strip())
+    digits = re.sub(r"\D", "", cleaned)
+    variants = set()
+    if cleaned:
+        variants.add(cleaned)
+    if digits:
+        variants.add(digits)
+    if len(digits) >= 10:
+        national = digits[-10:]
+        variants.add(national)
+        variants.add(f"+91{national}")
+        variants.add(f"91{national}")
+        variants.add(f"+91 {national}")
+        variants.add(f"0{national}")
+        variants.add(f"+91-{national}")
+        variants.add(f"91-{national}")
+    return [v for v in variants if v]
+
+
 def _assign_coach_ids(body: TrainingRequestCoachAssign) -> List[str]:
     raw: List[str] = []
     if body.coach_ids:
@@ -341,28 +363,53 @@ async def _insert_training_request(
 
     norm_phone = _normalize_phone(contact_phone)
     norm_email = (contact_email or "").strip().lower()
+    phone_vars = _phone_match_variants(contact_phone)
 
-    # Link to authenticated user or create/update training_student user
+    # Resolve target user: match by email (case-insensitive) or phone variants
     user_id = None
-    if current_user and current_user.get("id"):
-        user_id = current_user.get("id")
-    elif password and password.strip():
-        existing_user = None
-        if norm_email:
-            existing_user = await db.users.find_one({"email": norm_email})
-        if not existing_user and norm_phone:
-            existing_user = await db.users.find_one({"phone": norm_phone})
+    target_user = None
 
-        if existing_user:
-            user_id = existing_user["id"]
+    if norm_email:
+        target_user = await db.users.find_one(
+            {"email": {"$regex": f"^{re.escape(norm_email)}$", "$options": "i"}}
+        )
+    if not target_user and phone_vars:
+        target_user = await db.users.find_one({"phone": {"$in": phone_vars}})
+
+    # If password is provided, ALWAYS create or update user credentials for this account
+    if password and password.strip():
+        pwd_clean = password.strip()
+        hashed = hash_password(pwd_clean)
+
+        if target_user:
+            user_id = target_user["id"]
             update_data: Dict[str, Any] = {
-                "password": hash_password(password.strip()),
+                "password": hashed,
+                "password_hash": hashed,
+                "is_active": True,
                 "is_phone_verified": True,
                 "updated_at": now,
             }
-            if not existing_user.get("role"):
+            if not target_user.get("role"):
                 update_data["role"] = "training_student"
+            if not target_user.get("phone") and norm_phone:
+                update_data["phone"] = norm_phone
+            if not target_user.get("email") and norm_email:
+                update_data["email"] = norm_email
             await db.users.update_one({"id": user_id}, {"$set": update_data})
+
+            # If user has an account in db.accounts, sync the password there as well
+            acc_id = target_user.get("account_id")
+            if acc_id:
+                await db.accounts.update_one(
+                    {"id": acc_id},
+                    {"$set": {"password": hashed, "updated_at": now}},
+                )
+            elif norm_email:
+                await db.accounts.update_one(
+                    {"email": norm_email},
+                    {"$set": {"password": hashed, "updated_at": now}},
+                )
         else:
             user_id = str(uuid.uuid4())
             full_name = contact_name.strip()
@@ -377,13 +424,18 @@ async def _insert_training_request(
                 "last_name": last_name,
                 "full_name": full_name,
                 "role": "training_student",
-                "password": hash_password(password.strip()),
+                "password": hashed,
+                "password_hash": hashed,
                 "is_active": True,
                 "is_phone_verified": bool(is_phone_verified),
                 "created_at": now,
                 "updated_at": now,
             }
             await db.users.insert_one(new_user)
+    elif target_user:
+        user_id = target_user["id"]
+    elif current_user and current_user.get("id"):
+        user_id = current_user.get("id")
 
     doc_id = str(uuid.uuid4())
     doc = {
@@ -1609,22 +1661,91 @@ async def training_client_login(
     if db is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
 
-    login_identifier = (credentials.email or "").strip().lower()
-    norm_phone = _normalize_phone(credentials.email)
+    raw_ident = (credentials.email or "").strip()
+    if not raw_ident:
+        raise HTTPException(status_code=400, detail="Email or registered phone is required")
 
-    user = await db.users.find_one({"email": login_identifier})
-    if not user and norm_phone:
-        user = await db.users.find_one({"phone": norm_phone})
+    login_identifier = raw_ident.lower()
+    phone_vars = _phone_match_variants(raw_ident)
 
-    if not user:
+    # 1. Search candidate users in db.users: by email (case-insensitive regex) or phone variants
+    or_clauses: List[Dict[str, Any]] = [
+        {"email": {"$regex": f"^{re.escape(login_identifier)}$", "$options": "i"}},
+    ]
+    if phone_vars:
+        or_clauses.append({"phone": {"$in": phone_vars}})
+
+    user = None
+    password_ok = False
+    candidates = await db.users.find({"$or": or_clauses}).to_list(length=20)
+
+    for cand in candidates:
+        stored_hash = cand.get("password") or cand.get("password_hash")
+        if stored_hash and verify_password(credentials.password, stored_hash):
+            user = cand
+            password_ok = True
+            break
+        # Check linked account in db.accounts
+        if cand.get("account_id"):
+            cand_acc = await db.accounts.find_one({"id": cand["account_id"]})
+            if cand_acc and cand_acc.get("password") and verify_password(credentials.password, cand_acc["password"]):
+                user = cand
+                password_ok = True
+                break
+
+    # 2. If not matched, search candidate accounts in db.accounts
+    acc = None
+    if not password_ok:
+        acc_clauses: List[Dict[str, Any]] = [
+            {"email": {"$regex": f"^{re.escape(login_identifier)}$", "$options": "i"}},
+        ]
+        if phone_vars:
+            acc_clauses.append({"phone": {"$in": phone_vars}})
+
+        acc_candidates = await db.accounts.find({"$or": acc_clauses}).to_list(length=20)
+        for cand_acc in acc_candidates:
+            if cand_acc.get("password") and verify_password(credentials.password, cand_acc["password"]):
+                acc = cand_acc
+                password_ok = True
+                student_id = acc.get("default_student_id")
+                if student_id:
+                    user = await db.users.find_one({"id": student_id})
+                if not user:
+                    user = await db.users.find_one({"account_id": acc["id"]})
+                break
+
+    # 3. If still not matched, check if a training_request exists with this email or phone
+    if not password_ok:
+        tr_query: List[Dict[str, Any]] = [
+            {"contact_email": {"$regex": f"^{re.escape(login_identifier)}$", "$options": "i"}},
+        ]
+        if phone_vars:
+            tr_query.append({"contact_phone": {"$in": phone_vars}})
+        tr_docs = await db[COL].find({"$or": tr_query}).sort("created_at", -1).to_list(length=10)
+        for tr_doc in tr_docs:
+            if tr_doc and tr_doc.get("user_id"):
+                cand_u = await db.users.find_one({"id": tr_doc["user_id"]})
+                if cand_u:
+                    stored_hash = cand_u.get("password") or cand_u.get("password_hash")
+                    if stored_hash and verify_password(credentials.password, stored_hash):
+                        user = cand_u
+                        password_ok = True
+                        break
+
+    if not password_ok or (not user and not acc):
         raise HTTPException(status_code=401, detail="Invalid email/phone or password")
 
-    stored_hash = user.get("password") or user.get("password_hash")
-    if not stored_hash or not verify_password(credentials.password, stored_hash):
-        raise HTTPException(status_code=401, detail="Invalid email/phone or password")
-
-    if user.get("is_active") is False:
+    if user and user.get("is_active") is False:
         raise HTTPException(status_code=400, detail="Account is deactivated. Please contact support.")
+
+    if not user and acc:
+        user = {
+            "id": acc["id"],
+            "email": acc.get("email"),
+            "phone": acc.get("phone"),
+            "full_name": "Student",
+            "role": "training_student",
+        }
 
     user_role = str(user.get("role") or "training_student")
     token = create_access_token(
@@ -1656,7 +1777,7 @@ async def list_my_training_requests(
 
     uid = current_user.get("id")
     uemail = (current_user.get("email") or "").strip().lower()
-    uphone = _normalize_phone(current_user.get("phone") or "")
+    phone_vars = _phone_match_variants(current_user.get("phone") or "")
 
     or_clauses: List[Dict[str, Any]] = []
     if uid:
@@ -1664,8 +1785,8 @@ async def list_my_training_requests(
         or_clauses.append({"created_by": uid})
     if uemail:
         or_clauses.append({"contact_email": {"$regex": f"^{re.escape(uemail)}$", "$options": "i"}})
-    if uphone:
-        or_clauses.append({"contact_phone": uphone})
+    if phone_vars:
+        or_clauses.append({"contact_phone": {"$in": phone_vars}})
 
     if not or_clauses:
         return {"requests": [], "total": 0}
@@ -1700,8 +1821,20 @@ async def list_my_training_requests(
     cursor = db[COL].find(q).sort("created_at", -1).skip(skip).limit(limit)
     docs = await cursor.to_list(length=limit)
 
+    sanitized = []
+    for d in docs:
+        sd = serialize_doc(d)
+        assignment_status = str(sd.get("coach_assignment_status") or "").lower()
+        # Until the coach confirms and accepts, do not reveal the coach details to the student
+        if assignment_status != "accepted":
+            sd["assigned_coach_id"] = None
+            sd["assigned_coach_name"] = None
+            if sd.get("status") == TrainingRequestStatus.COACH_ASSIGNED.value:
+                sd["status"] = TrainingRequestStatus.UNDER_REVIEW.value
+        sanitized.append(sd)
+
     return {
-        "requests": [serialize_doc(d) for d in docs],
+        "requests": sanitized,
         "total": total,
     }
 
