@@ -28,6 +28,14 @@ class PartnerOrgCreate(BaseModel):
     phone: str = Field(..., min_length=7, max_length=20)
     address: str = Field(..., min_length=3, max_length=500)
     payment_method: PartnerPaymentMethod
+    # Optional Super Admin messaging quotas (0 = channel disabled)
+    sms_allocated: Optional[int] = Field(None, ge=0)
+    whatsapp_allocated: Optional[int] = Field(None, ge=0)
+
+
+class PartnerMessagingQuotaUpdate(BaseModel):
+    sms_allocated: Optional[int] = Field(None, ge=0)
+    whatsapp_allocated: Optional[int] = Field(None, ge=0)
 
 
 class PartnerOrgVerifyPayment(BaseModel):
@@ -74,6 +82,7 @@ def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
     if not doc:
         return None
     from utils.partner_org_access import partner_org_public_extras
+    from utils.partner_messaging_quota import quota_summary_from_doc
 
     payload = {
         "id": doc.get("id"),
@@ -93,6 +102,13 @@ def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "activated_at": doc.get("activated_at"),
+        "sms_allocated": doc.get("sms_allocated"),
+        "whatsapp_allocated": doc.get("whatsapp_allocated"),
+        "sms_utilized": doc.get("sms_utilized"),
+        "whatsapp_utilized": doc.get("whatsapp_utilized"),
+        "sms_reserved": doc.get("sms_reserved"),
+        "whatsapp_reserved": doc.get("whatsapp_reserved"),
+        "messaging_quota": quota_summary_from_doc(doc),
     }
     payload.update(partner_org_public_extras(doc))
     return payload

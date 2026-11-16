@@ -603,8 +603,13 @@ class UserController:
                 print(f"❌ Error creating enrollment record: {e}")
                 pass
         
-        # Send credentials
-        await send_sms(user_dict["phone"], f"Account created. Email: {user_dict['email']}, Password: {user_data.password}")
+        # Send credentials (partner-scoped create consumes SMS quota)
+        await send_sms(
+            user_dict["phone"],
+            f"Account created. Email: {user_dict['email']}, Password: {user_data.password}",
+            partner_org_id=user_dict.get("partner_org_id") or current_user.get("partner_org_id"),
+            idempotency_key=f"user-create-sms:{user_dict['id']}",
+        )
 
         await log_activity(
             request=request,
@@ -1323,10 +1328,24 @@ class UserController:
             details={"reset_user_id": user_id, "reset_user_email": target_user["email"]}
         )
 
-        # Send the new password to the user
+        # Send the new password to the user (partner admin actions consume quota)
         message = f"Your password has been reset by an administrator. Your new temporary password is: {new_password}"
-        await send_sms(target_user["phone"], message)
-        await send_whatsapp(target_user["phone"], message)
+        force_partner_org = (
+            current_user.get("partner_org_id")
+            or target_user.get("partner_org_id")
+        )
+        await send_sms(
+            target_user["phone"],
+            message,
+            partner_org_id=force_partner_org,
+            idempotency_key=f"force-reset-sms:{user_id}:{new_password[:4]}",
+        )
+        await send_whatsapp(
+            target_user["phone"],
+            message,
+            partner_org_id=force_partner_org,
+            idempotency_key=f"force-reset-wa:{user_id}:{new_password[:4]}",
+        )
 
         return {"message": f"Password for user {target_user['full_name']} has been reset and sent to them."}
 
@@ -1392,8 +1411,26 @@ class UserController:
         else:
             raise HTTPException(status_code=400, detail="Invalid notification kind")
 
-        ok_wa = await send_whatsapp(phone, msg)
-        ok_sms = await send_sms(phone, msg)
+        # Super-admin route: do not charge partner quota unless actor is partner-scoped.
+        notif_partner_org = (
+            (current_user or {}).get("partner_org_id")
+            or user.get("partner_org_id")
+        )
+        # Only charge when the actor is partner-scoped (Rock SA notifying partner students is Rock-paid).
+        actor_is_partner = bool((current_user or {}).get("partner_org_id"))
+        charge_org = notif_partner_org if actor_is_partner else None
+        ok_wa = await send_whatsapp(
+            phone,
+            msg,
+            partner_org_id=charge_org,
+            idempotency_key=f"student-notif-wa:{user_id}:{kind}",
+        )
+        ok_sms = await send_sms(
+            phone,
+            msg,
+            partner_org_id=charge_org,
+            idempotency_key=f"student-notif-sms:{user_id}:{kind}",
+        )
 
         email_ok = False
         try:

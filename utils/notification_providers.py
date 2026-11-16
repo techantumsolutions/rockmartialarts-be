@@ -42,10 +42,41 @@ async def deliver_sms(
     *,
     dlt_template_id: Optional[str] = None,
     dry_run: bool = False,
+    partner_org_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ProviderResult:
     if dry_run:
         return "skipped", None, None
-    ok, err = send_registration_sms(phone, message, template_id=dlt_template_id)
+
+    async def _raw() -> bool:
+        ok, _err = send_registration_sms(phone, message, template_id=dlt_template_id)
+        return bool(ok)
+
+    org_id = (partner_org_id or "").strip() or None
+    err: Optional[str] = None
+    ok = False
+    try:
+        if org_id:
+            from utils.partner_messaging_quota import dispatch_with_partner_quota
+
+            ok, err, _rid = await dispatch_with_partner_quota(
+                org_id,
+                "sms",
+                _raw,
+                units=1,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            ok = await _raw()
+    except Exception as exc:
+        from fastapi import HTTPException
+
+        if isinstance(exc, HTTPException):
+            raise
+        logger.exception("SMS provider error")
+        ok = False
+        err = str(exc)[:200]
+
     if ok:
         return "sent", None, None
     if _allow_sms_stub() or not sms_provider_expects_delivery():
@@ -59,14 +90,26 @@ async def deliver_whatsapp(
     *,
     provider_template_name: Optional[str] = None,
     dry_run: bool = False,
+    partner_org_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ProviderResult:
     if dry_run:
         return "skipped", None, None
     try:
         from utils.helpers import send_whatsapp
 
-        ok = await send_whatsapp(phone, message)
+        ok = await send_whatsapp(
+            phone,
+            message,
+            partner_org_id=partner_org_id,
+            idempotency_key=idempotency_key,
+        )
     except Exception as exc:
+        # Propagate quota exhaustion to API callers
+        from fastapi import HTTPException
+
+        if isinstance(exc, HTTPException):
+            raise
         logger.exception("WhatsApp provider error")
         ok = False
         err = str(exc)[:200]
@@ -141,6 +184,8 @@ async def deliver_channel(
     dlt_template_id: Optional[str] = None,
     provider_template_name: Optional[str] = None,
     dry_run: bool = False,
+    partner_org_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ProviderResult:
     ch = (channel or "sms").lower()
     if ch == "sms":
@@ -149,6 +194,8 @@ async def deliver_channel(
             message,
             dlt_template_id=dlt_template_id,
             dry_run=dry_run,
+            partner_org_id=partner_org_id,
+            idempotency_key=idempotency_key,
         )
     if ch == "whatsapp":
         return await deliver_whatsapp(
@@ -156,6 +203,8 @@ async def deliver_channel(
             message,
             provider_template_name=provider_template_name,
             dry_run=dry_run,
+            partner_org_id=partner_org_id,
+            idempotency_key=idempotency_key,
         )
     if ch == "email":
         return await deliver_email(

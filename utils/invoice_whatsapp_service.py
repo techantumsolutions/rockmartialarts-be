@@ -14,7 +14,10 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from utils.database import get_db
+from fastapi import HTTPException
+
 from utils.helpers import send_whatsapp, serialize_doc
+from utils.partner_messaging_quota import MESSAGE_QUOTA_EXCEEDED
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +305,15 @@ async def send_invoice_whatsapp(
         return serialize_doc(delivery)
 
     try:
-        ok = await send_whatsapp(phone, message)
+        from utils.partner_messaging_quota import resolve_partner_org_id_for_actor
+
+        partner_org_id = await resolve_partner_org_id_for_actor(doc=invoice_doc)
+        ok = await send_whatsapp(
+            phone,
+            message,
+            partner_org_id=partner_org_id,
+            idempotency_key=f"invoice-wa:{invoice_id}:{attempt}",
+        )
         if ok:
             delivery["status"] = "sent"
             delivery["sent_at"] = datetime.utcnow()
@@ -315,6 +326,14 @@ async def send_invoice_whatsapp(
         else:
             delivery["status"] = "failed"
             delivery["error"] = "Provider returned failure"
+    except HTTPException as exc:
+        # Surface quota exhaustion to API (do not swallow as provider failure)
+        detail = exc.detail
+        code = detail.get("code") if isinstance(detail, dict) else None
+        if code == MESSAGE_QUOTA_EXCEEDED or exc.status_code == 402:
+            raise
+        delivery["status"] = "failed"
+        delivery["error"] = str(detail)[:500]
     except Exception as exc:
         logger.exception("WhatsApp send failed invoice_id=%s", invoice_id)
         delivery["status"] = "failed"

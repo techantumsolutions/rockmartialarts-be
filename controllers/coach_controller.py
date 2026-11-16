@@ -144,7 +144,12 @@ class CoachController:
             f"Role: Coach\n"
             f"Areas of Expertise: {', '.join(coach_data.areas_of_expertise)}"
         )
-        await send_sms(full_phone, sms_message)
+        await send_sms(
+            full_phone,
+            sms_message,
+            partner_org_id=(current_admin.get("partner_org_id") or coach_dict.get("partner_org_id") or None),
+            idempotency_key=f"coach-create-sms:{coach.id}",
+        )
         
         # Log activity
         await log_activity(

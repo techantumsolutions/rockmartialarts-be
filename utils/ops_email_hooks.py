@@ -312,6 +312,8 @@ async def fire_payment_success(
             "branch_name": branch_name or "",
             "start_date": _date(start_date),
         }
+        if partner_org_id:
+            ctx_pay["partner_org_id"] = partner_org_id
         phone = _phone(student_phone)
         if student_email or phone:
             await notify_ops(
@@ -319,6 +321,7 @@ async def fire_payment_success(
                 email=student_email,
                 phone=phone,
                 context=ctx_pay,
+                partner_org_id=partner_org_id,
             )
             if invoice_id or invoice_no:
                 await notify_ops(
@@ -326,12 +329,14 @@ async def fire_payment_success(
                     email=student_email,
                     phone=phone,
                     context=ctx_pay,
+                    partner_org_id=partner_org_id,
                 )
             await notify_ops(
                 "rock_enrollment_confirm",
                 email=student_email,
                 phone=phone,
                 context=ctx_pay,
+                partner_org_id=partner_org_id,
             )
 
         bm = await resolve_branch_manager_email(db, branch_id)

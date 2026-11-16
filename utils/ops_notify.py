@@ -75,10 +75,18 @@ def _append_cta(plain: str, code: str, context: Optional[Dict[str, Any]]) -> str
     return f"{plain}\n\n{label}: {url}"
 
 
+def _partner_org_id_from_context(context: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not context:
+        return None
+    return str(context.get("partner_org_id") or "").strip() or None
+
+
 async def notify_ops_whatsapp(
     code: str,
     phone: Optional[str],
     context: Optional[Dict[str, Any]] = None,
+    *,
+    partner_org_id: Optional[str] = None,
 ) -> bool:
     try:
         if not phone or not str(phone).strip():
@@ -93,22 +101,41 @@ async def notify_ops_whatsapp(
         from utils.whatsapp_sender import send_whatsapp_message, whatsapp_is_configured
         from utils.helpers import send_whatsapp
 
-        if whatsapp_is_configured():
-            ok, err = await send_whatsapp_message(
-                str(phone),
-                message,
-                template_name=code,
-                template_body=tmpl.get("body") or "",
-                context=_default_context(context),
-            )
-            if ok:
-                logger.info("ops whatsapp sent code=%s phone=****%s", code, str(phone)[-4:])
-                return True
-            logger.warning("ops whatsapp failed code=%s err=%s", code, err)
-            return False
+        org_id = (partner_org_id or _partner_org_id_from_context(context) or "").strip() or None
+        # Rock-owned partner invite / activation must not charge the new partner's quota.
+        if code in ("rock_partner_invite", "rock_partner_activated", "rock_partner_payment_success"):
+            org_id = None
 
-        # Fall through to helpers (stub / refuse policy)
-        return bool(await send_whatsapp(str(phone), message))
+        async def _raw() -> bool:
+            if whatsapp_is_configured():
+                ok, err = await send_whatsapp_message(
+                    str(phone),
+                    message,
+                    template_name=code,
+                    template_body=tmpl.get("body") or "",
+                    context=_default_context(context),
+                )
+                if ok:
+                    return True
+                logger.warning("ops whatsapp failed code=%s err=%s", code, err)
+                return False
+            return bool(await send_whatsapp(str(phone), message))
+
+        if org_id:
+            from utils.partner_messaging_quota import dispatch_with_partner_quota
+
+            ok, _err, _rid = await dispatch_with_partner_quota(
+                org_id,
+                "whatsapp",
+                _raw,
+                units=1,
+                idempotency_key=f"ops-wa:{org_id}:{code}:{str(phone)[-10:]}",
+            )
+        else:
+            ok = await _raw()
+        if ok:
+            logger.info("ops whatsapp sent code=%s phone=****%s", code, str(phone)[-4:])
+        return bool(ok)
     except Exception:
         logger.exception("ops whatsapp failure code=%s", code)
         return False
@@ -118,6 +145,8 @@ async def notify_ops_sms(
     code: str,
     phone: Optional[str],
     context: Optional[Dict[str, Any]] = None,
+    *,
+    partner_org_id: Optional[str] = None,
 ) -> bool:
     """SMS only for SMS_PRIORITY_CODES — keep messages short."""
     try:
@@ -134,7 +163,16 @@ async def notify_ops_sms(
             msg = msg[:597] + "..."
         from utils.helpers import send_sms
 
-        ok = await send_sms(str(phone), msg)
+        org_id = (partner_org_id or _partner_org_id_from_context(context) or "").strip() or None
+        if code in ("rock_partner_invite", "rock_partner_activated", "rock_partner_payment_success"):
+            org_id = None
+
+        ok = await send_sms(
+            str(phone),
+            msg,
+            partner_org_id=org_id,
+            idempotency_key=f"ops-sms:{org_id or 'rock'}:{code}:{str(phone)[-10:]}",
+        )
         if ok:
             logger.info("ops sms sent code=%s phone=****%s", code, str(phone)[-4:])
         return bool(ok)
@@ -151,15 +189,20 @@ async def notify_ops(
     context: Optional[Dict[str, Any]] = None,
     channels: Optional[Sequence[str]] = None,
     force_email: bool = False,
+    partner_org_id: Optional[str] = None,
 ) -> Dict[str, bool]:
     """
     Send catalog notification on relevant channels.
     Default channels: email (if email), whatsapp (if phone), sms (if priority + phone).
+    When partner_org_id is set (or present in context), SMS/WhatsApp consume partner quota.
     """
     result = {"email": False, "whatsapp": False, "sms": False}
     try:
         wanted = {c.lower() for c in (channels or ["email", "whatsapp", "sms"])}
         ctx = _default_context(context)
+        org_id = (partner_org_id or _partner_org_id_from_context(ctx) or "").strip() or None
+        if org_id and "partner_org_id" not in ctx:
+            ctx["partner_org_id"] = org_id
 
         if "email" in wanted and email:
             result["email"] = await notify_ops_email(
@@ -167,10 +210,14 @@ async def notify_ops(
             )
 
         if "whatsapp" in wanted and phone:
-            result["whatsapp"] = await notify_ops_whatsapp(code, phone, ctx)
+            result["whatsapp"] = await notify_ops_whatsapp(
+                code, phone, ctx, partner_org_id=org_id
+            )
 
         if "sms" in wanted and phone:
-            result["sms"] = await notify_ops_sms(code, phone, ctx)
+            result["sms"] = await notify_ops_sms(
+                code, phone, ctx, partner_org_id=org_id
+            )
 
         return result
     except Exception:

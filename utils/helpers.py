@@ -85,7 +85,7 @@ def _allow_sms_or_whatsapp_stub() -> bool:
     return os.getenv("ENVIRONMENT", "development").lower() not in ("production", "prod")
 
 
-async def send_sms(phone: str, message: str) -> bool:
+async def _send_sms_raw(phone: str, message: str) -> bool:
     """Send SMS via registration checkout provider when configured; never fake success in production."""
     from utils.reg_checkout_sms import send_registration_sms, sms_provider_expects_delivery
 
@@ -102,7 +102,7 @@ async def send_sms(phone: str, message: str) -> bool:
     return False
 
 
-async def send_whatsapp(phone: str, message: str) -> bool:
+async def _send_whatsapp_raw(phone: str, message: str) -> bool:
     """WhatsApp delivery via Meta Cloud / webhook when configured; stub only when allowed."""
     from utils.whatsapp_sender import send_whatsapp_message, whatsapp_is_configured, whatsapp_provider_name
 
@@ -123,6 +123,58 @@ async def send_whatsapp(phone: str, message: str) -> bool:
         phone,
     )
     return False
+
+
+async def send_sms(
+    phone: str,
+    message: str,
+    *,
+    partner_org_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> bool:
+    """
+    Send SMS. When partner_org_id is set, enforces partner messaging quota
+    (reserve → send → confirm/release). Rock/super-admin paths omit partner_org_id.
+    """
+    org_id = (partner_org_id or "").strip() or None
+    if not org_id:
+        return await _send_sms_raw(phone, message)
+    from utils.partner_messaging_quota import dispatch_with_partner_quota
+
+    ok, _err, _rid = await dispatch_with_partner_quota(
+        org_id,
+        "sms",
+        lambda: _send_sms_raw(phone, message),
+        units=1,
+        idempotency_key=idempotency_key,
+    )
+    return bool(ok)
+
+
+async def send_whatsapp(
+    phone: str,
+    message: str,
+    *,
+    partner_org_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> bool:
+    """
+    Send WhatsApp. When partner_org_id is set, enforces partner messaging quota.
+    Rock/super-admin paths omit partner_org_id.
+    """
+    org_id = (partner_org_id or "").strip() or None
+    if not org_id:
+        return await _send_whatsapp_raw(phone, message)
+    from utils.partner_messaging_quota import dispatch_with_partner_quota
+
+    ok, _err, _rid = await dispatch_with_partner_quota(
+        org_id,
+        "whatsapp",
+        lambda: _send_whatsapp_raw(phone, message),
+        units=1,
+        idempotency_key=idempotency_key,
+    )
+    return bool(ok)
 
 async def check_and_send_stock_alert(product: dict, branch_id: str, new_stock_level: int):
     """Checks if stock is low and sends an alert if needed."""

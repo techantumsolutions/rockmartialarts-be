@@ -2826,7 +2826,17 @@ class PaymentController:
                 f"Welcome! Family registration is complete. Payment of ₹{total_amount} received. "
                 f"Transaction ID: {transaction_id}"
             )
-            await send_whatsapp(phone, message)
+            from utils.partner_tenant import resolve_partner_org_id_for_branch
+
+            family_partner_org = await resolve_partner_org_id_for_branch(
+                db, first.branch_id
+            )
+            await send_whatsapp(
+                phone,
+                message,
+                partner_org_id=family_partner_org,
+                idempotency_key=f"family-wa:{transaction_id}",
+            )
 
         if last_info:
             await PaymentController.create_payment_notification(

@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from models.partner_org_models import (
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
+    PartnerMessagingQuotaUpdate,
     PartnerOrgCreate,
     PartnerOrgStatus,
     PartnerOrgUpdateStatus,
@@ -24,6 +25,13 @@ from models.partner_org_models import (
     PartnerValidityUpdate,
     new_partner_org_id,
     partner_org_public,
+)
+from utils.partner_messaging_quota import (
+    ensure_partner_messaging_quota_indexes,
+    ensure_partner_quota_fields,
+    get_quota_summary,
+    messaging_quota_defaults,
+    set_partner_messaging_limits,
 )
 from utils.partner_org_access import (
     compute_partner_effective_status,
@@ -229,6 +237,17 @@ async def ensure_partner_org_indexes(db) -> None:
         await db[COL].create_index("valid_until")
     except Exception:
         logger.exception("partner_organizations index ensure failed")
+    await ensure_partner_messaging_quota_indexes(db)
+
+
+def _quota_fields_from_create(body: PartnerOrgCreate) -> Dict[str, Any]:
+    """Stamp messaging quota on new partner docs (env defaults unless SA overrides)."""
+    fields = messaging_quota_defaults()
+    if body.sms_allocated is not None:
+        fields["sms_allocated"] = int(body.sms_allocated)
+    if body.whatsapp_allocated is not None:
+        fields["whatsapp_allocated"] = int(body.whatsapp_allocated)
+    return fields
 
 
 def partner_org_id_of(user: Optional[dict]) -> Optional[str]:
@@ -431,6 +450,8 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         "created_at": now,
         "updated_at": now,
         "created_by": current_user.get("id"),
+        **_quota_fields_from_create(body),
+        "messaging_quota_updated_at": now,
     }
     await db[COL].insert_one(org)
     updated = await _finalize_paid_org(
@@ -485,6 +506,8 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
                     "address": body.address.strip(),
                     "payment_method": PartnerPaymentMethod.ONLINE.value,
                     "updated_at": now,
+                    **_quota_fields_from_create(body),
+                    "messaging_quota_updated_at": now,
                 }
             },
         )
@@ -506,6 +529,8 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
                 "created_at": now,
                 "updated_at": now,
                 "created_by": current_user.get("id"),
+                **_quota_fields_from_create(body),
+                "messaging_quota_updated_at": now,
             }
         )
 
@@ -1130,3 +1155,63 @@ async def get_partner_feature_permissions_for_me(current_user: dict) -> Dict[str
         if not is_partner_feature_enabled(org, key):
             perms[key] = False
     return {"partner_org_id": org_id, "feature_permissions": perms}
+
+
+async def get_partner_messaging_quota(
+    partner_org_id: str, current_user: dict
+) -> Dict[str, Any]:
+    """Super Admin: read messaging quota for a partner."""
+    _ = current_user
+    summary = await get_quota_summary(partner_org_id)
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id}) if db is not None else None
+    return {
+        "partner_org_id": partner_org_id,
+        "messaging_quota": {
+            "sms": summary.get("sms"),
+            "whatsapp": summary.get("whatsapp"),
+            "updated_at": summary.get("updated_at"),
+        },
+        "partner": partner_org_public(org) if org else None,
+    }
+
+
+async def update_partner_messaging_quota(
+    partner_org_id: str,
+    body: PartnerMessagingQuotaUpdate,
+    current_user: dict,
+) -> Dict[str, Any]:
+    """Super Admin: set SMS/WhatsApp allocated limits (utilized is preserved)."""
+    if body.sms_allocated is None and body.whatsapp_allocated is None:
+        raise HTTPException(
+            status_code=400, detail="Provide sms_allocated and/or whatsapp_allocated"
+        )
+    summary = await set_partner_messaging_limits(
+        partner_org_id,
+        sms_allocated=body.sms_allocated,
+        whatsapp_allocated=body.whatsapp_allocated,
+        actor_user_id=current_user.get("id"),
+    )
+    db = get_db()
+    org = await ensure_partner_quota_fields(db, partner_org_id) if db is not None else None
+    return {
+        "message": "Messaging quota updated",
+        "messaging_quota": summary,
+        "partner": partner_org_public(org),
+    }
+
+
+async def get_my_messaging_quota(current_user: dict) -> Dict[str, Any]:
+    """Partner Super Admin: allocated / utilized / remaining for dashboard."""
+    org_id = partner_org_id_of(current_user)
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Partner organization is missing on this account")
+    summary = await get_quota_summary(org_id)
+    return {
+        "partner_org_id": org_id,
+        "messaging_quota": {
+            "sms": summary.get("sms"),
+            "whatsapp": summary.get("whatsapp"),
+            "updated_at": summary.get("updated_at"),
+        },
+    }

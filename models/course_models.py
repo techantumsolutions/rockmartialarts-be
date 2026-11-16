@@ -76,7 +76,12 @@ class Course(BaseModel):
     media_resources: MediaResources
     pricing: Pricing
     settings: Settings
-    # Public course page: hero_section (bullet_points[]), about_section (content_blocks: [{ title, description, bullet_points[], image? }]), etc.
+    # Public course page CMS JSON (schemaless, additive):
+    # layout_variant, section_visibility, hero_section(+feature_icons/secondary_ctas),
+    # about_section, learn_cards, who_can_join, training_programs, why_rmaa,
+    # lineage, philosophy_pillars, qualities, sport_spotlight, style_cards,
+    # course_info_sections, benefits, learning_section, gallery_images,
+    # instructors, testimonials, pdf_attachments, final_cta, cta_section, …
     page_content: Optional[Dict[str, Any]] = None
     seo: Optional[CourseSEO] = None
     created_by: Optional[str] = None

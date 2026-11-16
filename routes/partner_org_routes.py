@@ -13,6 +13,7 @@ from models.partner_org_branding_models import PartnerOrgBrandingUpsert
 from models.partner_org_models import (
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
+    PartnerMessagingQuotaUpdate,
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
@@ -178,6 +179,14 @@ async def get_my_partner_feature_permissions(
     return await PartnerOrgController.get_my_feature_permissions(current_user)
 
 
+@router.get("/me/messaging-quota")
+async def get_my_messaging_quota(
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner admin: SMS/WhatsApp allocated, utilized, remaining."""
+    return await PartnerOrgController.get_my_messaging_quota(current_user)
+
+
 @router.patch("/{partner_org_id}/validity")
 async def set_partner_validity(
     partner_org_id: str,
@@ -202,3 +211,22 @@ async def patch_partner_feature_permissions(
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
 ):
     return await PartnerOrgController.patch_feature_permissions(partner_org_id, body, current_user)
+
+
+@router.get("/{partner_org_id}/messaging-quota")
+async def get_partner_messaging_quota(
+    partner_org_id: str,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: read partner SMS/WhatsApp quota utilization."""
+    return await PartnerOrgController.get_messaging_quota(partner_org_id, current_user)
+
+
+@router.patch("/{partner_org_id}/messaging-quota")
+async def patch_partner_messaging_quota(
+    partner_org_id: str,
+    body: PartnerMessagingQuotaUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: set partner SMS/WhatsApp allocated limits."""
+    return await PartnerOrgController.patch_messaging_quota(partner_org_id, body, current_user)

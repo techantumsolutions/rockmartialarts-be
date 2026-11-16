@@ -111,8 +111,17 @@ class EnrollmentController:
         
         await db.payments.insert_many([adm, crs])
         
-        # Send enrollment confirmation
-        await send_whatsapp(student["phone"], f"Welcome! You're enrolled in {course['name']}. Start date: {enrollment_data.start_date.date()}")
+        # Send enrollment confirmation (partner-scoped actors consume messaging quota)
+        from utils.partner_tenant import partner_org_id_of
+
+        await send_whatsapp(
+            student["phone"],
+            f"Welcome! You're enrolled in {course['name']}. Start date: {enrollment_data.start_date.date()}",
+            partner_org_id=partner_org_id_of(current_user)
+            or student.get("partner_org_id")
+            or enrollment_dict.get("partner_org_id"),
+            idempotency_key=f"enroll-wa:{enrollment.id}",
+        )
         
         return {"message": "Enrollment created successfully", "enrollment_id": enrollment.id}
 
@@ -410,8 +419,22 @@ class EnrollmentController:
             pay_docs.insert(0, admission_payment.dict())
         await db.payments.insert_many(pay_docs)
 
-        # Send enrollment confirmation
-        await send_whatsapp(student["phone"], f"Welcome! You're enrolled in {course['name']}. Start date: {enrollment_data.start_date.date()}")
+        # Send enrollment confirmation (partner-scoped when student/branch is partner tenant)
+        from utils.partner_tenant import partner_org_id_of, resolve_partner_org_id_for_branch
+
+        enroll_partner_org = (
+            partner_org_id_of(current_user)
+            if current_user
+            else None
+        ) or student.get("partner_org_id") or await resolve_partner_org_id_for_branch(
+            db, enrollment_data.branch_id
+        )
+        await send_whatsapp(
+            student["phone"],
+            f"Welcome! You're enrolled in {course['name']}. Start date: {enrollment_data.start_date.date()}",
+            partner_org_id=enroll_partner_org,
+            idempotency_key=f"enroll-wa:{enrollment.id}",
+        )
 
         return {"message": "Enrollment created successfully", "enrollment_id": enrollment.id}
 

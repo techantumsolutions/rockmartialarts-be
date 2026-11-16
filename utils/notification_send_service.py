@@ -358,6 +358,20 @@ async def send_notification(
             "provider": provider_info(),
         }
 
+    from utils.partner_messaging_quota import resolve_partner_org_id_for_actor
+
+    partner_org_id = await resolve_partner_org_id_for_actor(
+        current_user, branch_id=body.branch_id
+    )
+    idempotency_key = None
+    if isinstance(meta, dict) and meta.get("outbox_id"):
+        idempotency_key = f"notif-outbox:{meta.get('outbox_id')}"
+    elif body.template_id or body.template_name:
+        idempotency_key = (
+            f"notif:{resolved.get('channel')}:{body.recipient}:"
+            f"{body.template_id or body.template_name}:{body.user_id or ''}"
+        )
+
     status, error, provider_msg_id = await deliver_channel(
         resolved["channel"],
         body.recipient,
@@ -366,6 +380,8 @@ async def send_notification(
         dlt_template_id=resolved.get("dlt_template_id"),
         provider_template_name=resolved.get("provider_template_name"),
         dry_run=False,
+        partner_org_id=partner_org_id,
+        idempotency_key=idempotency_key,
     )
 
     outbox_id = None
@@ -678,6 +694,13 @@ async def retry_notification_log(
         raise HTTPException(status_code=400, detail="Log has no message to resend")
 
     new_attempt = attempt + 1
+    from utils.partner_messaging_quota import resolve_partner_org_id_for_actor
+
+    partner_org_id = await resolve_partner_org_id_for_actor(
+        current_user,
+        branch_id=doc.get("branch_id"),
+        doc=doc,
+    )
     status, error, provider_msg_id = await deliver_channel(
         resolved["channel"],
         doc.get("recipient") or "",
@@ -685,6 +708,8 @@ async def retry_notification_log(
         subject=resolved.get("subject"),
         dlt_template_id=resolved.get("dlt_template_id"),
         provider_template_name=resolved.get("provider_template_name"),
+        partner_org_id=partner_org_id,
+        idempotency_key=f"notif-retry:{log_id}:{new_attempt}",
     )
 
     now = datetime.utcnow()

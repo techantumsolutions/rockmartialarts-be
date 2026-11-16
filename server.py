@@ -421,6 +421,17 @@ async def lifespan(app: FastAPI):
     try:
         from utils.partner_org_service import ensure_partner_org_indexes
         await ensure_partner_org_indexes(app.mongodb)
+        try:
+            from utils.partner_messaging_quota import migrate_all_partner_quotas
+
+            mig = await migrate_all_partner_quotas(app.mongodb)
+            logging.getLogger(__name__).info(
+                "partner messaging quota migrate scanned=%s updated=%s",
+                mig.get("scanned"),
+                mig.get("updated"),
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("partner messaging quota migrate failed")
     except Exception:
         logging.exception("Failed to ensure partner organization indexes")
 

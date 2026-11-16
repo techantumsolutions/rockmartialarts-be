@@ -612,6 +612,11 @@ This is an automated message. Please do not reply to this email.
                         "bm_name": manager_name,
                         "branch_name": branch_name,
                         "token": reset_token,
+                        "partner_org_id": (
+                            (current_admin or {}).get("partner_org_id")
+                            or manager.get("partner_org_id")
+                            or ""
+                        ),
                     },
                 )
             except Exception:

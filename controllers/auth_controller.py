@@ -1334,6 +1334,8 @@ class AuthController:
                 await send_sms(
                     user_dict["phone"],
                     f"Welcome {full_name}! A student profile was added to your Rock Martial Arts account.",
+                    partner_org_id=partner_org_id,
+                    idempotency_key=f"welcome-sms:{user_dict['id']}",
                 )
             except Exception:
                 logger.exception("Failed sending linked-student SMS")

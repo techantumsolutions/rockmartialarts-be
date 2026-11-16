@@ -3,6 +3,7 @@
 from models.partner_org_models import (
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
+    PartnerMessagingQuotaUpdate,
     PartnerOrgCreate,
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
@@ -87,3 +88,17 @@ class PartnerOrgController:
     @staticmethod
     async def get_my_feature_permissions(current_user: dict):
         return await svc.get_partner_feature_permissions_for_me(current_user)
+
+    @staticmethod
+    async def get_messaging_quota(partner_org_id: str, current_user: dict):
+        return await svc.get_partner_messaging_quota(partner_org_id, current_user)
+
+    @staticmethod
+    async def patch_messaging_quota(
+        partner_org_id: str, body: PartnerMessagingQuotaUpdate, current_user: dict
+    ):
+        return await svc.update_partner_messaging_quota(partner_org_id, body, current_user)
+
+    @staticmethod
+    async def get_my_messaging_quota(current_user: dict):
+        return await svc.get_my_messaging_quota(current_user)
