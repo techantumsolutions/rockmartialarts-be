@@ -64,6 +64,10 @@ class HomepageSection(BaseModel):
     # Registration flow media (left side image/video/gif)
     registration_media_url: Optional[str] = None
     registration_media_type: Optional[str] = None
+    # Courses Showcase (below Training Program)
+    course_showcase_tag: Optional[str] = None
+    course_showcase_title: Optional[str] = None
+    course_showcase_description: Optional[str] = None
 
 
 class FooterContent(BaseModel):
