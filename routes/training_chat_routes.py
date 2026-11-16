@@ -132,6 +132,30 @@ async def get_chat_messages(
         "email": request.get("contact_email"),
     }
 
+    details = request.get("details") or {}
+    lat = request.get("latitude") or details.get("latitude")
+    lng = request.get("longitude") or details.get("longitude")
+    address = (
+        request.get("location_address")
+        or details.get("formatted_address")
+        or details.get("address_line1")
+        or ""
+    )
+    maps_url = request.get("google_maps_url") or details.get("google_maps_url")
+    if not maps_url and lat and lng:
+        maps_url = f"https://www.google.com/maps?q={lat},{lng}"
+
+    location_info = {
+        "address": address,
+        "latitude": lat,
+        "longitude": lng,
+        "google_maps_url": maps_url,
+        "city": details.get("city"),
+        "state": details.get("state"),
+        "pincode": details.get("pincode"),
+        "location_shared": bool(request.get("location_shared") or details.get("location_shared") or lat),
+    } if (address or maps_url or lat) else None
+
     def _fmt(doc):
         d = serialize_doc(doc)
         if isinstance(d.get("created_at"), datetime):
@@ -148,6 +172,7 @@ async def get_chat_messages(
         "coach_info": coach_info,
         "student_info": student_info,
         "request_id": request_id,
+        "location": location_info,
     }
 
 

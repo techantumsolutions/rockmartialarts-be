@@ -86,6 +86,12 @@ class HomeTrainingDetails(BaseModel):
     )
     training_goals: Optional[str] = Field(default=None, max_length=2000)
     special_requirements: Optional[str] = Field(default=None, max_length=2000)
+    latitude: Optional[float] = Field(default=None, description="GPS latitude")
+    longitude: Optional[float] = Field(default=None, description="GPS longitude")
+    formatted_address: Optional[str] = Field(default=None, max_length=500, description="Google Maps formatted address")
+    google_maps_url: Optional[str] = Field(default=None, max_length=500, description="Google Maps link")
+    location_shared: Optional[bool] = Field(default=False, description="Whether live location was shared via GPS")
+
 
 
 class HomeTrainingRequestCreate(BaseModel):
@@ -138,6 +144,12 @@ class SchoolTrainingDetails(BaseModel):
     )
     training_goals: Optional[str] = Field(default=None, max_length=2000)
     special_requirements: Optional[str] = Field(default=None, max_length=2000)
+    latitude: Optional[float] = Field(default=None, description="GPS latitude")
+    longitude: Optional[float] = Field(default=None, description="GPS longitude")
+    formatted_address: Optional[str] = Field(default=None, max_length=500, description="Google Maps formatted address")
+    google_maps_url: Optional[str] = Field(default=None, max_length=500, description="Google Maps link")
+    location_shared: Optional[bool] = Field(default=False, description="Whether live location was shared via GPS")
+
 
 
 class SchoolTrainingRequestCreate(BaseModel):
@@ -197,6 +209,12 @@ class CollegeTrainingDetails(BaseModel):
     )
     training_goals: Optional[str] = Field(default=None, max_length=2000)
     special_requirements: Optional[str] = Field(default=None, max_length=2000)
+    latitude: Optional[float] = Field(default=None, description="GPS latitude")
+    longitude: Optional[float] = Field(default=None, description="GPS longitude")
+    formatted_address: Optional[str] = Field(default=None, max_length=500, description="Google Maps formatted address")
+    google_maps_url: Optional[str] = Field(default=None, max_length=500, description="Google Maps link")
+    location_shared: Optional[bool] = Field(default=False, description="Whether live location was shared via GPS")
+
 
 
 class CollegeTrainingRequestCreate(BaseModel):
@@ -256,6 +274,12 @@ class CorporateTrainingDetails(BaseModel):
     )
     training_goals: Optional[str] = Field(default=None, max_length=2000)
     special_requirements: Optional[str] = Field(default=None, max_length=2000)
+    latitude: Optional[float] = Field(default=None, description="GPS latitude")
+    longitude: Optional[float] = Field(default=None, description="GPS longitude")
+    formatted_address: Optional[str] = Field(default=None, max_length=500, description="Google Maps formatted address")
+    google_maps_url: Optional[str] = Field(default=None, max_length=500, description="Google Maps link")
+    location_shared: Optional[bool] = Field(default=False, description="Whether live location was shared via GPS")
+
 
 
 class CorporateTrainingRequestCreate(BaseModel):
@@ -380,6 +404,12 @@ class ResidentialTrainingDetails(BaseModel):
     medical_notes: Optional[str] = Field(default=None, max_length=2000)
     training_goals: Optional[str] = Field(default=None, max_length=2000)
     special_requirements: Optional[str] = Field(default=None, max_length=2000)
+    latitude: Optional[float] = Field(default=None, description="GPS latitude")
+    longitude: Optional[float] = Field(default=None, description="GPS longitude")
+    formatted_address: Optional[str] = Field(default=None, max_length=500, description="Google Maps formatted address")
+    google_maps_url: Optional[str] = Field(default=None, max_length=500, description="Google Maps link")
+    location_shared: Optional[bool] = Field(default=False, description="Whether live location was shared via GPS")
+
     # Fee snapshot (filled server-side from package; client may omit)
     fee_total_inr: Optional[int] = Field(default=None, ge=0)
     fee_pay_now_inr: Optional[int] = Field(default=None, ge=0)
