@@ -1,3 +1,4 @@
+
 """
 M12 Training request service — Home/School/College/Corporate/Residential + unified admin (S06).
 
@@ -450,6 +451,15 @@ async def _insert_training_request(
         "source": (source or "website").strip() or "website",
         "notes": (notes or "").strip() or None,
         "details": details,
+        "location_address": (details or {}).get("formatted_address") or (details or {}).get("address_line1") or None,
+        "latitude": (details or {}).get("latitude"),
+        "longitude": (details or {}).get("longitude"),
+        "google_maps_url": (details or {}).get("google_maps_url") or (
+            f"https://www.google.com/maps?q={(details or {}).get('latitude')},{(details or {}).get('longitude')}"
+            if (details or {}).get("latitude") and (details or {}).get("longitude")
+            else None
+        ),
+        "location_shared": bool((details or {}).get("location_shared") or (details or {}).get("latitude")),
         "payment_status": payment_status,
         "fee_total_inr": configured_fee,
         "amount_paise": amount_paise,
@@ -1444,6 +1454,72 @@ async def list_coach_training_requests(
     }
 
 
+async def _ensure_training_location_chat_notice(db, request_id: str, doc: dict):
+    """When coach accepts, post location details to chat history if available."""
+    try:
+        existing = await db["training_chat_messages"].find_one({
+            "request_id": request_id,
+            "sender_role": "system",
+            "content": {"$regex": "Training Location", "$options": "i"},
+        })
+        if existing:
+            return
+
+        details = (doc or {}).get("details") or {}
+        address = (
+            (doc or {}).get("location_address")
+            or details.get("formatted_address")
+            or details.get("address_line1")
+            or ""
+        )
+        city = details.get("city") or ""
+        state = details.get("state") or ""
+        pincode = details.get("pincode") or ""
+        full_addr_parts = [address]
+        if city or state:
+            full_addr_parts.append(", ".join(filter(None, [city, state, pincode])))
+        loc_display = " • ".join(filter(None, full_addr_parts))
+
+        lat = (doc or {}).get("latitude") or details.get("latitude")
+        lng = (doc or {}).get("longitude") or details.get("longitude")
+        maps_url = (doc or {}).get("google_maps_url") or details.get("google_maps_url")
+        if not maps_url and lat and lng:
+            maps_url = f"https://www.google.com/maps?q={lat},{lng}"
+
+        if not loc_display and not maps_url:
+            return
+
+        lines = ["📍 Student Training Location:"]
+        if loc_display:
+            lines.append(f"Address: {loc_display}")
+        if lat and lng:
+            try:
+                lines.append(f"GPS Coordinates: {float(lat):.5f}, {float(lng):.5f}")
+            except Exception:
+                lines.append(f"GPS Coordinates: {lat}, {lng}")
+        if maps_url:
+            lines.append(f"Google Maps Link: {maps_url}")
+
+        now = datetime.utcnow()
+        sys_msg = {
+            "id": str(uuid.uuid4()),
+            "request_id": request_id,
+            "sender_id": "system",
+            "sender_name": "Rock Martial Arts System",
+            "sender_role": "system",
+            "content": "\n".join(lines),
+            "is_read": False,
+            "created_at": now,
+        }
+        await db["training_chat_messages"].insert_one(sys_msg)
+        await db[COL].update_one(
+            {"id": request_id},
+            {"$set": {"chat_last_message": "📍 Location shared with coach", "chat_last_message_at": now}}
+        )
+    except Exception:
+        logger.exception("Failed to insert location notice into training chat")
+
+
 async def coach_respond_to_request(
     request_id: str,
     body: CoachTrainingRequestResponse,
@@ -1555,6 +1631,7 @@ async def coach_respond_to_request(
                 action="coach_accepted",
             )
             updated = await db[COL].find_one({"id": request_id})
+            await _ensure_training_location_chat_notice(db, request_id, updated)
             return {
                 "message": "Training request accepted successfully",
                 "request": serialize_doc(updated),
@@ -1581,6 +1658,7 @@ async def coach_respond_to_request(
             action="coach_accepted",
         )
         updated = await db[COL].find_one({"id": request_id})
+        await _ensure_training_location_chat_notice(db, request_id, updated)
         return {
             "message": "Training request accepted successfully",
             "request": serialize_doc(updated),
