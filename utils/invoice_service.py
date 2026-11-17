@@ -222,9 +222,13 @@ async def _build_lines_from_enrollment(db, payment: dict, enrollment: Optional[d
 
     line_total = round(course_fee + admission_fee, 2)
     # If payment amount differs (e.g. discounts applied later), prefer payment amount as total
-    pay_amount = _f(payment.get("amount"))
+    pay_amount = _f(payment.get("amount") or payment.get("amount_received"))
     discount = 0.0
-    if pay_amount > 0 and abs(pay_amount - line_total) > 0.05 and line_total > pay_amount:
+    is_partial = bool(payment.get("is_partial_payment")) or _f(payment.get("outstanding_amount")) > 0.05
+    if is_partial and pay_amount > 0:
+        # Partial cash: keep full fee particulars; invoice total = amount received (not a discount)
+        line_total = pay_amount
+    elif pay_amount > 0 and abs(pay_amount - line_total) > 0.05 and line_total > pay_amount:
         discount = round(line_total - pay_amount, 2)
         line_total = pay_amount
 
@@ -345,8 +349,19 @@ async def generate_invoice_for_payment(
     admission_total = round(sum(_f(i.admission_fee) for i in lines), 2)
     discount_total = round(sum(_f(i.discount_amount) for i in lines), 2)
     computed_total = round(sum(_f(i.line_total) for i in lines), 2)
-    pay_total = _f(payment.get("amount") or (checkout or {}).get("amount_inr"))
+    pay_total = _f(
+        payment.get("amount_received")
+        or payment.get("amount")
+        or (checkout or {}).get("amount_inr")
+    )
     total_amount = pay_total if pay_total > 0 else computed_total
+    quoted_total = _f(payment.get("quoted_total_amount"))
+    if quoted_total <= 0:
+        quoted_total = round(subtotal + admission_total - discount_total, 2) or total_amount
+    outstanding_amount = _f(payment.get("outstanding_amount"))
+    if outstanding_amount <= 0 and quoted_total > total_amount:
+        outstanding_amount = round(quoted_total - total_amount, 2)
+    is_partial = bool(payment.get("is_partial_payment")) or outstanding_amount > 0.05
 
     paid_at = payment.get("payment_date") or payment.get("updated_at") or datetime.utcnow()
     invoice_number = await next_invoice_number(paid_at=paid_at if isinstance(paid_at, datetime) else None)
@@ -363,6 +378,14 @@ async def generate_invoice_for_payment(
             gateway_label = "Razorpay"
 
     now = datetime.utcnow()
+    notes = payment.get("notes")
+    if is_partial:
+        partial_note = (
+            f"Amount received: ₹{total_amount:.2f}. "
+            f"Quoted total: ₹{quoted_total:.2f}. "
+            f"Outstanding: ₹{outstanding_amount:.2f}."
+        )
+        notes = f"{notes} | {partial_note}" if notes else partial_note
     doc: Dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "invoice_number": invoice_number,
@@ -379,13 +402,17 @@ async def generate_invoice_for_payment(
         "discount_total": discount_total,
         "tax_total": 0.0,
         "total_amount": total_amount,
+        "amount_received": total_amount,
+        "quoted_total_amount": quoted_total,
+        "outstanding_amount": outstanding_amount,
+        "is_partial_payment": is_partial,
         "payment_reference": payment.get("razorpay_payment_id")
         or payment.get("transaction_id")
         or payment.get("id"),
         "payment_method": pm_str or "physical_cash",
         "payment_gateway_label": gateway_label,
         "paid_at": paid_at,
-        "notes": payment.get("notes"),
+        "notes": notes,
         "source": source,
         "created_at": now,
         "updated_at": now,
@@ -457,6 +484,136 @@ async def safe_generate_invoice_for_payment(**kwargs) -> Optional[Dict[str, Any]
             "Invoice generation failed payment_id=%s cart=%s",
             kwargs.get("payment_id"),
             kwargs.get("cart_checkout_id"),
+        )
+        return None
+
+
+async def generate_partner_onboarding_invoice(
+    *,
+    partner_org: dict,
+    amount_received: float,
+    quoted_total: Optional[float] = None,
+    payment_id: Optional[str] = None,
+    payment_method: str = "physical_cash",
+    notes: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Create an invoice for partner offline/cash onboarding. Idempotent by partner_org_id + source."""
+    db = get_db()
+    if db is None:
+        return None
+    await ensure_invoice_indexes(db)
+    org_id = partner_org.get("id")
+    if not org_id:
+        return None
+
+    existing = await db.invoices.find_one(
+        {"partner_org_id": org_id, "source": "partner_onboarding"}
+    )
+    if existing:
+        existing.pop("_id", None)
+        return serialize_doc(existing)
+    if payment_id:
+        by_pay = await db.invoices.find_one({"payment_id": payment_id})
+        if by_pay:
+            by_pay.pop("_id", None)
+            return serialize_doc(by_pay)
+
+    amount = round(float(amount_received or 0), 2)
+    if amount <= 0:
+        return None
+    quoted = round(float(quoted_total if quoted_total is not None else amount), 2)
+    outstanding = round(max(0.0, quoted - amount), 2)
+    is_partial = outstanding > 0.05
+
+    company = await _load_company(db)
+    customer = {
+        "name": partner_org.get("name") or "Partner",
+        "email": partner_org.get("email"),
+        "phone": partner_org.get("phone"),
+        "address": partner_org.get("address"),
+    }
+    line = InvoiceLineItem(
+        description="Partner organization onboarding / registration",
+        student_id=None,
+        student_label=partner_org.get("name") or "Partner",
+        enrollment_id=None,
+        course_id=None,
+        course_name="Partner Onboarding",
+        branch_id=None,
+        branch_name=None,
+        course_fee=amount,
+        admission_fee=0.0,
+        discount_amount=0.0,
+        line_total=amount,
+    )
+    now = datetime.utcnow()
+    invoice_number = await next_invoice_number(paid_at=now)
+    pm_str = str(payment_method or "physical_cash").lower()
+    if pm_str in ("offline", "cash", "hand_cash"):
+        pm_str = "physical_cash"
+    gateway_label = "Physical Hand Cash" if pm_str == "physical_cash" else pm_str.title()
+    inv_notes = notes or "Partner offline cash onboarding payment"
+    if is_partial:
+        inv_notes = (
+            f"{inv_notes} | Amount received: ₹{amount:.2f}. "
+            f"Quoted total: ₹{quoted:.2f}. Outstanding: ₹{outstanding:.2f}."
+        )
+    doc: Dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "invoice_number": invoice_number,
+        "status": InvoiceStatus.ISSUED.value,
+        "student_id": None,
+        "account_user_id": partner_org.get("admin_user_id"),
+        "partner_org_id": org_id,
+        "branch_id": None,
+        "currency": "INR",
+        "company": company,
+        "customer": customer,
+        "line_items": [line.dict() if hasattr(line, "dict") else line.model_dump()],
+        "subtotal_amount": amount,
+        "admission_total": 0.0,
+        "discount_total": 0.0,
+        "tax_total": 0.0,
+        "total_amount": amount,
+        "amount_received": amount,
+        "quoted_total_amount": quoted,
+        "outstanding_amount": outstanding,
+        "is_partial_payment": is_partial,
+        "payment_reference": payment_id or org_id,
+        "payment_method": pm_str,
+        "payment_gateway_label": gateway_label,
+        "paid_at": now,
+        "notes": inv_notes,
+        "source": "partner_onboarding",
+        "created_at": now,
+        "updated_at": now,
+    }
+    if payment_id:
+        doc["payment_id"] = payment_id
+    try:
+        resolved_company = await resolve_invoice_company_branding(db, doc)
+        if resolved_company:
+            doc["company"] = resolved_company
+    except Exception:
+        logger.exception("Partner invoice branding resolve failed")
+
+    try:
+        doc["document_html"] = build_invoice_html(doc)
+    except Exception:
+        logger.exception("Partner invoice HTML build failed")
+
+    await db.invoices.insert_one(doc)
+    doc.pop("_id", None)
+    return serialize_doc(doc)
+
+
+async def safe_generate_partner_onboarding_invoice(**kwargs) -> Optional[Dict[str, Any]]:
+    try:
+        return await generate_partner_onboarding_invoice(**kwargs)
+    except Exception:
+        logger.exception(
+            "Partner onboarding invoice failed partner_org_id=%s",
+            (kwargs.get("partner_org") or {}).get("id"),
         )
         return None
 

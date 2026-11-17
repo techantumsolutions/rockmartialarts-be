@@ -382,9 +382,14 @@ class CourseController:
             assert_tenant_doc_access,
             is_partner_super_admin,
         )
-        from utils.partner_org_access import assert_partner_feature_for_user, is_partner_feature_enabled
+        from utils.partner_org_access import (
+            assert_partner_course_mutation,
+            assert_partner_feature_for_user,
+            is_partner_feature_enabled,
+        )
 
         await assert_partner_feature_for_user(db, current_user, "courses")
+        await assert_partner_course_mutation(db, current_user, action="create")
 
         # Check for duplicate course title (scoped per partner tenant)
         title_query = {
@@ -804,7 +809,13 @@ class CourseController:
             raise HTTPException(status_code=404, detail="Course not found")
 
         from utils.partner_tenant import assert_tenant_doc_access
+        from utils.partner_org_access import (
+            assert_partner_course_mutation,
+            assert_partner_feature_for_user,
+        )
 
+        await assert_partner_feature_for_user(db, current_user, "courses")
+        await assert_partner_course_mutation(db, current_user, action="edit")
         assert_tenant_doc_access(existing_course, current_user, entity="course")
         
         # Coach Admin permission check

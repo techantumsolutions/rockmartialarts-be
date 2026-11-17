@@ -432,6 +432,26 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             logging.getLogger(__name__).exception("partner messaging quota migrate failed")
+        try:
+            # Partner Organizations must NOT auto-become public branches.
+            # Deactivate any leftover auto-created stub branches from earlier backfills.
+            auto_res = await app.mongodb.branches.update_many(
+                {"created_via": "partner_org_auto_branch", "is_active": True},
+                {
+                    "$set": {
+                        "is_active": False,
+                        "deactivated_reason": "partner_org_is_not_a_branch",
+                        "updated_at": __import__("datetime").datetime.utcnow(),
+                    }
+                },
+            )
+            logging.getLogger(__name__).info(
+                "partner auto-branch cleanup matched=%s modified=%s",
+                getattr(auto_res, "matched_count", None),
+                getattr(auto_res, "modified_count", None),
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("partner auto-branch cleanup failed")
     except Exception:
         logging.exception("Failed to ensure partner organization indexes")
 

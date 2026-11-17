@@ -39,8 +39,18 @@ async def get_course(
 async def update_course(
     course_id: str,
     course_update: CourseUpdate,
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]))
+    current_user: dict = Depends(
+        require_role_unified(
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
+        )
+    ),
 ):
+    """Update course. Partner SA requires Super Admin–granted can_edit_courses."""
     return await CourseController.update_course(course_id, course_update, current_user)
 
 @router.delete("/{course_id}")

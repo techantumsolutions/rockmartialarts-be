@@ -10,7 +10,12 @@ from controllers.partner_org_branding_controller import (
     PartnerOrgLandingLeadCreate,
 )
 from models.partner_org_branding_models import PartnerOrgBrandingUpsert
+from models.partner_branding_approval_models import (
+    BrandingEditRequestCreate,
+    BrandingEditReviewBody,
+)
 from models.partner_org_models import (
+    PartnerCoursePermissionsUpdate,
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerMessagingQuotaUpdate,
@@ -96,8 +101,73 @@ async def upsert_my_partner_branding(
     body: PartnerOrgBrandingUpsert,
     current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
 ):
-    """Partner Super Admin: create/update own org branding."""
+    """Partner Super Admin: create/update own org branding (requires SA approval)."""
     return await PartnerOrgBrandingController.upsert_my_branding(body, current_user)
+
+
+@router.get("/me/branding-edit-permission")
+async def get_my_branding_edit_permission(
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: current branding edit permission state."""
+    return await PartnerOrgBrandingController.get_my_branding_edit_permission(current_user)
+
+
+@router.post("/me/branding-edit-request")
+async def request_branding_edit_access(
+    body: BrandingEditRequestCreate = Body(default=BrandingEditRequestCreate()),
+    current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
+):
+    """Partner Super Admin: request permission to edit branding page."""
+    return await PartnerOrgBrandingController.request_branding_edit(
+        current_user, note=(body.note if body else None)
+    )
+
+
+@router.get("/branding-edit-requests")
+async def list_branding_edit_requests(
+    status: Optional[str] = Query("pending"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Rock Super Admin: list partner branding edit requests."""
+    return await PartnerOrgBrandingController.list_branding_edit_requests(
+        current_user, status=status, skip=skip, limit=limit
+    )
+
+
+@router.post("/branding-edit-requests/{request_id}/approve")
+async def approve_branding_edit_request(
+    request_id: str,
+    body: BrandingEditReviewBody = Body(default=BrandingEditReviewBody()),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgBrandingController.approve_branding_edit_request(
+        request_id, current_user, reason=(body.reason if body else None)
+    )
+
+
+@router.post("/branding-edit-requests/{request_id}/reject")
+async def reject_branding_edit_request(
+    request_id: str,
+    body: BrandingEditReviewBody = Body(default=BrandingEditReviewBody()),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgBrandingController.reject_branding_edit_request(
+        request_id, current_user, reason=(body.reason if body else None)
+    )
+
+
+@router.post("/{partner_org_id}/branding-edit-revoke")
+async def revoke_branding_edit_access(
+    partner_org_id: str,
+    body: BrandingEditReviewBody = Body(default=BrandingEditReviewBody()),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    return await PartnerOrgBrandingController.revoke_branding_edit_access(
+        partner_org_id, current_user, reason=(body.reason if body else None)
+    )
 
 
 @router.get("/public/{slug}")
@@ -211,6 +281,27 @@ async def patch_partner_feature_permissions(
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
 ):
     return await PartnerOrgController.patch_feature_permissions(partner_org_id, body, current_user)
+
+
+@router.get("/{partner_org_id}/course-permissions")
+async def get_partner_course_permissions(
+    partner_org_id: str,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: read Partner course create/edit permission flags."""
+    return await PartnerOrgController.get_course_permissions(partner_org_id, current_user)
+
+
+@router.patch("/{partner_org_id}/course-permissions")
+async def patch_partner_course_permissions(
+    partner_org_id: str,
+    body: PartnerCoursePermissionsUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: grant/revoke Partner course create/edit permissions."""
+    return await PartnerOrgController.patch_course_permissions(
+        partner_org_id, body, current_user
+    )
 
 
 @router.get("/{partner_org_id}/messaging-quota")

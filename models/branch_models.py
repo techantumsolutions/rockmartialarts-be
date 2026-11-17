@@ -138,6 +138,9 @@ class Branch(BaseModel):
     allows_collaboration: bool = False  # M21 — collaboration partner branch
     is_collaboration_partner: bool = False  # Alias of allows_collaboration (API/UI)
     is_active: bool = True
+    # Optional map coordinates for visitor→branch distance (WGS84)
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -152,6 +155,12 @@ class BranchCreate(BaseModel):
     slug: Optional[str] = None
     allows_collaboration: bool = False
     is_collaboration_partner: Optional[bool] = None
+    # White-label partner org (1:1 with branch). Rock SA only.
+    partner_org_id: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    description: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
 
 class BranchUpdate(BaseModel):
     branch: Optional[BranchInfo] = None
@@ -169,3 +178,7 @@ class BranchUpdate(BaseModel):
     map_link: Optional[str] = None
     cover_image_url: Optional[str] = None
     gallery_images: Optional[List[str]] = None
+    # White-label partner org (1:1). Pass null/"" to unlink.
+    partner_org_id: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)

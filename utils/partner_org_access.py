@@ -89,6 +89,27 @@ def is_partner_feature_enabled(org: Optional[dict], feature_key: str) -> bool:
     return perms.get(key, True)
 
 
+def normalize_course_permissions(raw: Any) -> Dict[str, bool]:
+    """Partner course mutation permissions — default OFF (view-only)."""
+    data = raw if isinstance(raw, dict) else {}
+    return {
+        "can_create_courses": bool(
+            data.get("can_create_courses")
+            if "can_create_courses" in data
+            else data.get("can_create", False)
+        ),
+        "can_edit_courses": bool(
+            data.get("can_edit_courses")
+            if "can_edit_courses" in data
+            else data.get("can_edit", False)
+        ),
+    }
+
+
+def get_partner_course_permissions(org: Optional[dict]) -> Dict[str, bool]:
+    return normalize_course_permissions((org or {}).get("course_permissions"))
+
+
 def partner_org_public_extras(org: Optional[dict]) -> Dict[str, Any]:
     if not org:
         return {}
@@ -98,7 +119,42 @@ def partner_org_public_extras(org: Optional[dict]) -> Dict[str, Any]:
         "valid_until": org.get("valid_until"),
         "effective_status": effective,
         "feature_permissions": normalize_feature_permissions(org.get("feature_permissions")),
+        "course_permissions": get_partner_course_permissions(org),
     }
+
+
+async def assert_partner_course_mutation(
+    db,
+    current_user: Optional[dict],
+    *,
+    action: str,
+) -> None:
+    """Enforce Super-Admin-granted course create/edit flags for Partner SA."""
+    if not current_user:
+        return
+    role = str(current_user.get("role") or "").lower()
+    if role != "partner_super_admin":
+        return
+    org_id = str(current_user.get("partner_org_id") or "").strip()
+    if not org_id:
+        raise HTTPException(status_code=403, detail="Partner organization is missing on this account")
+    org = await db.partner_organizations.find_one({"id": org_id})
+    if partner_org_blocks_access(org):
+        raise HTTPException(
+            status_code=403,
+            detail="This partner account is disabled or expired. Please contact administrator.",
+        )
+    perms = get_partner_course_permissions(org)
+    key = "can_create_courses" if action == "create" else "can_edit_courses"
+    if not perms.get(key):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Course creation is not enabled for your partner organization."
+                if action == "create"
+                else "Course editing is not enabled for your partner organization."
+            ),
+        )
 
 
 async def assert_partner_feature_for_user(

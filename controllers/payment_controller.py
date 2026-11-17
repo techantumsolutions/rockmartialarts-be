@@ -3069,6 +3069,31 @@ class PaymentController:
                 expected_amount_inr=float(payment_info.pricing.total_amount or 0),
             )
 
+            quoted_total_amount = float(payment_info.pricing.total_amount or 0)
+            raw_pm_early = (
+                payment_data.payment_method.value
+                if hasattr(payment_data.payment_method, "value")
+                else str(payment_data.payment_method or "")
+            )
+            is_hand_cash_early = str(raw_pm_early).lower() in ("cash", "physical_cash", "hand_cash")
+            amount_received = quoted_total_amount
+            outstanding_amount = 0.0
+            is_partial_payment = False
+            if is_hand_cash_early:
+                cash_raw = getattr(payment_data, "cash_amount", None)
+                try:
+                    cash_val = float(cash_raw) if cash_raw is not None else None
+                except (TypeError, ValueError):
+                    cash_val = None
+                if cash_val is None or cash_val <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cash Payment Amount is required and must be a positive amount when payment mode is Cash.",
+                    )
+                amount_received = round(cash_val, 2)
+                outstanding_amount = round(max(0.0, quoted_total_amount - amount_received), 2)
+                is_partial_payment = outstanding_amount > 0.05
+
             # Generate transaction ID
             transaction_id = f"TXN{datetime.utcnow().strftime('%Y%m%d')}{secrets.token_hex(4).upper()}"
 
@@ -3110,7 +3135,7 @@ class PaymentController:
                     end_date=end_date,
                     fee_amount=payment_info.pricing.course_fee,
                     admission_fee=payment_info.pricing.admission_fee,
-                    payment_status="paid",
+                    payment_status="paid" if not is_partial_payment else "pending",
                     enrollment_date=start_date,
                     is_active=True
                 )
@@ -3118,6 +3143,11 @@ class PaymentController:
                 enrollment_doc = enrollment.dict()
                 if payment_data.duration:
                     enrollment_doc["duration_id"] = payment_data.duration
+                enrollment_doc["amount_received"] = amount_received
+                enrollment_doc["quoted_total_amount"] = quoted_total_amount
+                enrollment_doc["outstanding_amount"] = outstanding_amount
+                if is_partial_payment:
+                    enrollment_doc["arrear_amount"] = outstanding_amount
                 await db.enrollments.insert_one(enrollment_doc)
                 enrollment_id = enrollment.id
             else:
@@ -3137,17 +3167,25 @@ class PaymentController:
                     end_date = await resolve_enrollment_end_date(
                         db, payment_data.duration, st, months_hint=months_hint
                     )
+                    enroll_set = {
+                        "end_date": end_date,
+                        "fee_amount": payment_info.pricing.course_fee,
+                        "admission_fee": payment_info.pricing.admission_fee,
+                        "payment_status": (
+                            PaymentStatus.PENDING.value
+                            if is_partial_payment
+                            else PaymentStatus.PAID.value
+                        ),
+                        "duration_id": payment_data.duration,
+                        "amount_received": amount_received,
+                        "quoted_total_amount": quoted_total_amount,
+                        "outstanding_amount": outstanding_amount,
+                    }
+                    if is_partial_payment:
+                        enroll_set["arrear_amount"] = outstanding_amount
                     await db.enrollments.update_one(
                         {"id": enrollment_id},
-                        {
-                            "$set": {
-                                "end_date": end_date,
-                                "fee_amount": payment_info.pricing.course_fee,
-                                "admission_fee": payment_info.pricing.admission_fee,
-                                "payment_status": PaymentStatus.PAID.value,
-                                "duration_id": payment_data.duration,
-                            }
-                        },
+                        {"$set": enroll_set},
                     )
 
             # Update user with creator audit if present
@@ -3163,10 +3201,10 @@ class PaymentController:
             payment = Payment(
                 student_id=student_id,
                 enrollment_id=enrollment_id,  # Link payment to enrollment
-                amount=payment_info.pricing.total_amount,
+                amount=amount_received,
                 payment_type=PaymentType.REGISTRATION_FEE,
                 payment_method=effective_pm,
-                payment_status=PaymentStatus.PAID,  # Successful payment
+                payment_status=PaymentStatus.PAID,  # Successful payment of amount received
                 transaction_id=payment_data.razorpay_payment_id or transaction_id,
                 payment_date=datetime.utcnow(),
                 due_date=datetime.utcnow() + timedelta(days=7),
@@ -3187,9 +3225,19 @@ class PaymentController:
             payment_dict["payment_status"] = "paid"
             payment_dict["payment_type"] = "registration_fee"
             payment_dict["payment_method"] = normalized_pm
+            payment_dict["quoted_total_amount"] = quoted_total_amount
+            payment_dict["amount_received"] = amount_received
+            payment_dict["outstanding_amount"] = outstanding_amount
+            payment_dict["is_partial_payment"] = is_partial_payment
             if is_hand_cash:
+                payment_dict["cash_amount"] = amount_received
                 payment_dict["gateway_payment_label"] = "Physical Hand Cash"
-                payment_dict["notes"] = payment_data.cash_notes or "Physical Hand Cash"
+                note_bits = [payment_data.cash_notes or "Physical Hand Cash"]
+                if is_partial_payment:
+                    note_bits.append(
+                        f"Partial payment: received ₹{amount_received:.2f} of ₹{quoted_total_amount:.2f}; outstanding ₹{outstanding_amount:.2f}"
+                    )
+                payment_dict["notes"] = " | ".join(n for n in note_bits if n)
             if payment_data.razorpay_payment_id:
                 payment_dict["razorpay_payment_id"] = payment_data.razorpay_payment_id
             if payment_data.razorpay_order_id:
@@ -3288,7 +3336,11 @@ class PaymentController:
                     "course_id": payment_data.course_id,
                     "course_name": payment_info.course_name,
                     "batch_ref": payment_data.batch_ref,
-                    "amount": payment_info.pricing.total_amount,
+                    "amount": amount_received,
+                    "quoted_total_amount": quoted_total_amount,
+                    "amount_received": amount_received,
+                    "outstanding_amount": outstanding_amount,
+                    "is_partial_payment": is_partial_payment,
                     "currency": "INR",
                     "payment_type": "registration_fee",
                     "payment_method": "physical_cash",
@@ -3367,7 +3419,7 @@ class PaymentController:
                     student_name=payment_data.student_data.get("full_name")
                     or payment_data.student_data.get("first_name")
                     or "Student",
-                    amount=payment_info.pricing.total_amount,
+                    amount=amount_received,
                     course_or_plan=payment_info.course_name or "Course",
                     txn_id=transaction_id or "",
                     payment_date=datetime.utcnow(),

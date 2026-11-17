@@ -28,6 +28,8 @@ class PartnerOrgCreate(BaseModel):
     phone: str = Field(..., min_length=7, max_length=20)
     address: str = Field(..., min_length=3, max_length=500)
     payment_method: PartnerPaymentMethod
+    # Actual cash amount received when payment_method is offline (required for offline).
+    cash_amount: Optional[float] = Field(None, gt=0)
     # Optional Super Admin messaging quotas (0 = channel disabled)
     sms_allocated: Optional[int] = Field(None, ge=0)
     whatsapp_allocated: Optional[int] = Field(None, ge=0)
@@ -74,6 +76,13 @@ class PartnerFeaturePermissionsUpdate(BaseModel):
     feature_permissions: Dict[str, bool] = Field(default_factory=dict)
 
 
+class PartnerCoursePermissionsUpdate(BaseModel):
+    """Super Admin grants Partner SA course create/edit (default both false)."""
+
+    can_create_courses: bool = False
+    can_edit_courses: bool = False
+
+
 def new_partner_org_id() -> str:
     return str(uuid4())
 
@@ -109,6 +118,12 @@ def partner_org_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
         "sms_reserved": doc.get("sms_reserved"),
         "whatsapp_reserved": doc.get("whatsapp_reserved"),
         "messaging_quota": quota_summary_from_doc(doc),
+        "cash_amount": doc.get("cash_amount") or doc.get("amount_received"),
+        "amount_received": doc.get("amount_received") or doc.get("cash_amount"),
+        "registration_fee": doc.get("registration_fee"),
+        "invoice_id": doc.get("invoice_id"),
+        "invoice_number": doc.get("invoice_number"),
+        "branding_edit_permission": doc.get("branding_edit_permission") or "none",
     }
     payload.update(partner_org_public_extras(doc))
     return payload

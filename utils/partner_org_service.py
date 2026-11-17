@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from models.partner_org_models import (
+    PartnerCoursePermissionsUpdate,
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerMessagingQuotaUpdate,
@@ -35,7 +36,9 @@ from utils.partner_messaging_quota import (
 )
 from utils.partner_org_access import (
     compute_partner_effective_status,
+    get_partner_course_permissions,
     is_partner_feature_enabled,
+    normalize_course_permissions,
     normalize_feature_permissions,
     partner_org_blocks_access,
 )
@@ -433,9 +436,32 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         allow_pending_partner_email=False,
     )
 
+    try:
+        cash_amount = float(body.cash_amount) if body.cash_amount is not None else None
+    except (TypeError, ValueError):
+        cash_amount = None
+    if cash_amount is None or cash_amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Cash Payment Amount is required and must be a positive amount for Offline (Hand Cash) partner creation.",
+        )
+    cash_amount = round(cash_amount, 2)
+
+    quoted_fee_inr = cash_amount
+    try:
+        from controllers.settings_controller import SettingsController
+
+        settings_fee = float(await SettingsController.get_default_partner_registration_fee())
+        if settings_fee > 0:
+            quoted_fee_inr = settings_fee
+    except Exception:
+        pass
+    outstanding = round(max(0.0, quoted_fee_inr - cash_amount), 2)
+
     now = datetime.utcnow()
     org_id = new_partner_org_id()
     slug = await ensure_unique_partner_slug(db, body.name)
+    payment_id = str(__import__("uuid").uuid4())
     org = {
         "id": org_id,
         "name": body.name.strip(),
@@ -450,10 +476,52 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         "created_at": now,
         "updated_at": now,
         "created_by": current_user.get("id"),
+        "cash_amount": cash_amount,
+        "amount_received": cash_amount,
+        "registration_fee": quoted_fee_inr,
+        "quoted_total_amount": quoted_fee_inr,
+        "outstanding_amount": outstanding,
+        "onboarding_payment_id": payment_id,
+        "branding_edit_permission": "none",
+        "course_permissions": {
+            "can_create_courses": False,
+            "can_edit_courses": False,
+        },
         **_quota_fields_from_create(body),
         "messaging_quota_updated_at": now,
     }
     await db[COL].insert_one(org)
+
+    # Persist partner cash payment record (idempotent key = onboarding_payment_id)
+    existing_pay = await db.payments.find_one({"id": payment_id})
+    if not existing_pay:
+        pay_doc = {
+            "id": payment_id,
+            "student_id": None,
+            "partner_org_id": org_id,
+            "enrollment_id": None,
+            "amount": cash_amount,
+            "amount_received": cash_amount,
+            "quoted_total_amount": quoted_fee_inr,
+            "outstanding_amount": outstanding,
+            "is_partial_payment": outstanding > 0.05,
+            "payment_type": "registration_fee",
+            "payment_method": "physical_cash",
+            "payment_status": "paid",
+            "gateway_payment_label": "Physical Hand Cash",
+            "transaction_id": f"PARTNER-CASH-{org_id[:8].upper()}",
+            "payment_date": now,
+            "notes": "Partner offline cash onboarding payment",
+            "created_at": now,
+            "updated_at": now,
+            "collected_by": {
+                "user_id": current_user.get("id"),
+                "role": current_user.get("role"),
+                "name": current_user.get("full_name") or current_user.get("name"),
+            },
+        }
+        await db.payments.insert_one(pay_doc)
+
     updated = await _finalize_paid_org(
         db,
         org,
@@ -461,15 +529,57 @@ async def create_partner_offline(body: PartnerOrgCreate, current_user: dict) -> 
         payment_status="offline_recorded",
         current_user=current_user,
     )
-    email_sent = bool(updated.get("_invite_email_sent"))
+
+    inv_doc = None
+    try:
+        from utils.invoice_service import safe_generate_partner_onboarding_invoice
+
+        inv_doc = await safe_generate_partner_onboarding_invoice(
+            partner_org=updated or org,
+            amount_received=cash_amount,
+            quoted_total=quoted_fee_inr,
+            payment_id=payment_id,
+            payment_method="physical_cash",
+            notes="Partner offline cash onboarding payment",
+        )
+    except Exception:
+        logger.exception("Partner offline invoice generation failed org_id=%s", org_id)
+
+    inv_id = (inv_doc or {}).get("id")
+    inv_number = (inv_doc or {}).get("invoice_number")
+    if inv_id:
+        await db[COL].update_one(
+            {"id": org_id},
+            {
+                "$set": {
+                    "invoice_id": inv_id,
+                    "invoice_number": inv_number,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        await db.payments.update_one(
+            {"id": payment_id},
+            {"$set": {"invoice_id": inv_id, "invoice_number": inv_number}},
+        )
+        updated = await db[COL].find_one({"id": org_id}) or updated
+
+    email_sent = bool((updated or {}).get("_invite_email_sent"))
+    msg = (
+        "Partner created. Invitation email sent to set password."
+        if email_sent
+        else "Partner created, but the invitation email could not be delivered. Use Resend invite from Partner Profiles."
+    )
+    if not inv_id:
+        msg += " Invoice generation pending — use retry invoice if available."
     return {
-        "message": (
-            "Partner created. Invitation email sent to set password."
-            if email_sent
-            else "Partner created, but the invitation email could not be delivered. Use Resend invite from Partner Profiles."
-        ),
+        "message": msg,
         "invite_email_sent": email_sent,
         "partner": partner_org_public(updated),
+        "invoice_id": inv_id,
+        "invoice_number": inv_number,
+        "payment_id": payment_id,
+        "cash_amount": cash_amount,
     }
 
 
@@ -529,6 +639,11 @@ async def create_partner_online_order(body: PartnerOrgCreate, current_user: dict
                 "created_at": now,
                 "updated_at": now,
                 "created_by": current_user.get("id"),
+                "branding_edit_permission": "none",
+                "course_permissions": {
+                    "can_create_courses": False,
+                    "can_edit_courses": False,
+                },
                 **_quota_fields_from_create(body),
                 "messaging_quota_updated_at": now,
             }
@@ -1154,7 +1269,65 @@ async def get_partner_feature_permissions_for_me(current_user: dict) -> Dict[str
     for key in list(perms.keys()):
         if not is_partner_feature_enabled(org, key):
             perms[key] = False
-    return {"partner_org_id": org_id, "feature_permissions": perms}
+    return {
+        "partner_org_id": org_id,
+        "feature_permissions": perms,
+        "course_permissions": get_partner_course_permissions(org),
+    }
+
+
+async def get_partner_course_permissions_admin(
+    partner_org_id: str, current_user: dict
+) -> Dict[str, Any]:
+    _ = current_user
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    return {
+        "partner_org_id": partner_org_id,
+        "course_permissions": get_partner_course_permissions(org),
+        "partner": partner_org_public(org),
+    }
+
+
+async def update_partner_course_permissions(
+    partner_org_id: str,
+    body: PartnerCoursePermissionsUpdate,
+    current_user: dict,
+) -> Dict[str, Any]:
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    if partner_org_blocks_access(org):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change course permissions while partner is disabled or expired.",
+        )
+    course_perms = normalize_course_permissions(
+        {
+            "can_create_courses": bool(body.can_create_courses),
+            "can_edit_courses": bool(body.can_edit_courses),
+        }
+    )
+    now = datetime.utcnow()
+    await db[COL].update_one(
+        {"id": partner_org_id},
+        {
+            "$set": {
+                "course_permissions": course_perms,
+                "updated_at": now,
+                "updated_by": current_user.get("id"),
+            }
+        },
+    )
+    updated = await db[COL].find_one({"id": partner_org_id})
+    return {
+        "message": "Course permissions updated",
+        "course_permissions": get_partner_course_permissions(updated),
+        "partner": partner_org_public(updated),
+    }
 
 
 async def get_partner_messaging_quota(

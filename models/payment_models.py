@@ -108,6 +108,9 @@ class RegistrationPaymentCreate(BaseModel):
     razorpay_signature: Optional[str] = None
     # Optional physical cash notes / receipt reference
     cash_notes: Optional[str] = None
+    # Actual cash amount received (required when payment_method is cash / physical_cash).
+    # May be a partial payment; must not be assumed equal to the full course fee.
+    cash_amount: Optional[float] = None
 
     @model_validator(mode="before")
     @classmethod

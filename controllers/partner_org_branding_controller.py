@@ -227,12 +227,17 @@ class PartnerOrgBrandingController:
             raise HTTPException(status_code=404, detail="Partner organization not found")
         doc = await db[COL].find_one({"partner_org_id": org_id})
         sections = await _site_sections_for_org(db, org_id)
+        from utils.partner_branding_approval import get_partner_branding_permission
+
+        permission = await get_partner_branding_permission(org_id)
         if not doc:
             out = empty_branding_response(org_id, org)
             out.update(sections)
+            out["edit_permission"] = permission
             return out
         out = _serialize_branding(doc, org)
         out.update(sections)
+        out["edit_permission"] = permission
         return out
 
     @staticmethod
@@ -240,6 +245,9 @@ class PartnerOrgBrandingController:
         if not is_partner_super_admin(current_user):
             raise HTTPException(status_code=403, detail="Partner admin access only")
         org_id = require_partner_org_id(current_user)
+        from utils.partner_branding_approval import assert_partner_can_edit_branding
+
+        await assert_partner_can_edit_branding(org_id)
         db = get_db()
         await ensure_partner_org_branding_indexes(db)
         org = await db[ORG_COL].find_one({"id": org_id})
@@ -453,3 +461,58 @@ class PartnerOrgBrandingController:
         except Exception:
             logger.exception("ops email after partner org landing lead failed")
         return {"message": "Thank you — we received your enquiry.", "lead": out}
+
+    # ── Branding edit approval ──────────────────────────────────────────
+
+    @staticmethod
+    async def get_my_branding_edit_permission(current_user: dict):
+        if not is_partner_super_admin(current_user):
+            raise HTTPException(status_code=403, detail="Partner admin access only")
+        org_id = require_partner_org_id(current_user)
+        from utils.partner_branding_approval import get_partner_branding_permission
+
+        return await get_partner_branding_permission(org_id)
+
+    @staticmethod
+    async def request_branding_edit(current_user: dict, note: Optional[str] = None):
+        if not is_partner_super_admin(current_user):
+            raise HTTPException(status_code=403, detail="Partner admin access only")
+        from utils.partner_branding_approval import request_branding_edit
+
+        return await request_branding_edit(current_user, note=note)
+
+    @staticmethod
+    async def list_branding_edit_requests(
+        current_user: dict,
+        *,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 50,
+    ):
+        from utils.partner_branding_approval import list_branding_edit_requests
+
+        return await list_branding_edit_requests(status=status, skip=skip, limit=limit)
+
+    @staticmethod
+    async def approve_branding_edit_request(
+        request_id: str, current_user: dict, reason: Optional[str] = None
+    ):
+        from utils.partner_branding_approval import approve_branding_edit_request
+
+        return await approve_branding_edit_request(request_id, current_user, reason=reason)
+
+    @staticmethod
+    async def reject_branding_edit_request(
+        request_id: str, current_user: dict, reason: Optional[str] = None
+    ):
+        from utils.partner_branding_approval import reject_branding_edit_request
+
+        return await reject_branding_edit_request(request_id, current_user, reason=reason)
+
+    @staticmethod
+    async def revoke_branding_edit_access(
+        partner_org_id: str, current_user: dict, reason: Optional[str] = None
+    ):
+        from utils.partner_branding_approval import revoke_branding_edit_access
+
+        return await revoke_branding_edit_access(partner_org_id, current_user, reason=reason)

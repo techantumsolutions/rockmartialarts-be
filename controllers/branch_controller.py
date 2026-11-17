@@ -130,6 +130,15 @@ class BranchController:
         """Create new branch with comprehensive nested structure"""
         if not current_user:
             raise HTTPException(status_code=401, detail="Authentication required")
+
+        from utils.partner_tenant import (
+            assert_partner_may_not_create_branch,
+            assign_partner_org_to_branch_doc,
+            is_partner_super_admin,
+        )
+
+        # Partners cannot create branches (1 partner ↔ 1 branch via Rock SA assignment).
+        await assert_partner_may_not_create_branch(current_user)
             
         db = get_db()
         payload = branch_data.dict()
@@ -150,17 +159,37 @@ class BranchController:
         if isinstance(payload.get("assignments"), dict):
             payload["assignments"] = prepare_assignments_for_write(payload.get("assignments"))
 
+        # Normalize optional map coordinates for visitor→branch distance
+        if payload.get("latitude") is not None and payload.get("longitude") is not None:
+            try:
+                from utils.branch_distance import validate_coordinates
+
+                la, lo = validate_coordinates(payload.get("latitude"), payload.get("longitude"))
+                payload["latitude"] = la
+                payload["longitude"] = lo
+                payload["coordinates"] = {"lat": la, "lng": lo}
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+        # Rock SA may create a partner-driven branch (1:1 partner_org ↔ branch).
+        partner_org_id = payload.pop("partner_org_id", None)
+        cover_image_url = payload.pop("cover_image_url", None)
+        description = payload.pop("description", None)
+        if partner_org_id and is_partner_super_admin(current_user):
+            raise HTTPException(status_code=403, detail="Partners cannot assign organizations to branches")
+
         branch = Branch(**payload)
         
         # Store the branch with nested structure exactly as provided
         branch_dict = branch.dict()
+        if payload.get("coordinates"):
+            branch_dict["coordinates"] = payload["coordinates"]
+        if cover_image_url:
+            branch_dict["cover_image_url"] = cover_image_url
+        if description:
+            branch_dict["description"] = description
         apply_collaboration_flag(branch_dict, flag)
-
-        from utils.partner_tenant import stamp_tenant, require_partner_org_id, is_partner_super_admin
-
-        if is_partner_super_admin(current_user):
-            require_partner_org_id(current_user)
-            stamp_tenant(branch_dict, current_user)
+        await assign_partner_org_to_branch_doc(db, branch_dict, partner_org_id)
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
@@ -308,8 +337,10 @@ class BranchController:
         """Get all branches - Public endpoint (no authentication required)"""
         db = get_db()
 
-        # Build query
-        query = {}
+        # Build query — physical branches only (never Partner Organization stubs).
+        query: dict = {
+            "created_via": {"$ne": "partner_org_auto_branch"},
+        }
         if active_only:
             query["is_active"] = True
 
@@ -399,6 +430,13 @@ class BranchController:
             or bool(branch.get("is_collaboration_partner", False)),
             "is_active": branch.get("is_active", True),
             "admission_fee": branch.get("admission_fee", 500.0),
+            "latitude": branch.get("latitude"),
+            "longitude": branch.get("longitude"),
+            "coordinates": branch.get("coordinates"),
+            "cover_image_url": branch.get("cover_image_url") or None,
+            "description": branch.get("description") or None,
+            "rating": branch.get("rating"),
+            "review_count": branch.get("review_count"),
             "operational_details": {
                 "timings": operational.get("timings", []),
                 "courses_offered": operational.get("courses_offered", []),
@@ -491,6 +529,71 @@ class BranchController:
         payload["assignments"] = assignments
         for key in ("manager_id", "bank_details", "bank_info", "bank_account"):
             payload.pop(key, None)
+
+        # Partner-org branches: attach their own site branding for the public
+        # branch detail page (treated as a normal branch URL, not a partner directory).
+        org_id = str(branch.get("partner_org_id") or "").strip()
+        if org_id:
+            try:
+                org = await db.partner_organizations.find_one({"id": org_id})
+                branding = await db.partner_org_branding.find_one({"partner_org_id": org_id})
+                if org:
+                    media = (branding or {}).get("media") or {}
+                    content = (branding or {}).get("content") or {}
+                    facilities = (branding or {}).get("facilities") or {}
+                    social = (branding or {}).get("social_links") or {}
+                    contact_page = (branding or {}).get("contact_page") or {}
+                    footer = (branding or {}).get("footer") or {}
+                    payload["partner_org_slug"] = org.get("slug")
+                    payload["partner_org_name"] = org.get("name")
+                    payload["has_own_branding"] = bool(branding)
+                    payload["site_branding"] = {
+                        "org_name": org.get("name"),
+                        "org_slug": org.get("slug"),
+                        "logo_url": media.get("logo_url"),
+                        "logo_alt": media.get("logo_alt"),
+                        "cover_banner_url": media.get("cover_banner_url"),
+                        "cover_banner_alt": media.get("cover_banner_alt"),
+                        "tagline": content.get("tagline"),
+                        "short_description": content.get("short_description"),
+                        "about_content": content.get("about_content"),
+                        "vision": content.get("vision"),
+                        "mission": content.get("mission"),
+                        "our_story": content.get("our_story"),
+                        "why_choose_us": content.get("why_choose_us"),
+                        "facilities": facilities.get("facilities") or [],
+                        "parking_info": facilities.get("parking_info"),
+                        "location_highlights": facilities.get("location_highlights") or [],
+                        "map_embed_url": facilities.get("map_embed_url")
+                        or contact_page.get("map_embed_url"),
+                        "social_links": social,
+                        "contact": {
+                            "headline": contact_page.get("headline"),
+                            "intro": contact_page.get("intro"),
+                            "address": contact_page.get("address") or org.get("address"),
+                            "phone": contact_page.get("phone") or org.get("phone"),
+                            "email": contact_page.get("email") or org.get("email"),
+                        },
+                        "footer": {
+                            "logo_url": footer.get("logo_url"),
+                            "description": footer.get("description"),
+                        },
+                    }
+                    # Prefer partner cover on the branch page when branch has none.
+                    if not payload.get("cover_image_url") and media.get("cover_banner_url"):
+                        payload["cover_image_url"] = media.get("cover_banner_url")
+                    if not payload.get("description") and (
+                        content.get("short_description") or content.get("tagline")
+                    ):
+                        payload["description"] = (
+                            content.get("short_description") or content.get("tagline")
+                        )
+            except Exception:
+                logger.exception(
+                    "Failed attaching partner site branding for branch %s",
+                    branch.get("id"),
+                )
+
         return payload
 
     @staticmethod
@@ -514,6 +617,9 @@ class BranchController:
             q=q,
             active_only=active_only,
         )
+        # Exclude Partner Organization auto-stub branches — only real physical branches.
+        auto_stub_clause = {"created_via": {"$ne": "partner_org_auto_branch"}}
+        query = {"$and": [query, auto_stub_clause]} if query else auto_stub_clause
         if collaboration_partners_only:
             partner_clause = {
                 "$or": [
@@ -804,7 +910,11 @@ class BranchController:
         existing_branch_for_tenant = await db.branches.find_one({"id": branch_id})
         if not existing_branch_for_tenant:
             raise HTTPException(status_code=404, detail="Branch not found")
-        from utils.partner_tenant import assert_tenant_doc_access
+        from utils.partner_tenant import (
+            assert_tenant_doc_access,
+            assign_partner_org_to_branch_doc,
+            is_partner_super_admin,
+        )
 
         assert_tenant_doc_access(existing_branch_for_tenant, current_user, entity="branch")
 
@@ -839,6 +949,28 @@ class BranchController:
         existing_for_geo = await db.branches.find_one({"id": branch_id})
         if not existing_for_geo:
             raise HTTPException(status_code=404, detail="Branch not found")
+
+        # Partner org assignment (Rock SA only); partners cannot reassign
+        if "partner_org_id" in update_data:
+            if is_partner_super_admin(current_user):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Partners cannot change branch organization assignment",
+                )
+            role_val = str(current_user.get("role") or "").lower()
+            if role_val not in ("super_admin", "superadmin"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only Super Admin can assign a partner to a branch",
+                )
+            org_raw = update_data.get("partner_org_id")
+            org_id = None if org_raw is None or str(org_raw).strip() == "" else str(org_raw).strip()
+            await assign_partner_org_to_branch_doc(
+                db,
+                update_data,
+                org_id,
+                exclude_branch_id=branch_id,
+            )
 
         if (
             "allows_collaboration" in update_data
@@ -917,6 +1049,21 @@ class BranchController:
                 if prev_cs is not None:
                     new_asg["course_schedule"] = prev_cs
             update_data["assignments"] = prepare_assignments_for_write(new_asg)
+
+        # Keep coordinates object in sync when lat/lng are provided
+        if "latitude" in update_data or "longitude" in update_data:
+            lat = update_data.get("latitude", existing_for_geo.get("latitude"))
+            lng = update_data.get("longitude", existing_for_geo.get("longitude"))
+            if lat is not None and lng is not None:
+                try:
+                    from utils.branch_distance import validate_coordinates
+
+                    la, lo = validate_coordinates(lat, lng)
+                    update_data["latitude"] = la
+                    update_data["longitude"] = lo
+                    update_data["coordinates"] = {"lat": la, "lng": lo}
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
 
         update_data["updated_at"] = datetime.utcnow()
         
@@ -1111,6 +1258,48 @@ class BranchController:
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Holiday not found")
         return
+
+    @staticmethod
+    async def calculate_public_distances(
+        latitude: float,
+        longitude: float,
+        branch_ids: Optional[list] = None,
+    ):
+        """Public: distances from visitor coordinates to branch coordinates."""
+        from utils.branch_distance import (
+            calculate_branch_distances,
+            validate_coordinates,
+        )
+
+        try:
+            validate_coordinates(latitude, longitude)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        db = get_db()
+        query: dict = {"is_active": True}
+        ids = [str(x).strip() for x in (branch_ids or []) if str(x).strip()]
+        if ids:
+            if len(ids) > 50:
+                raise HTTPException(status_code=400, detail="Too many branch_ids (max 50)")
+            query["id"] = {"$in": ids}
+
+        projection = {
+            "id": 1,
+            "latitude": 1,
+            "longitude": 1,
+            "coordinates": 1,
+            "is_active": 1,
+            "_id": 0,
+        }
+        branches = await db.branches.find(query, projection).limit(50).to_list(50)
+        if ids:
+            found = {b.get("id") for b in branches}
+            for missing in ids:
+                if missing not in found:
+                    branches.append({"id": missing})
+
+        return await calculate_branch_distances(latitude, longitude, branches)
 
     @staticmethod
     async def delete_branch(

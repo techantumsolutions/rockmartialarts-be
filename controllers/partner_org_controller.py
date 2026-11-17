@@ -1,6 +1,7 @@
 """White-label partner organization APIs."""
 
 from models.partner_org_models import (
+    PartnerCoursePermissionsUpdate,
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
     PartnerMessagingQuotaUpdate,
@@ -88,6 +89,18 @@ class PartnerOrgController:
     @staticmethod
     async def get_my_feature_permissions(current_user: dict):
         return await svc.get_partner_feature_permissions_for_me(current_user)
+
+    @staticmethod
+    async def get_course_permissions(partner_org_id: str, current_user: dict):
+        return await svc.get_partner_course_permissions_admin(partner_org_id, current_user)
+
+    @staticmethod
+    async def patch_course_permissions(
+        partner_org_id: str, body: PartnerCoursePermissionsUpdate, current_user: dict
+    ):
+        return await svc.update_partner_course_permissions(
+            partner_org_id, body, current_user
+        )
 
     @staticmethod
     async def get_messaging_quota(partner_org_id: str, current_user: dict):

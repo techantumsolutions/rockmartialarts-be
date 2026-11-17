@@ -7,11 +7,17 @@ Student ownership is stamped from the *creator* (partner staff), not from the br
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import logging
+import re
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
 from models.user_models import UserRole
+
+logger = logging.getLogger(__name__)
 
 
 def is_partner_super_admin(user: Optional[dict]) -> bool:
@@ -97,6 +103,135 @@ def stamp_tenant(doc: Dict[str, Any], user: Optional[dict]) -> Dict[str, Any]:
     if org_id:
         doc["partner_org_id"] = org_id
     return doc
+
+
+async def assert_partner_may_not_create_branch(user: Optional[dict]) -> None:
+    """Partners cannot create branches — Rock SA assigns or creates partner-driven branches."""
+    if is_partner_super_admin(user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Partners cannot create branches. Ask Rock Super Admin to assign "
+                "your organization to an existing branch or create a partner-driven branch."
+            ),
+        )
+
+
+async def assert_partner_org_exists(
+    db,
+    partner_org_id: Optional[str],
+) -> None:
+    """Validate partner_org_id refers to a real Partner Organization (not a branch)."""
+    org_id = str(partner_org_id or "").strip()
+    if not org_id:
+        return
+    org = await db.partner_organizations.find_one({"id": org_id}, {"id": 1})
+    if not org:
+        raise HTTPException(status_code=400, detail="Partner organization not found")
+
+
+# Backward-compatible alias — multiple Partner Branches per org are now allowed.
+async def assert_one_branch_per_partner_org(
+    db,
+    partner_org_id: Optional[str],
+    *,
+    exclude_branch_id: Optional[str] = None,
+) -> None:
+    _ = exclude_branch_id
+    await assert_partner_org_exists(db, partner_org_id)
+
+
+async def assign_partner_org_to_branch_doc(
+    db,
+    doc: Dict[str, Any],
+    partner_org_id: Optional[str],
+    *,
+    exclude_branch_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Set or clear partner_org_id on a branch. Orgs may own multiple Partner Branches."""
+    _ = exclude_branch_id
+    org_id = str(partner_org_id or "").strip() or None
+    if org_id:
+        await assert_partner_org_exists(db, org_id)
+        doc["partner_org_id"] = org_id
+    else:
+        doc["partner_org_id"] = None
+    return doc
+
+
+def _slugify_branch_name(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9\-]", "", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "branch"
+
+
+def _parse_address_string(address: Any) -> Dict[str, str]:
+    if isinstance(address, dict):
+        return {
+            "line1": str(address.get("line1") or address.get("address") or "Address").strip() or "Address",
+            "area": str(address.get("area") or "").strip() or "—",
+            "city": str(address.get("city") or "").strip() or "—",
+            "state": str(address.get("state") or "").strip() or "—",
+            "pincode": str(address.get("pincode") or address.get("pin") or "").strip() or "000000",
+            "country": str(address.get("country") or "India").strip() or "India",
+        }
+    raw = str(address or "").strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip()] if raw else []
+    line1 = parts[0] if parts else (raw or "Address")
+    city = parts[-2] if len(parts) >= 2 else (parts[-1] if parts else "—")
+    state = parts[-1] if len(parts) >= 3 else "—"
+    area = parts[1] if len(parts) >= 3 else "—"
+    return {
+        "line1": line1[:200],
+        "area": area[:100] or "—",
+        "city": city[:100] or "—",
+        "state": state[:100] or "—",
+        "pincode": "000000",
+        "country": "India",
+    }
+
+
+async def ensure_unique_branch_slug(db, base: str, *, exclude_id: Optional[str] = None) -> str:
+    slug = _slugify_branch_name(base)
+    n = 0
+    while True:
+        candidate = slug if n == 0 else f"{slug}-{n}"
+        query: Dict[str, Any] = {"slug": candidate}
+        if exclude_id:
+            query["id"] = {"$ne": exclude_id}
+        existing = await db.branches.find_one(query, {"id": 1})
+        if not existing:
+            return candidate
+        n += 1
+        if n > 200:
+            return f"{slug}-{uuid.uuid4().hex[:6]}"
+
+
+async def ensure_partner_public_branch(db, org: dict) -> Optional[dict]:
+    """Deprecated: Partner Organizations must not auto-become branches.
+
+    Returns an existing Super-Admin-linked Partner Branch if present; never creates one.
+    """
+    if not org or not org.get("id"):
+        return None
+    org_id = str(org["id"]).strip()
+    if not org_id:
+        return None
+    return await db.branches.find_one(
+        {
+            "partner_org_id": org_id,
+            "created_via": {"$ne": "partner_org_auto_branch"},
+            "is_active": True,
+        }
+    )
+
+
+async def migrate_partner_public_branches(db) -> Dict[str, Any]:
+    """No-op migration — Partner Orgs are not auto-converted to public branches."""
+    _ = db
+    return {"scanned": 0, "created": 0, "existing": 0, "skipped": 0, "disabled": True}
 
 
 def assert_tenant_doc_access(doc: Optional[dict], user: Optional[dict], *, entity: str = "record") -> None:

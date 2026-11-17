@@ -1,9 +1,16 @@
-from fastapi import APIRouter
-from typing import Optional
+from fastapi import APIRouter, Body
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from controllers.location_controller import LocationController
 from controllers.branch_controller import BranchController
 
 router = APIRouter()
+
+
+class BranchDistancesRequest(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    branch_ids: Optional[List[str]] = None
 
 @router.get("/public/by-location/{location_id}")
 async def get_branches_by_location(
@@ -54,6 +61,16 @@ async def search_branches_public(
 async def get_public_branch_by_slug(slug: str):
     """Public branch detail by slug or id, with available courses."""
     return await BranchController.get_branch_by_slug(slug)
+
+
+@router.post("/public/distances")
+async def calculate_branch_distances(body: BranchDistancesRequest = Body(...)):
+    """Calculate visitor→branch distances (routing when configured, else Haversine)."""
+    return await BranchController.calculate_public_distances(
+        latitude=body.latitude,
+        longitude=body.longitude,
+        branch_ids=body.branch_ids,
+    )
 
 
 @router.get("/public/{branch_id}")

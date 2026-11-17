@@ -269,14 +269,24 @@ class AchievementController:
         sort_spec = [("is_featured", -1), ("created_at", -1)] if include_all else [("created_at", -1)]
         cursor = db.student_achievements.find(q).sort(sort_spec).skip(skip).limit(limit)
         items = await cursor.to_list(length=limit)
-        # Enrich with student names
+        # Enrich with student names + photos
         student_ids = list({a["student_id"] for a in items})
         users = await db.users.find({"id": {"$in": student_ids}}).to_list(length=len(student_ids)) if student_ids else []
-        user_map = {u["id"]: u.get("full_name") or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip() or "Student" for u in users}
+        user_map = {
+            u["id"]: u.get("full_name")
+            or f"{u.get('first_name', '')} {u.get('last_name', '')}".strip()
+            or "Student"
+            for u in users
+        }
+        photo_map = {
+            u["id"]: u.get("profile_image_url") or u.get("profile_image") or None
+            for u in users
+        }
         result = []
         for a in items:
             d = serialize_doc(a)
             d["student_name"] = user_map.get(a["student_id"], "Student")
+            d["student_photo"] = photo_map.get(a["student_id"])
             result.append(d)
         return {"achievements": result}
 
