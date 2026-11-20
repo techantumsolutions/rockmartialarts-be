@@ -3,7 +3,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 
 from controllers.camp_registration_controller import CampRegistrationController
-from models.camp_registration_models import CampRegistrationCreate, CampRegistrationResponse, CampRegVerifyPayment
+from models.camp_registration_models import (
+    CampRegistrationCreate,
+    CampRegistrationResponse,
+    CampRegAdminStatusUpdate,
+    CampRegVerifyPayment,
+)
 from models.user_models import UserRole
 from utils.unified_auth import require_role_unified
 
@@ -55,3 +60,15 @@ async def get_camp_registration(
 ):
     """Super-admin: full camp registration."""
     return await CampRegistrationController.get_one(reg_id)
+
+
+@router.patch("/{reg_id}/status", response_model=CampRegistrationResponse)
+async def update_camp_registration_status(
+    reg_id: str,
+    body: CampRegAdminStatusUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super-admin: change enquiry/lead status for a camp registration."""
+    return await CampRegistrationController.update_status(
+        reg_id, body.status, note=body.note
+    )

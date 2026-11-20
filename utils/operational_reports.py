@@ -34,8 +34,10 @@ async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[st
     role = current_user.get("role")
     db = get_db()
     from utils.partner_tenant import partner_report_branch_ids
+    from utils.student_report_query import _resolve_branch_id_from_param
 
-    partner_ids = await partner_report_branch_ids(db, current_user, branch_id)
+    resolved = await _resolve_branch_id_from_param(db, branch_id) if branch_id else ""
+    partner_ids = await partner_report_branch_ids(db, current_user, resolved or None)
     if partner_ids is not None:
         return {"branch_id": {"$in": partner_ids}}
     if role == "branch_manager":
@@ -44,9 +46,11 @@ async def _branch_scope(current_user: dict, branch_id: Optional[str]) -> Dict[st
         ids = await get_managed_branch_ids_for_user(db, current_user)
         if not ids:
             return {"branch_id": {"$in": []}}
-        return {"branch_id": {"$in": ids}}
-    if branch_id:
-        return {"branch_id": branch_id}
+        if resolved and resolved not in ids:
+            return {"branch_id": {"$in": []}}
+        return {"branch_id": {"$in": [resolved] if resolved else ids}}
+    if resolved:
+        return {"branch_id": resolved}
     return {}
 
 

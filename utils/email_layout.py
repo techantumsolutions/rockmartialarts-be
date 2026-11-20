@@ -28,10 +28,36 @@ ACCENT_GOLD = "#FFB70F"
 ACCENT_PARTNER = "#FFC403"
 
 
+def _platform() -> dict:
+    try:
+        from utils.platform_branding import get_cached_platform_branding
+
+        return get_cached_platform_branding() or {}
+    except Exception:
+        return {}
+
+
+def academy_display_name() -> str:
+    p = _platform()
+    return (
+        str(p.get("platform_name") or p.get("legal_name") or "").strip()
+        or ACADEMY_NAME
+    )
+
+
 def _logo_url() -> str:
     explicit = (os.getenv("EMAIL_LOGO_URL") or "").strip()
     if explicit:
         return explicit
+    p = _platform()
+    logo = str(p.get("navbar_logo") or p.get("footer_logo") or "").strip()
+    if logo:
+        if logo.startswith("http://") or logo.startswith("https://"):
+            return logo
+        base = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_SITE_URL") or "").strip().rstrip("/")
+        if logo.startswith("/") and base:
+            return f"{base}{logo}"
+        return logo
     base = (os.getenv("FRONTEND_URL") or os.getenv("NEXT_PUBLIC_SITE_URL") or "").strip().rstrip("/")
     if base:
         return f"{base}/logo.png"
@@ -46,16 +72,23 @@ def wrap_rock_email_html(
     cta_label: str = "",
     cta_url: str = "",
     accent: str = ACCENT_RED,
-    footer_note: str = "This is an automated message from Rock Martial Arts Academy.",
-    academy_name: str = ACADEMY_NAME,
+    footer_note: str = "",
+    academy_name: str = "",
     include_logo: bool = True,
     preheader: str = "",
 ) -> str:
-    """Wrap inner HTML in the branded Rock Martial Arts card."""
+    """Wrap inner HTML in the branded platform email card."""
     year = datetime.utcnow().year
+    if not academy_name:
+        academy_name = academy_display_name()
+    if not footer_note:
+        footer_note = f"This is an automated message from {academy_name}."
+    p = _platform()
+    accent_gold = str(p.get("accent_color") or ACCENT_GOLD)
     accent_safe = accent or ACCENT_RED
     cta_text_color = "#111827" if accent_safe.lower() in (
         ACCENT_GOLD.lower(),
+        accent_gold.lower(),
         ACCENT_PARTNER.lower(),
         "#ffc403",
         "#ffb70f",

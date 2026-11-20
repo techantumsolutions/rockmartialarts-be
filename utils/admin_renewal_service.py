@@ -102,6 +102,10 @@ async def admin_quote_renewal(
 
     await assert_admin_can_renew_enrollment(db, current_user, enrollment)
 
+    from utils.billing_state import assert_renewal_window_open
+
+    assert_renewal_window_open(enrollment)
+
     student_id = str(enrollment.get("student_id") or "")
     course_id = enrollment.get("course_id")
     branch_id = enrollment.get("branch_id")
@@ -272,6 +276,10 @@ async def admin_confirm_renewal(
         raise HTTPException(status_code=404, detail="Enrollment not found")
 
     await assert_admin_can_renew_enrollment(db, current_user, source)
+
+    from utils.billing_state import assert_renewal_window_open
+
+    assert_renewal_window_open(source)
 
     student_id = str(source.get("student_id") or "")
     course_id = source.get("course_id")

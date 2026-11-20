@@ -480,9 +480,19 @@ async def send_partner_invite_email(
     safe_pay = _html.escape(f"{payment_method or '—'} / {payment_status or '—'}")
     safe_set = _html.escape(set_password_link, quote=True)
     safe_login = _html.escape(login_link, quote=True)
+    powered_note = ""
+    try:
+        from utils.platform_branding import format_academy_powered_by, get_cached_platform_branding
+
+        if bool(get_cached_platform_branding().get("show_academy_powered_by")):
+            labeled = format_academy_powered_by(display)
+            if "powered by" in labeled.lower():
+                powered_note = f" ({_html.escape(labeled)})"
+    except Exception:
+        powered_note = ""
     content = f"""
       <p style="margin:0 0 16px 0;">Hello <strong>{safe_display}</strong>,</p>
-      <p style="margin:0 0 16px 0;">Your partner organization is ready (Powered by Rock Martial Arts). Create your password to open the partner admin dashboard.</p>
+      <p style="margin:0 0 16px 0;">Your partner organization is ready{powered_note}. Create your password to open the partner admin dashboard.</p>
       <table style="width:100%;border-collapse:collapse;margin:12px 0 8px;font-size:14px;">
         <tr><td style="padding:6px 0;color:#6b7280;">Partner</td><td style="padding:6px 0;"><b>{safe_display}</b></td></tr>
         <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="padding:6px 0;">{safe_email}</td></tr>

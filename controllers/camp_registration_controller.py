@@ -194,6 +194,51 @@ class CampRegistrationController:
             raise HTTPException(status_code=404, detail="Registration not found")
         return CampRegistrationController._to_response(doc)
 
+    ALLOWED_ADMIN_STATUSES = {
+        "received",
+        "contacted",
+        "confirmed",
+        "waitlisted",
+        "cancelled",
+        "rejected",
+        "pending_payment",
+        "registered",
+        "paid",
+    }
+
+    @staticmethod
+    async def update_status(reg_id: str, status_value: str, note: Optional[str] = None) -> CampRegistrationResponse:
+        """Super-admin: update enquiry/lead status for a camp registration."""
+        next_status = (status_value or "").strip().lower()
+        if next_status not in CampRegistrationController.ALLOWED_ADMIN_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status. Allowed: "
+                + ", ".join(sorted(CampRegistrationController.ALLOWED_ADMIN_STATUSES)),
+            )
+        doc = await CampRegistrationController._load(reg_id)
+        current = (doc.get("status") or "").strip().lower()
+        if current == "paid" and next_status not in {"paid", "cancelled"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Paid registrations can only stay Paid or move to Cancelled.",
+            )
+        db = get_db()
+        now = datetime.utcnow()
+        update_fields: Dict[str, Any] = {
+            "status": next_status,
+            "updated_at": now,
+            "admin_status_updated_at": now,
+        }
+        if note and str(note).strip():
+            update_fields["admin_status_note"] = str(note).strip()
+        await db[CampRegistrationController.COLLECTION].update_one(
+            {"_id": ObjectId(reg_id)},
+            {"$set": update_fields},
+        )
+        refreshed = await CampRegistrationController._load(reg_id)
+        return CampRegistrationController._to_response(refreshed)
+
     @staticmethod
     async def _load(reg_id: str) -> Dict[str, Any]:
         if not ObjectId.is_valid(reg_id):

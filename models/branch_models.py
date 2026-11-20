@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, EmailStr, AliasChoices, ConfigDict, field_validator
 from datetime import datetime, date
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 import uuid
 
 class Address(BaseModel):
@@ -134,10 +134,19 @@ class Branch(BaseModel):
     assignments: Assignments
     bank_details: BankDetails
     admission_fee: float = 500.0
+    # fixed = one fee for all courses; per_course = use admission_fee_by_course[course_id]
+    admission_fee_mode: str = "fixed"
+    admission_fee_by_course: Optional[Dict[str, float]] = None
     slug: Optional[str] = None
     allows_collaboration: bool = False  # M21 — collaboration partner branch
     is_collaboration_partner: bool = False  # Alias of allows_collaboration (API/UI)
     is_active: bool = True
+    # Public website visibility (missing/True = visible; False = hidden). Super Admin only.
+    is_public: bool = True
+    # Per-academy branding overlay (falls back to partner org branding, then RMAA).
+    site_branding: Optional[Dict[str, Any]] = None
+    # Academy-scoped branding edit permission: none|pending|approved|rejected|revoked
+    branding_edit_permission: Optional[str] = None
     # Optional map coordinates for visitor→branch distance (WGS84)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
@@ -152,13 +161,17 @@ class BranchCreate(BaseModel):
     assignments: Assignments
     bank_details: BankDetails
     admission_fee: float = 500.0
+    admission_fee_mode: str = "fixed"
+    admission_fee_by_course: Optional[Dict[str, float]] = None
     slug: Optional[str] = None
     allows_collaboration: bool = False
     is_collaboration_partner: Optional[bool] = None
-    # White-label partner org (1:1 with branch). Rock SA only.
+    # White-label partner org assignment. Rock SA only.
     partner_org_id: Optional[str] = None
+    is_public: bool = True
     cover_image_url: Optional[str] = None
     description: Optional[str] = None
+    site_branding: Optional[Dict[str, Any]] = None
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
 
@@ -170,15 +183,25 @@ class BranchUpdate(BaseModel):
     assignments: Optional[Assignments] = None
     bank_details: Optional[BankDetails] = None
     admission_fee: Optional[float] = None
+    admission_fee_mode: Optional[str] = None
+    admission_fee_by_course: Optional[Dict[str, float]] = None
     slug: Optional[str] = None
     allows_collaboration: Optional[bool] = None
     is_collaboration_partner: Optional[bool] = None
     is_active: Optional[bool] = None
+    is_public: Optional[bool] = None
     description: Optional[str] = None
     map_link: Optional[str] = None
     cover_image_url: Optional[str] = None
     gallery_images: Optional[List[str]] = None
-    # White-label partner org (1:1). Pass null/"" to unlink.
+    # Per-academy branding overlay (Partner/SA with approval).
+    site_branding: Optional[Dict[str, Any]] = None
+    # White-label partner org. Pass null/"" to unlink (Rock-owned again).
     partner_org_id: Optional[str] = None
+    ownership_change_reason: Optional[str] = Field(default=None, max_length=1000)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    # Google rating shown on public academy cards (synced or manually set).
+    rating: Optional[float] = Field(default=None, ge=0, le=5)
+    review_count: Optional[int] = Field(default=None, ge=0)
+    google_place_id: Optional[str] = None

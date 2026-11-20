@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from models.academy_event_models import AcademyEventStatus
+from models.academy_event_models import AcademyEventStatus, batch_start_iso
 from models.academy_event_registration_models import (
     HELD_REGISTRATION_STATUSES,
     AcademyEventRegistrationCreate,
@@ -139,6 +139,43 @@ async def _resolve_event(db, body: AcademyEventRegistrationCreate) -> dict:
     return event
 
 
+def _resolve_registration_batch(
+    event: dict, batch_id: Optional[str]
+) -> Dict[str, Any]:
+    """Validate batch selection and return snapshot fields for the registration doc."""
+    batches = [b for b in (event.get("batches") or []) if isinstance(b, dict)]
+    if not batches:
+        return {}
+    if len(batches) == 1:
+        only = batches[0]
+        bid = str(only.get("id") or "").strip()
+        if batch_id and bid and batch_id != bid:
+            raise HTTPException(status_code=400, detail="Invalid time slot for this event")
+        chosen = only
+    else:
+        key = (batch_id or "").strip()
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="Please select an event time slot",
+            )
+        chosen = next((b for b in batches if str(b.get("id") or "") == key), None)
+        if not chosen:
+            raise HTTPException(status_code=400, detail="Invalid time slot for this event")
+    snapshot = {
+        "batch_id": chosen.get("id"),
+        "batch_label": chosen.get("label"),
+        "batch_date": chosen.get("date"),
+        "batch_start_time": chosen.get("start_time"),
+        "batch_end_time": chosen.get("end_time"),
+    }
+    try:
+        snapshot["event_start_at"] = batch_start_iso(chosen)
+    except ValueError:
+        snapshot["event_start_at"] = event.get("start_at")
+    return snapshot
+
+
 def _validate_against_fields(body: AcademyEventRegistrationCreate, fields: list) -> None:
     enabled = {f["key"]: f for f in fields if f.get("enabled")}
     values = {
@@ -174,6 +211,8 @@ async def create_academy_event_registration(
     event = await _resolve_event(db, body)
     if not event.get("registration_enabled", True):
         raise HTTPException(status_code=400, detail="Registration is closed for this event")
+
+    batch_snap = _resolve_registration_batch(event, body.batch_id)
 
     fields = normalize_registration_fields(event.get("registration_fields"))
     _validate_against_fields(body, fields)
@@ -211,7 +250,7 @@ async def create_academy_event_registration(
         "event_slug": event.get("slug"),
         "event_title": event.get("title"),
         "event_type": event.get("event_type"),
-        "event_start_at": event.get("start_at"),
+        "event_start_at": batch_snap.get("event_start_at") or event.get("start_at"),
         "event_venue": event.get("venue"),
         "branch_id": event.get("branch_id"),
         "participant_name": body.participant_name.strip(),
@@ -240,6 +279,17 @@ async def create_academy_event_registration(
         "updated_at": now,
         "created_by": actor_id,
         "confirmed_at": now if status == AcademyEventRegistrationStatus.CONFIRMED.value else None,
+        **{
+            k: batch_snap[k]
+            for k in (
+                "batch_id",
+                "batch_label",
+                "batch_date",
+                "batch_start_time",
+                "batch_end_time",
+            )
+            if k in batch_snap
+        },
     }
     await db[COL].insert_one(doc)
 

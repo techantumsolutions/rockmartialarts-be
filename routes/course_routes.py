@@ -120,6 +120,12 @@ async def get_public_course_branch_info(course_id: str, branch_id: str = Query(.
     return await CourseController.get_public_course_branch_info(course_id, branch_id)
 
 
+@router.get("/public/detail/{course_id}/academy-info")
+async def get_public_course_academy_info(course_id: str, branch_id: str = Query(..., description="Branch / Academy ID")):
+    """Alias of branch-info (FE uses academy naming). Fees come from live academy/batch setup."""
+    return await CourseController.get_public_course_branch_info(course_id, branch_id)
+
+
 @router.get("/public/by-branch/{branch_id}")
 async def get_public_courses_by_branch(branch_id: str):
     """Get courses at a branch with details and fees - Public (no auth)."""

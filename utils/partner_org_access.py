@@ -20,7 +20,7 @@ PARTNER_FEATURE_DEFAULTS: Dict[str, bool] = {
     "org-branding": True,
     "achievements-showcase": True,
     "reports": True,
-    "settings": True,
+    "settings": False,  # System Settings is Rock-only; partners do not need it
     "leads": True,
     "partners": True,
 }
@@ -114,12 +114,17 @@ def partner_org_public_extras(org: Optional[dict]) -> Dict[str, Any]:
     if not org:
         return {}
     effective = compute_partner_effective_status(org)
+    # Defaults: CMS on (partners can brand), footer off (Rock chrome hidden).
+    page_cms = org.get("page_cms_enabled")
+    footer_on = org.get("public_footer_enabled")
     return {
         "valid_from": org.get("valid_from"),
         "valid_until": org.get("valid_until"),
         "effective_status": effective,
         "feature_permissions": normalize_feature_permissions(org.get("feature_permissions")),
         "course_permissions": get_partner_course_permissions(org),
+        "page_cms_enabled": True if page_cms is None else bool(page_cms),
+        "public_footer_enabled": False if footer_on is None else bool(footer_on),
     }
 
 

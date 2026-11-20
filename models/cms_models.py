@@ -84,11 +84,25 @@ class FooterContent(BaseModel):
 
 
 class BrandingSettings(BaseModel):
+    # Platform identity (Super Admin / platform admin)
+    platform_name: Optional[str] = "Rock Martial Arts Academy"
+    platform_short_name: Optional[str] = "Rock Martial Arts"
+    legal_name: Optional[str] = "Rock Martial Arts Academy"
+    primary_color: Optional[str] = "#E1BB33"
+    secondary_color: Optional[str] = "#4F5077"
+    accent_color: Optional[str] = "#FFB70F"
+    dark_color: Optional[str] = "#171A26"
+    support_email: Optional[str] = None
+    support_phone: Optional[str] = None
+    website_url: Optional[str] = None
+    # Logos / chrome
     navbar_logo: Optional[str] = None
     footer_logo: Optional[str] = None
     favicon: Optional[str] = None
     # Full-screen site loader (shown on public pages until content loads); JPG/PNG/WEBP/GIF URL
     site_loader_image: Optional[str] = None
+    # When True, academy labels render as "{Academy} powered by {Platform}"
+    show_academy_powered_by: Optional[bool] = False
 
     class Config:
         extra = "ignore"

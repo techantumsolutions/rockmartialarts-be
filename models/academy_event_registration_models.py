@@ -105,6 +105,11 @@ class AcademyEventRegistrationCreate(BaseModel):
     participant_email: Optional[str] = Field(default=None, max_length=200)
     participant_age: Optional[int] = Field(default=None, ge=1, le=120)
     notes: Optional[str] = Field(default=None, max_length=2000)
+    batch_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Required when the event has multiple time slots",
+    )
     source: Optional[str] = Field(default="website", max_length=80)
     # Extra answers keyed by field key (for future custom fields)
     field_values: Optional[Dict[str, Any]] = None
@@ -117,7 +122,9 @@ class AcademyEventRegistrationCreate(BaseModel):
             raise ValueError("required")
         return s
 
-    @field_validator("participant_email", "event_id", "event_slug", "notes", mode="before")
+    @field_validator(
+        "participant_email", "event_id", "event_slug", "notes", "batch_id", mode="before"
+    )
     @classmethod
     def _empty(cls, v):
         if v is None:

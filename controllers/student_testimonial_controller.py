@@ -135,6 +135,29 @@ async def _owned_partner_branch_id(db, user: dict, branch_id: Optional[str]) -> 
     return bid if bid in owned else None
 
 
+async def _default_partner_branch_id(db, user: dict) -> Optional[str]:
+    """First genuine active academy for this partner (for create when no branch selected)."""
+    from utils.academy_visibility import AUTO_STUB_CREATED_VIA
+
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return None
+    doc = await db.branches.find_one(
+        {
+            "partner_org_id": org_id,
+            "is_active": True,
+            "created_via": {"$ne": AUTO_STUB_CREATED_VIA},
+        },
+        {"id": 1},
+        sort=[("branch.name", 1)],
+    )
+    if doc and doc.get("id"):
+        return str(doc["id"])
+    # Fallback: any owned active branch id from partner_branch_ids
+    owned = [str(i) for i in (await partner_branch_ids(db, user) or []) if i]
+    return owned[0] if owned else None
+
+
 def _normalize_testimonial_row(doc: dict) -> dict:
     """Public/API shape: name, content, image alongside legacy keys."""
     if not doc:
@@ -152,24 +175,141 @@ def _sort_course():
     return [("display_order", 1), ("created_at", -1)]
 
 
+def _branch_display_name(branch: Optional[dict]) -> Optional[str]:
+    if not branch:
+        return None
+    info = branch.get("branch") if isinstance(branch.get("branch"), dict) else {}
+    name = (
+        (info or {}).get("name")
+        or branch.get("name")
+        or branch.get("branch_name")
+        or ""
+    )
+    name = str(name).strip()
+    return name or None
+
+
+async def _enrich_public_testimonials(db, docs: List[dict]) -> List[Dict[str, Any]]:
+    """Attach academy/branch display name for public website cards."""
+    branch_ids = list(
+        {
+            str(d.get("branch_id") or "").strip()
+            for d in docs
+            if str(d.get("branch_id") or "").strip()
+        }
+    )
+    org_ids = list(
+        {
+            str(d.get("partner_org_id") or "").strip()
+            for d in docs
+            if str(d.get("partner_org_id") or "").strip()
+            and not str(d.get("branch_id") or "").strip()
+        }
+    )
+    name_by_id: Dict[str, str] = {}
+    if branch_ids:
+        async for branch in db.branches.find(
+            {"id": {"$in": branch_ids}},
+            {"_id": 0, "id": 1, "name": 1, "branch_name": 1, "branch.name": 1},
+        ):
+            bid = str(branch.get("id") or "").strip()
+            label = _branch_display_name(branch)
+            if bid and label:
+                name_by_id[bid] = label
+
+    # Partner testimonials missing branch_id → show partner org / primary academy name
+    org_name_by_id: Dict[str, str] = {}
+    if org_ids:
+        async for org in db.partner_organizations.find(
+            {"id": {"$in": org_ids}},
+            {"_id": 0, "id": 1, "name": 1},
+        ):
+            oid = str(org.get("id") or "").strip()
+            oname = str(org.get("name") or "").strip()
+            if oid and oname:
+                org_name_by_id[oid] = oname
+        from utils.academy_visibility import AUTO_STUB_CREATED_VIA
+
+        async for branch in db.branches.find(
+            {
+                "partner_org_id": {"$in": org_ids},
+                "is_active": True,
+                "created_via": {"$ne": AUTO_STUB_CREATED_VIA},
+            },
+            {"_id": 0, "id": 1, "partner_org_id": 1, "name": 1, "branch.name": 1},
+        ):
+            oid = str(branch.get("partner_org_id") or "").strip()
+            label = _branch_display_name(branch)
+            if oid and label and oid not in org_name_by_id:
+                org_name_by_id[oid] = label
+            elif oid and label:
+                # Prefer real academy name over org name when available
+                org_name_by_id[oid] = label
+
+    out: List[Dict[str, Any]] = []
+    for doc in docs:
+        row = _normalize_testimonial_row(serialize_doc(doc))
+        bid = str(row.get("branch_id") or "").strip()
+        oid = str(row.get("partner_org_id") or "").strip()
+        if bid and bid in name_by_id:
+            academy = name_by_id[bid]
+        elif oid and oid in org_name_by_id:
+            academy = org_name_by_id[oid]
+        elif row.get("is_global"):
+            academy = "All academies"
+        else:
+            academy = None
+        row["branch_name"] = academy
+        row["academy_name"] = academy
+        out.append(row)
+    return out
+
+
 async def list_public(
     branch_id: Optional[str] = None,
     is_global: Optional[bool] = None,
     limit: int = 10,
 ) -> List[Dict[str, Any]]:
+    """Public testimonials.
+
+    - ``branch_id``: academy page → that academy only
+    - no ``branch_id``: public website → all active academy testimonials
+      (``is_global=true`` still filters to global-only for legacy callers)
+    """
     db = get_db()
     q: Dict[str, Any] = {"status": "active"}
-    # Branch pages: only testimonials for that branch (no global/inherit merge).
+    # Branch pages: testimonials for that branch. For partner academies, also
+    # include partner-stamped rows that were saved without a branch_id.
     if branch_id:
-        q["branch_id"] = branch_id
+        branch = await db.branches.find_one(
+            {"id": branch_id}, {"partner_org_id": 1}
+        )
+        org_id = str((branch or {}).get("partner_org_id") or "").strip()
+        if org_id:
+            q = {
+                "status": "active",
+                "$or": [
+                    {"branch_id": branch_id},
+                    {
+                        "partner_org_id": org_id,
+                        "$or": [
+                            {"branch_id": None},
+                            {"branch_id": ""},
+                            {"branch_id": {"$exists": False}},
+                        ],
+                    },
+                ],
+            }
+        else:
+            q["branch_id"] = branch_id
     elif is_global is True:
         q["is_global"] = True
     else:
-        q["is_global"] = True
-        q = merge_and_clause(q, await _rock_testimonial_scope(db))
+        # Site-wide public catalogue: every active testimonial across academies.
+        q = {"status": "active"}
     cur = db[COLLECTION].find(q).sort(_sort_course()).limit(max(1, min(limit, 50)))
     docs = await cur.to_list(length=50)
-    return [_normalize_testimonial_row(serialize_doc(d)) for d in docs]
+    return await _enrich_public_testimonials(db, docs)
 
 
 async def list_manage(current_user: dict, status: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -208,9 +348,17 @@ async def create(data: StudentTestimonialCreate, current_user: dict) -> Dict[str
                 detail="Partners cannot create global testimonials",
             )
         data.is_global = False
+        db = get_db()
         data.branch_id = await _owned_partner_branch_id(
-            get_db(), current_user, data.branch_id
+            db, current_user, data.branch_id
         )
+        if not data.branch_id:
+            data.branch_id = await _default_partner_branch_id(db, current_user)
+        if not data.branch_id:
+            raise HTTPException(
+                status_code=400,
+                detail="No academy found for this partner. Assign an academy before adding testimonials.",
+            )
     elif not is_super_admin(current_user) and not is_branch_manager(current_user):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     if is_branch_manager(current_user):

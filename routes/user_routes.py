@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request, Path
+from fastapi import APIRouter, Depends, Request, Path, File, UploadFile
 from typing import Optional
 from controllers.user_controller import UserController
 from models.user_models import UserCreate, UserUpdate, UserRole, StudentNotifyBody, StudentStatusUpdateBody
@@ -303,6 +303,28 @@ async def clear_student_biometric_mapping(
     """M09-S02: clear biometric mapping."""
     return await UserController.clear_student_biometric_mapping(
         user_id, request, current_user
+    )
+
+
+@router.post("/{user_id}/profile-photo")
+async def upload_student_profile_photo_admin(
+    user_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(
+        require_role_unified(
+            [
+                UserRole.SUPER_ADMIN,
+                UserRole.COACH_ADMIN,
+                UserRole.BRANCH_MANAGER,
+                UserRole.PARTNER_SUPER_ADMIN,
+            ]
+        )
+    ),
+):
+    """Upload/replace student profile photo (used on Student ID card)."""
+    return await UserController.upload_student_profile_photo_admin(
+        user_id, file, request, current_user
     )
 
 

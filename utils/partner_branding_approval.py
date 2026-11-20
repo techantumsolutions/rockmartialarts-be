@@ -26,36 +26,71 @@ async def ensure_branding_approval_indexes(db) -> None:
     try:
         await db[REQ_COL].create_index("id", unique=True)
         await db[REQ_COL].create_index([("partner_org_id", 1), ("status", 1)])
+        await db[REQ_COL].create_index(
+            [("partner_org_id", 1), ("branch_id", 1), ("status", 1)]
+        )
         await db[REQ_COL].create_index([("status", 1), ("requested_at", -1)])
     except Exception:
         logger.exception("Failed ensuring branding approval indexes")
 
 
-def _permission_from_org(org: Optional[dict]) -> str:
-    if not org:
-        return BrandingEditPermission.NONE.value
-    raw = (org.get("branding_edit_permission") or "").strip().lower()
-    if raw in {e.value for e in BrandingEditPermission}:
-        return raw
+def _permission_from_value(raw: Any) -> str:
+    val = (str(raw or "")).strip().lower()
+    if val in {e.value for e in BrandingEditPermission}:
+        return val
     return BrandingEditPermission.NONE.value
 
 
-async def get_partner_branding_permission(partner_org_id: str) -> Dict[str, Any]:
+def _permission_from_org(org: Optional[dict]) -> str:
+    if not org:
+        return BrandingEditPermission.NONE.value
+    return _permission_from_value(org.get("branding_edit_permission"))
+
+
+async def get_partner_branding_permission(
+    partner_org_id: str, branch_id: Optional[str] = None
+) -> Dict[str, Any]:
     db = get_db()
     org = await db[ORG_COL].find_one({"id": partner_org_id})
     if not org:
         raise HTTPException(status_code=404, detail="Partner organization not found")
-    permission = _permission_from_org(org)
-    pending = await db[REQ_COL].find_one(
-        {
+
+    branch_id = (branch_id or "").strip() or None
+    branch = None
+    if branch_id:
+        branch = await db.branches.find_one({"id": branch_id})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Academy not found")
+        if str(branch.get("partner_org_id") or "").strip() != str(partner_org_id).strip():
+            raise HTTPException(
+                status_code=403,
+                detail="Academy is not assigned to this Partner organization",
+            )
+        permission = _permission_from_value(branch.get("branding_edit_permission"))
+        pending_q: Dict[str, Any] = {
             "partner_org_id": partner_org_id,
+            "branch_id": branch_id,
             "status": BrandingEditRequestStatus.PENDING.value,
         }
-    )
-    latest = await db[REQ_COL].find_one(
-        {"partner_org_id": partner_org_id},
-        sort=[("updated_at", -1)],
-    )
+        latest_q: Dict[str, Any] = {
+            "partner_org_id": partner_org_id,
+            "branch_id": branch_id,
+        }
+    else:
+        permission = _permission_from_org(org)
+        # Org-level requests only (no branch_id / null branch_id)
+        pending_q = {
+            "partner_org_id": partner_org_id,
+            "status": BrandingEditRequestStatus.PENDING.value,
+            "$or": [{"branch_id": None}, {"branch_id": {"$exists": False}}, {"branch_id": ""}],
+        }
+        latest_q = {
+            "partner_org_id": partner_org_id,
+            "$or": [{"branch_id": None}, {"branch_id": {"$exists": False}}, {"branch_id": ""}],
+        }
+
+    pending = await db[REQ_COL].find_one(pending_q)
+    latest = await db[REQ_COL].find_one(latest_q, sort=[("updated_at", -1)])
     can_edit = permission == BrandingEditPermission.APPROVED.value
     can_request = permission in {
         BrandingEditPermission.NONE.value,
@@ -64,6 +99,9 @@ async def get_partner_branding_permission(partner_org_id: str) -> Dict[str, Any]
     } and pending is None
     return {
         "partner_org_id": partner_org_id,
+        "branch_id": branch_id,
+        "branch_name": ((branch or {}).get("branch") or {}).get("name") if branch else None,
+        "scope": "academy" if branch_id else "organization",
         "permission": permission,
         "can_edit": can_edit,
         "can_request": can_request,
@@ -72,20 +110,34 @@ async def get_partner_branding_permission(partner_org_id: str) -> Dict[str, Any]
     }
 
 
-async def assert_partner_can_edit_branding(partner_org_id: str) -> None:
-    state = await get_partner_branding_permission(partner_org_id)
+async def assert_partner_can_edit_branding(
+    partner_org_id: str, branch_id: Optional[str] = None
+) -> None:
+    """Require SA-approved edit access (org branding, or Edit Academy when branch_id set)."""
+    state = await get_partner_branding_permission(partner_org_id, branch_id=branch_id)
     if not state.get("can_edit"):
+        scope = "academy" if branch_id else "organization"
         raise HTTPException(
             status_code=403,
             detail={
                 "code": "branding_edit_not_approved",
-                "message": "Branding edit requires Rock Martial Arts Super Admin approval.",
+                "message": (
+                    "Edit Academy access requires Rock Martial Arts Super Admin approval."
+                    if branch_id
+                    else "Organization Branding edit requires Rock Martial Arts Super Admin approval."
+                ),
                 "permission": state.get("permission"),
+                "branch_id": branch_id,
+                "scope": scope,
             },
         )
 
 
-async def request_branding_edit(current_user: dict, note: Optional[str] = None) -> Dict[str, Any]:
+async def request_branding_edit(
+    current_user: dict,
+    note: Optional[str] = None,
+    branch_id: Optional[str] = None,
+) -> Dict[str, Any]:
     db = get_db()
     await ensure_branding_approval_indexes(db)
     org_id = current_user.get("partner_org_id")
@@ -95,7 +147,8 @@ async def request_branding_edit(current_user: dict, note: Optional[str] = None) 
     if not org:
         raise HTTPException(status_code=404, detail="Partner organization not found")
 
-    state = await get_partner_branding_permission(org_id)
+    branch_id = (branch_id or "").strip() or None
+    state = await get_partner_branding_permission(org_id, branch_id=branch_id)
     if state.get("can_edit"):
         return {
             "message": "Branding edit access is already approved.",
@@ -113,12 +166,15 @@ async def request_branding_edit(current_user: dict, note: Optional[str] = None) 
             detail="Cannot submit a branding edit request in the current state.",
         )
 
+    branch_name = state.get("branch_name")
     now = datetime.utcnow()
     doc = {
         "id": new_branding_request_id(),
         "partner_org_id": org_id,
         "partner_name": org.get("name"),
         "partner_slug": org.get("slug"),
+        "branch_id": branch_id,
+        "branch_name": branch_name,
         "requested_by": current_user.get("id"),
         "requested_by_name": current_user.get("full_name")
         or current_user.get("name")
@@ -136,19 +192,30 @@ async def request_branding_edit(current_user: dict, note: Optional[str] = None) 
         "updated_at": now,
     }
     await db[REQ_COL].insert_one(doc)
-    await db[ORG_COL].update_one(
-        {"id": org_id},
-        {
-            "$set": {
-                "branding_edit_permission": BrandingEditPermission.PENDING.value,
-                "updated_at": now,
-            }
-        },
-    )
+    if branch_id:
+        await db.branches.update_one(
+            {"id": branch_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.PENDING.value,
+                    "updated_at": now,
+                }
+            },
+        )
+    else:
+        await db[ORG_COL].update_one(
+            {"id": org_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.PENDING.value,
+                    "updated_at": now,
+                }
+            },
+        )
     return {
         "message": "Your branding edit request has been submitted for Super Admin approval.",
         "request": branding_request_public(doc),
-        "permission": await get_partner_branding_permission(org_id),
+        "permission": await get_partner_branding_permission(org_id, branch_id=branch_id),
     }
 
 
@@ -214,13 +281,23 @@ async def approve_branding_edit_request(
         "updated_at": now,
     }
     await db[REQ_COL].update_one({"id": request_id}, {"$set": reviewer})
-    # Close any other pending requests for same partner
+    branch_id = str(doc.get("branch_id") or "").strip() or None
+    # Close other pending requests for the same scope only (org OR same academy).
+    pending_filter: Dict[str, Any] = {
+        "partner_org_id": doc["partner_org_id"],
+        "status": BrandingEditRequestStatus.PENDING.value,
+        "id": {"$ne": request_id},
+    }
+    if branch_id:
+        pending_filter["branch_id"] = branch_id
+    else:
+        pending_filter["$or"] = [
+            {"branch_id": None},
+            {"branch_id": {"$exists": False}},
+            {"branch_id": ""},
+        ]
     await db[REQ_COL].update_many(
-        {
-            "partner_org_id": doc["partner_org_id"],
-            "status": BrandingEditRequestStatus.PENDING.value,
-            "id": {"$ne": request_id},
-        },
+        pending_filter,
         {
             "$set": {
                 "status": BrandingEditRequestStatus.REJECTED.value,
@@ -231,17 +308,30 @@ async def approve_branding_edit_request(
             }
         },
     )
-    await db[ORG_COL].update_one(
-        {"id": doc["partner_org_id"]},
-        {
-            "$set": {
-                "branding_edit_permission": BrandingEditPermission.APPROVED.value,
-                "branding_edit_approved_at": now,
-                "branding_edit_approved_by": current_user.get("id"),
-                "updated_at": now,
-            }
-        },
-    )
+    if branch_id:
+        await db.branches.update_one(
+            {"id": branch_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.APPROVED.value,
+                    "branding_edit_approved_at": now,
+                    "branding_edit_approved_by": current_user.get("id"),
+                    "updated_at": now,
+                }
+            },
+        )
+    else:
+        await db[ORG_COL].update_one(
+            {"id": doc["partner_org_id"]},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.APPROVED.value,
+                    "branding_edit_approved_at": now,
+                    "branding_edit_approved_by": current_user.get("id"),
+                    "updated_at": now,
+                }
+            },
+        )
     updated = await db[REQ_COL].find_one({"id": request_id})
     return {
         "message": "Branding edit access approved.",
@@ -272,15 +362,27 @@ async def reject_branding_edit_request(
             }
         },
     )
-    await db[ORG_COL].update_one(
-        {"id": doc["partner_org_id"]},
-        {
-            "$set": {
-                "branding_edit_permission": BrandingEditPermission.REJECTED.value,
-                "updated_at": now,
-            }
-        },
-    )
+    branch_id = str(doc.get("branch_id") or "").strip() or None
+    if branch_id:
+        await db.branches.update_one(
+            {"id": branch_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.REJECTED.value,
+                    "updated_at": now,
+                }
+            },
+        )
+    else:
+        await db[ORG_COL].update_one(
+            {"id": doc["partner_org_id"]},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.REJECTED.value,
+                    "updated_at": now,
+                }
+            },
+        )
     updated = await db[REQ_COL].find_one({"id": request_id})
     return {
         "message": "Branding edit request rejected.",
@@ -289,30 +391,64 @@ async def reject_branding_edit_request(
 
 
 async def revoke_branding_edit_access(
-    partner_org_id: str, current_user: dict, reason: Optional[str] = None
+    partner_org_id: str,
+    current_user: dict,
+    reason: Optional[str] = None,
+    branch_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     db = get_db()
     org = await db[ORG_COL].find_one({"id": partner_org_id})
     if not org:
         raise HTTPException(status_code=404, detail="Partner organization not found")
     now = datetime.utcnow()
-    await db[ORG_COL].update_one(
-        {"id": partner_org_id},
-        {
-            "$set": {
-                "branding_edit_permission": BrandingEditPermission.REVOKED.value,
-                "branding_edit_revoked_at": now,
-                "branding_edit_revoked_by": current_user.get("id"),
-                "updated_at": now,
-            }
-        },
-    )
-    # Mark latest approved request as revoked
+    branch_id = (branch_id or "").strip() or None
+    if branch_id:
+        branch = await db.branches.find_one({"id": branch_id})
+        if not branch:
+            raise HTTPException(status_code=404, detail="Academy not found")
+        if str(branch.get("partner_org_id") or "").strip() != str(partner_org_id).strip():
+            raise HTTPException(
+                status_code=403,
+                detail="Academy is not assigned to this Partner organization",
+            )
+        await db.branches.update_one(
+            {"id": branch_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.REVOKED.value,
+                    "branding_edit_revoked_at": now,
+                    "branding_edit_revoked_by": current_user.get("id"),
+                    "updated_at": now,
+                }
+            },
+        )
+    else:
+        await db[ORG_COL].update_one(
+            {"id": partner_org_id},
+            {
+                "$set": {
+                    "branding_edit_permission": BrandingEditPermission.REVOKED.value,
+                    "branding_edit_revoked_at": now,
+                    "branding_edit_revoked_by": current_user.get("id"),
+                    "updated_at": now,
+                }
+            },
+        )
+    # Mark latest approved request as revoked (same scope)
+    approved_q: Dict[str, Any] = {
+        "partner_org_id": partner_org_id,
+        "status": BrandingEditRequestStatus.APPROVED.value,
+    }
+    if branch_id:
+        approved_q["branch_id"] = branch_id
+    else:
+        approved_q["$or"] = [
+            {"branch_id": None},
+            {"branch_id": {"$exists": False}},
+            {"branch_id": ""},
+        ]
     approved = await db[REQ_COL].find_one(
-        {
-            "partner_org_id": partner_org_id,
-            "status": BrandingEditRequestStatus.APPROVED.value,
-        },
+        approved_q,
         sort=[("reviewed_at", -1)],
     )
     if approved:
@@ -329,12 +465,21 @@ async def revoke_branding_edit_access(
                 }
             },
         )
-    # Cancel pending
+    # Cancel pending in the same scope
+    pending_cancel: Dict[str, Any] = {
+        "partner_org_id": partner_org_id,
+        "status": BrandingEditRequestStatus.PENDING.value,
+    }
+    if branch_id:
+        pending_cancel["branch_id"] = branch_id
+    else:
+        pending_cancel["$or"] = [
+            {"branch_id": None},
+            {"branch_id": {"$exists": False}},
+            {"branch_id": ""},
+        ]
     await db[REQ_COL].update_many(
-        {
-            "partner_org_id": partner_org_id,
-            "status": BrandingEditRequestStatus.PENDING.value,
-        },
+        pending_cancel,
         {
             "$set": {
                 "status": BrandingEditRequestStatus.REVOKED.value,
@@ -345,5 +490,7 @@ async def revoke_branding_edit_access(
     )
     return {
         "message": "Partner branding edit access revoked.",
-        "permission": await get_partner_branding_permission(partner_org_id),
+        "permission": await get_partner_branding_permission(
+            partner_org_id, branch_id=branch_id
+        ),
     }

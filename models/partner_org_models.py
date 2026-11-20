@@ -52,6 +52,12 @@ class PartnerSetPassword(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
+class PartnerAdminResetPassword(BaseModel):
+    """Rock Super Admin sets partner admin password in-app (Partner Profiles)."""
+
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class PartnerLogin(BaseModel):
     email: EmailStr
     password: str
@@ -81,6 +87,13 @@ class PartnerCoursePermissionsUpdate(BaseModel):
 
     can_create_courses: bool = False
     can_edit_courses: bool = False
+
+
+class PartnerPublicSiteSettingsUpdate(BaseModel):
+    """Super Admin: partner public website CMS + footer visibility."""
+
+    page_cms_enabled: Optional[bool] = None
+    public_footer_enabled: Optional[bool] = None
 
 
 def new_partner_org_id() -> str:

@@ -1198,6 +1198,12 @@ class UserController:
                     if "branch" not in update_data:
                         update_data["branch"] = {}
                     update_data["branch"]["location_id"] = v
+            elif k == "profile_image":
+                # Keep photo aliases in sync for ID card / public consumers
+                url = (str(v).strip() if v is not None else "") or None
+                update_data["profile_image"] = url
+                update_data["profile_photo"] = url
+                update_data["photo"] = url
             else:
                 update_data[k] = v
 
@@ -1668,6 +1674,103 @@ class UserController:
             skip=skip,
             limit=limit,
         )
+
+    @staticmethod
+    async def upload_student_profile_photo_admin(
+        user_id: str,
+        file,
+        request: Request,
+        current_user: dict = None,
+    ):
+        """
+        Admin/staff: upload or replace a student's profile photo.
+        Stored on users.profile_image and used by Student ID card.
+        """
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        from datetime import datetime
+        from fastapi import UploadFile
+        from utils.student_status_service import assert_can_manage_student_status
+        from controllers.upload_controller import UPLOAD_ROOT, _safe_filename
+
+        if not isinstance(file, UploadFile):
+            raise HTTPException(status_code=400, detail="Image file is required")
+
+        db = get_db()
+        student = await db.users.find_one({"id": user_id})
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found")
+        if str(student.get("role") or "").lower() != "student":
+            raise HTTPException(status_code=400, detail="Profile photos are only for students")
+
+        await assert_can_manage_student_status(db, student, current_user)
+
+        content_type = (file.content_type or "").split(";")[0].strip().lower()
+        allowed = {"image/jpeg", "image/png", "image/webp", "image/jpg"}
+        if content_type not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Use JPG, PNG, or WEBP.",
+            )
+
+        data = await file.read()
+        max_bytes = 2 * 1024 * 1024
+        if len(data) > max_bytes:
+            raise HTTPException(status_code=400, detail="File too large. Maximum size is 2 MB.")
+
+        dest_dir = UPLOAD_ROOT / "images"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        filename = file.filename or "student-photo.jpg"
+        safe_name = _safe_filename(filename)
+        ext = safe_name.lower().rsplit(".", 1)[-1] if "." in safe_name else ""
+        if ext not in ("jpg", "jpeg", "png", "webp"):
+            safe_name = f"{safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name}.jpg"
+
+        dest_path = dest_dir / safe_name
+        dest_path.write_bytes(data)
+        file_url = f"/uploads/images/{safe_name}"
+
+        now = datetime.utcnow()
+        result = await db.users.update_one(
+            {"id": user_id},
+            {
+                "$set": {
+                    "profile_image": file_url,
+                    "profile_photo": file_url,
+                    "photo": file_url,
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+        try:
+            await log_activity(
+                request=request,
+                action="admin_student_profile_photo_update",
+                user_id=current_user.get("id"),
+                user_name=current_user.get("full_name"),
+                details={"student_id": user_id, "profile_image": file_url},
+            )
+        except Exception:
+            pass
+
+        # Return refreshed ID card payload when a card exists so UI can update instantly
+        id_card_payload = None
+        try:
+            from utils.student_id_card_service import get_id_card_for_student
+
+            id_card_payload = await get_id_card_for_student(user_id, current_user)
+        except Exception:
+            id_card_payload = None
+
+        return {
+            "message": "Student photo updated successfully",
+            "profile_image": file_url,
+            "id_card": id_card_payload,
+        }
 
     @staticmethod
     async def get_student_id_card(user_id: str, current_user: dict):

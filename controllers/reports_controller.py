@@ -25,6 +25,11 @@ class ReportsController:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
+        from utils.student_report_query import _resolve_branch_id_from_param
+
+        # Accept academy slug/name in addition to UUID
+        if branch_id and branch_id != "all":
+            branch_id = (await _resolve_branch_id_from_param(db, branch_id)) or branch_id
 
         # Build filter query based on user role and parameters
         filter_query = {}
@@ -122,7 +127,10 @@ class ReportsController:
         if date_range and date_range != "all":
             now = dt.datetime.utcnow()
 
-            if date_range == "current-month":
+            if date_range == "last-30-days":
+                start_date = now - dt.timedelta(days=30)
+                date_filter["payment_date"] = {"$gte": start_date}
+            elif date_range == "current-month":
                 start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
                 date_filter["payment_date"] = {"$gte": start_date}
             elif date_range == "last-month":
@@ -354,6 +362,7 @@ class ReportsController:
 
             # Date range options
             date_ranges = [
+                {"id": "last-30-days", "name": "Last 30 Days"},
                 {"id": "current-month", "name": "Current Month"},
                 {"id": "last-month", "name": "Last Month"},
                 {"id": "current-quarter", "name": "Current Quarter"},
@@ -390,6 +399,10 @@ class ReportsController:
             raise HTTPException(status_code=401, detail="Authentication required")
 
         db = get_db()
+        from utils.student_report_query import _resolve_branch_id_from_param
+
+        if branch_id and branch_id != "all":
+            branch_id = (await _resolve_branch_id_from_param(db, branch_id)) or branch_id
 
         # Build filter query based on user role
         filter_query = {"role": "student", "is_active": True}
@@ -1085,6 +1098,7 @@ class ReportsController:
 
             # Date range options
             date_ranges = [
+                {"id": "last-30-days", "name": "Last 30 Days"},
                 {"id": "current-month", "name": "Current Month"},
                 {"id": "last-month", "name": "Last Month"},
                 {"id": "current-quarter", "name": "Current Quarter"},

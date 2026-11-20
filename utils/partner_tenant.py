@@ -154,6 +154,9 @@ async def assign_partner_org_to_branch_doc(
     if org_id:
         await assert_partner_org_exists(db, org_id)
         doc["partner_org_id"] = org_id
+        # White-label partner academies are not Collaboration Partners.
+        doc["allows_collaboration"] = False
+        doc["is_collaboration_partner"] = False
     else:
         doc["partner_org_id"] = None
     return doc
@@ -328,11 +331,78 @@ def uniqueness_scope_for_user(user: Optional[dict]) -> Dict[str, Any]:
 
 
 async def partner_branch_ids(db, user: Optional[dict]):
-    """Branch ids owned by the partner tenant, or None when caller is not a partner."""
+    """Genuine branch ids owned by the partner tenant, or None when caller is not a partner."""
     org_id = partner_org_id_of(user)
     if not org_id:
         return None
-    return await db.branches.distinct("id", {"partner_org_id": org_id})
+    from utils.academy_visibility import AUTO_STUB_CREATED_VIA
+
+    return await db.branches.distinct(
+        "id",
+        {
+            "partner_org_id": org_id,
+            "created_via": {"$ne": AUTO_STUB_CREATED_VIA},
+            "is_active": True,
+        },
+    )
+
+
+async def partner_assigned_course_ids(db, user: Optional[dict]) -> Optional[List[str]]:
+    """Course ids on Partner-owned branches (Rock or partner courses).
+
+    Returns None when the caller is not a partner. Used so partners can *view*
+    courses/batches already assigned to their branch without re-stamping Rock masters.
+    """
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return None
+    from utils.branch_courses import available_course_ids_for_branch
+
+    branch_ids = [str(b) for b in (await partner_branch_ids(db, user) or []) if b]
+    if not branch_ids:
+        return []
+    ids: List[str] = []
+    seen = set()
+    branches = await db.branches.find({"id": {"$in": branch_ids}}).to_list(length=200)
+    for br in branches:
+        for cid in await available_course_ids_for_branch(db, br):
+            c = str(cid or "").strip()
+            if c and c not in seen:
+                seen.add(c)
+                ids.append(c)
+    return ids
+
+
+async def assert_partner_course_read_access(
+    db, course: Optional[dict], user: Optional[dict], *, entity: str = "course"
+) -> None:
+    """Partners may read own-tenant courses OR courses assigned to their branches."""
+    if not course:
+        return
+    org_id = partner_org_id_of(user)
+    if not org_id:
+        return
+    course_org = str(course.get("partner_org_id") or "").strip()
+    if course_org == org_id:
+        return
+    cid = str(course.get("id") or "").strip()
+    assigned = await partner_assigned_course_ids(db, user) or []
+    if cid and cid in assigned:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"You don't have permission to access this {entity}",
+    )
+
+
+def partner_courses_list_filter(org_id: str, assigned_course_ids: Optional[List[str]]) -> Dict[str, Any]:
+    """Mongo clause: partner-owned courses OR courses on assigned branches."""
+    org = str(org_id or "").strip()
+    clauses: List[Dict[str, Any]] = [{"partner_org_id": org}]
+    ids = [str(c) for c in (assigned_course_ids or []) if c]
+    if ids:
+        clauses.append({"id": {"$in": ids}})
+    return {"$or": clauses}
 
 
 async def partner_report_branch_ids(
@@ -386,6 +456,31 @@ def partner_payments_match_clause(org_id: str, branch_ids: Optional[list] = None
     return {"$or": clauses}
 
 
+def payer_category_clause(payer_category: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Separate student course payments from partner-organization payments.
+
+    - student: rows with a student_id (course / admission fees)
+    - partner: partner_org_id set and no student_id (partner onboarding / org fees)
+    """
+    cat = str(payer_category or "").strip().lower()
+    if cat in ("partner", "partners", "partner_org"):
+        return {
+            "$and": [
+                {"partner_org_id": {"$exists": True, "$nin": [None, ""]}},
+                {
+                    "$or": [
+                        {"student_id": {"$exists": False}},
+                        {"student_id": None},
+                        {"student_id": ""},
+                    ]
+                },
+            ]
+        }
+    if cat in ("student", "students"):
+        return {"student_id": {"$exists": True, "$nin": [None, ""]}}
+    return None
+
+
 async def apply_payment_list_partner_scope(
     db,
     query: Dict[str, Any],
@@ -393,13 +488,18 @@ async def apply_payment_list_partner_scope(
     *,
     partner_org_id: Optional[str] = None,
     partner_scope: Optional[str] = None,
+    payer_category: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Scope payment list/stats.
 
     - Partner SA: always restricted to their org (stamp or owned branches).
     - Rock SA: optional partner_org_id / partner_scope=rock|partners|all.
+    - Optional payer_category=student|partner for Finance tabs.
     """
     q = dict(query or {})
+    cat_clause = payer_category_clause(payer_category)
+    if cat_clause:
+        q = merge_and_clause(q, cat_clause)
 
     # Partner SA without org id must never see Rock-wide revenue.
     if is_partner_super_admin(user) and not partner_org_id_of(user):

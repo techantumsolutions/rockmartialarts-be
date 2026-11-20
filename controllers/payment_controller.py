@@ -197,6 +197,87 @@ def _fee_from_batch_for_keys(batch: Optional[dict], dur_keys: list) -> Optional[
     return legacy if legacy is not None and legacy > 0 else None
 
 
+def _pricing_type_for_batch_key(batch: Optional[dict], key: Optional[str]) -> str:
+    """UI default is Monthly; missing type means monthly (not flat package)."""
+    if not batch or not key:
+        return "monthly"
+    ptd = batch.get("pricing_type_per_duration") or {}
+    if isinstance(ptd, dict):
+        raw = ptd.get(key)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip().lower()
+    return "monthly"
+
+
+def _monthly_base_fee_from_batch(batch: Optional[dict], master_durations: Optional[list] = None) -> Optional[float]:
+    """Resolve a per-month rupee amount from batch fees when longer tenures are blank.
+
+    Prefer an explicit monthly 1-month cell; else any monthly cell / duration_months;
+    else legacy batch_fee.
+    """
+    if not batch:
+        return None
+    fpd = batch.get("fee_per_duration") or {}
+    if not isinstance(fpd, dict):
+        fpd = {}
+    ptd = batch.get("pricing_type_per_duration") or {}
+    if not isinstance(ptd, dict):
+        ptd = {}
+
+    durations = list(master_durations or [])
+    by_id = {str(d.get("id")): d for d in durations if d.get("id")}
+    by_code = {str(d.get("code")): d for d in durations if d.get("code")}
+
+    def months_for_key(key: str) -> int:
+        d = by_id.get(str(key)) or by_code.get(str(key))
+        if d:
+            try:
+                return max(1, int(d.get("duration_months") or 1))
+            except (TypeError, ValueError):
+                return 1
+        return 1
+
+    # 1) Explicit monthly cells — prefer shortest tenure
+    monthly_candidates: list[tuple[int, float]] = []
+    for key, raw in fpd.items():
+        try:
+            fee = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if fee <= 0:
+            continue
+        ptype = str(ptd.get(key) or "").strip().lower() or "monthly"
+        if ptype != "monthly":
+            continue
+        m = months_for_key(str(key))
+        monthly_candidates.append((m, fee if m <= 1 else fee))  # stored value is per-month when monthly
+    if monthly_candidates:
+        monthly_candidates.sort(key=lambda x: x[0])
+        return monthly_candidates[0][1]
+
+    # 2) Any positive 1-month (or shortest) fee treated as monthly base when type unset/monthly
+    shortest: Optional[tuple[int, float]] = None
+    for key, raw in fpd.items():
+        try:
+            fee = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if fee <= 0:
+            continue
+        ptype = str(ptd.get(key) or "").strip().lower() or "monthly"
+        if ptype == "flat" and months_for_key(str(key)) > 1:
+            continue
+        m = months_for_key(str(key))
+        per_month = fee if m <= 1 or ptype == "monthly" else fee / m
+        if shortest is None or m < shortest[0]:
+            shortest = (m, per_month)
+    if shortest:
+        return shortest[1]
+
+    legacy = _batch_fee_from_doc(batch)
+    return legacy if legacy is not None and legacy > 0 else None
+
+
 async def _latest_student_batch_ref(
     db,
     student_id: Optional[str],
@@ -1044,7 +1125,11 @@ class PaymentController:
         if current_user.get("role") != "student":
             raise HTTPException(status_code=403, detail="Only students can use this endpoint")
 
-        from utils.billing_state import calculate_arrear_amount, compute_enrollment_billing_state
+        from utils.billing_state import (
+            assert_renewal_window_open,
+            calculate_arrear_amount,
+            compute_enrollment_billing_state,
+        )
         from utils.renewal_service import package_quote_response
 
         student_id = current_user["id"]
@@ -1060,6 +1145,7 @@ class PaymentController:
             raise HTTPException(status_code=400, detail="Enrollment is missing course or branch.")
 
         await _enforce_student_assigned_branch(db, student_id, branch_id, current_user)
+        assert_renewal_window_open(enrollment)
 
         duration = (body.duration or enrollment.get("duration_id") or "").strip()
         if not duration:
@@ -1151,7 +1237,7 @@ class PaymentController:
         if current_user.get("role") != "student":
             raise HTTPException(status_code=403, detail="Only students can use this endpoint")
 
-        from utils.billing_state import calculate_arrear_amount
+        from utils.billing_state import assert_renewal_window_open, calculate_arrear_amount
         from utils.renewal_service import compute_renewal_validity_start
 
         student_id = current_user["id"]
@@ -1165,6 +1251,7 @@ class PaymentController:
             raise HTTPException(status_code=400, detail="Enrollment is missing course or branch.")
 
         await _enforce_student_assigned_branch(db, student_id, branch_id, current_user)
+        assert_renewal_window_open(source)
 
         duration = (body.duration or source.get("duration_id") or "").strip()
         if not duration:
@@ -2287,15 +2374,32 @@ class PaymentController:
                     pricing_multiplier = pm
             duration_name = duration_info.get("name", duration) if duration_info else duration
 
-            # Admission is always the configured branch/system amount for this checkout — never multiplied by duration.
-            # (Course tuition may scale by tenure via batch/monthly pricing or linear multi-month estimate.)
+            # Admission is never multiplied by duration.
+            # Mode: fixed (branch.admission_fee for all courses) or per_course (admission_fee_by_course[course_id]).
             admission_fee = await SettingsController.get_default_registration_fee()
-            branch_adm = branch.get("admission_fee")
-            if branch_adm is not None:
-                try:
-                    admission_fee = float(branch_adm)
-                except (TypeError, ValueError):
-                    pass
+            mode = str(branch.get("admission_fee_mode") or "fixed").strip().lower()
+            if mode in ("per_course", "course", "course_based"):
+                by_course = branch.get("admission_fee_by_course") or {}
+                if isinstance(by_course, dict) and course_id in by_course and by_course.get(course_id) is not None:
+                    try:
+                        admission_fee = float(by_course.get(course_id))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    # Fallback to academy fixed fee when a course has no override.
+                    branch_adm = branch.get("admission_fee")
+                    if branch_adm is not None:
+                        try:
+                            admission_fee = float(branch_adm)
+                        except (TypeError, ValueError):
+                            pass
+            else:
+                branch_adm = branch.get("admission_fee")
+                if branch_adm is not None:
+                    try:
+                        admission_fee = float(branch_adm)
+                    except (TypeError, ValueError):
+                        pass
             course_fee = None
             total_amount = None
             batch_is_flat = False
@@ -2338,12 +2442,10 @@ class PaymentController:
                     )
                 # Check batch fee_per_duration first (per-duration pricing)
                 batch_fpd = bdoc.get("fee_per_duration") or {}
-                batch_ptd = bdoc.get("pricing_type_per_duration") or {}
                 batch_dur_fee = None
-                # Default matches course-level fee_per_duration: each tier cell is the full package price
-                # for that tenure. Use pricing_type_per_duration[key] == "monthly" only when the cell is a
-                # per-month rupee amount (multiply by duration_months).
-                batch_dur_pricing_type = "flat"
+                # UI default is Monthly. Missing type ⇒ monthly (× duration months).
+                # Flat ⇒ fixed package for that tenure only.
+                batch_dur_pricing_type = "monthly"
                 matched_dur_key = None
                 if isinstance(batch_fpd, dict):
                     for dk in dur_keys:
@@ -2358,26 +2460,37 @@ class PaymentController:
                             batch_dur_fee = candidate
                             matched_dur_key = dk
                             break
-                if matched_dur_key and isinstance(batch_ptd, dict):
-                    pt_raw = batch_ptd.get(matched_dur_key)
-                    if pt_raw is not None and str(pt_raw).strip():
-                        batch_dur_pricing_type = str(pt_raw).strip().lower()
+                if matched_dur_key:
+                    batch_dur_pricing_type = _pricing_type_for_batch_key(bdoc, matched_dur_key)
                 if batch_dur_fee is not None and batch_dur_fee > 0:
                     explicit_duration_fee_found = True
-                    if batch_dur_pricing_type == "monthly":
+                    if batch_dur_pricing_type == "flat":
+                        course_fee = batch_dur_fee
+                        batch_is_flat = True
+                    else:
+                        # Monthly (or unset): per-month amount × tenure months
                         course_fee = batch_dur_fee * pricing_multiplier
                         batch_is_flat = False
-                    else:
-                        # Package total for this duration (flat / unset / any non-monthly label)
-                        course_fee = batch_dur_fee
-                        batch_is_flat = batch_dur_pricing_type == "flat"
                     total_amount = course_fee + admission_fee
                 else:
-                    bf = _batch_fee_from_doc(bdoc)
-                    if bf is not None and bf > 0:
-                        # Legacy batch_fee is per-month; multiply by tenure months
-                        course_fee = bf * pricing_multiplier
+                    # Tenure cell blank: if monthly base exists, monthly × months (not flat package).
+                    master_durs = await db.durations.find(
+                        {"is_active": {"$ne": False}},
+                        {"_id": 0, "id": 1, "code": 1, "duration_months": 1},
+                    ).to_list(length=100)
+                    monthly_base = _monthly_base_fee_from_batch(bdoc, master_durs)
+                    if monthly_base is not None and monthly_base > 0 and pricing_multiplier >= 1:
+                        course_fee = monthly_base * pricing_multiplier
                         total_amount = course_fee + admission_fee
+                        batch_is_flat = False
+                        explicit_duration_fee_found = False
+                    else:
+                        bf = _batch_fee_from_doc(bdoc)
+                        if bf is not None and bf > 0:
+                            # Legacy batch_fee is per-month; multiply by tenure months
+                            course_fee = bf * pricing_multiplier
+                            total_amount = course_fee + admission_fee
+                            batch_is_flat = False
 
             # 0) Flat/offer price check — overrides all calculated pricing
             flat_price_per_duration = course.get("flat_price_per_duration") or {}
@@ -3731,6 +3844,7 @@ class PaymentController:
         branch_id: Optional[str] = None,
         partner_org_id: Optional[str] = None,
         partner_scope: Optional[str] = None,
+        payer_category: Optional[str] = None,
     ):
         """Get payment statistics for dashboard"""
         db = get_db()
@@ -3759,6 +3873,8 @@ class PaymentController:
                         "monthly_revenue": 0,
                         "payment_count": 0,
                         "average_payment": 0,
+                        "failed_payments": 0,
+                        "transaction_count": 0,
                     }
 
                 base_filter["branch_details.branch_id"] = {"$in": managed_branch_ids}
@@ -3801,7 +3917,7 @@ class PaymentController:
                 # Filter by branch_id in branch_details
                 base_filter["branch_details.branch_id"] = assigned_branch
 
-        # Partner SA: own org. Rock SA: optional partner_org_id / partner_scope.
+        # Partner SA: own org. Rock SA: optional partner_org_id / partner_scope / payer_category.
         from utils.partner_tenant import apply_payment_list_partner_scope, partner_org_id_of
 
         base_filter = await apply_payment_list_partner_scope(
@@ -3810,6 +3926,7 @@ class PaymentController:
             current_user,
             partner_org_id=partner_org_id,
             partner_scope=partner_scope,
+            payer_category=payer_category,
         )
 
         # Optional superadmin branch filter (do not affect other roles)
@@ -3901,6 +4018,30 @@ class PaymentController:
         ]
         pending_payments_result = await db.payments.aggregate(pending_pipeline).to_list(1)
         pending_payments = float(pending_payments_result[0]["total"]) if pending_payments_result else 0.0
+
+        failed_match = {**all_time_match_base, "payment_status": PaymentStatus.FAILED.value}
+        failed_pipeline = _branch_resolution_pipeline(failed_match) + [
+            {
+                "$group": {
+                    "_id": None,
+                    "total": {
+                        "$sum": {
+                            "$convert": {"input": "$amount", "to": "double", "onError": 0.0, "onNull": 0.0}
+                        }
+                    },
+                    "cnt": {"$sum": 1},
+                }
+            }
+        ]
+        failed_payments_result = await db.payments.aggregate(failed_pipeline).to_list(1)
+        failed_payments = float(failed_payments_result[0]["total"]) if failed_payments_result else 0.0
+        failed_count = int(failed_payments_result[0]["cnt"]) if failed_payments_result else 0
+
+        txn_count_pipeline = _branch_resolution_pipeline(all_time_match_base) + [
+            {"$count": "cnt"}
+        ]
+        txn_count_result = await db.payments.aggregate(txn_count_pipeline).to_list(1)
+        transaction_count = int(txn_count_result[0]["cnt"]) if txn_count_result else 0
 
         # Period collection (matches dashboard date filter) vs calendar month fallback
         if period_start and period_end:
@@ -4002,6 +4143,9 @@ class PaymentController:
         return {
             "total_collected": total_collected,
             "pending_payments": pending_payments,
+            "failed_payments": failed_payments,
+            "failed_count": failed_count,
+            "transaction_count": transaction_count,
             "this_month_collection": this_month_collection,
             "total_students": total_students,
             "students_with_payments_in_period": display_students_for_period,
@@ -4030,6 +4174,8 @@ class PaymentController:
         branch_id: Optional[str] = None,
         partner_org_id: Optional[str] = None,
         partner_scope: Optional[str] = None,
+        payer_category: Optional[str] = None,
+        course_id: Optional[str] = None,
     ):
         """Get payments with filtering and student information"""
         try:
@@ -4041,9 +4187,25 @@ class PaymentController:
             # Build filter query
             filter_query = {}
             if status and status != "all":
-                filter_query["payment_status"] = status
+                mapped = str(status).strip().lower()
+                if mapped in ("paid", "completed"):
+                    filter_query["payment_status"] = {"$in": ["paid", "completed"]}
+                else:
+                    filter_query["payment_status"] = mapped
             if payment_type and payment_type != "all":
                 filter_query["payment_type"] = payment_type
+            if course_id and course_id != "all":
+                from utils.partner_tenant import merge_and_clause as _merge_course
+
+                filter_query = _merge_course(
+                    filter_query,
+                    {
+                        "$or": [
+                            {"course_id": course_id},
+                            {"course_details.course_id": course_id},
+                        ]
+                    },
+                )
 
             from utils.partner_tenant import (
                 apply_payment_list_partner_scope,
@@ -4056,6 +4218,7 @@ class PaymentController:
                 current_user,
                 partner_org_id=partner_org_id,
                 partner_scope=partner_scope,
+                payer_category=payer_category,
             )
             if branch_id and branch_id not in ("all", "unassigned"):
                 await assert_partner_owns_branch(db, current_user, branch_id)
@@ -4244,6 +4407,8 @@ class PaymentController:
                         "branch_name": {"$ifNull": ["$branch_details.branch_name", None]},
                         "branch_id": {"$ifNull": ["$branch_details.branch_id", "$resolved_branch_id"]},
                         "partner_org_id": 1,
+                        "invoice_id": 1,
+                        "invoice_number": 1,
                         "created_at": 1,
                     }
                 },
@@ -4356,6 +4521,42 @@ class PaymentController:
                     sp["gateway_payment_label"] = "Razorpay (online)"
                 elif pm:
                     sp["gateway_payment_label"] = _METHOD_DISPLAY.get(pm) or pm.replace("_", " ").title()
+
+            # Enrich invoice numbers when missing on payment rows
+            missing_inv = [
+                sp
+                for sp in serialized_payments
+                if not sp.get("invoice_number") and (sp.get("id") or sp.get("invoice_id"))
+            ]
+            if missing_inv:
+                try:
+                    pay_ids = [str(sp["id"]) for sp in missing_inv if sp.get("id")]
+                    inv_ids = [str(sp["invoice_id"]) for sp in missing_inv if sp.get("invoice_id")]
+                    inv_by_pay: Dict[str, dict] = {}
+                    inv_by_id: Dict[str, dict] = {}
+                    if pay_ids:
+                        async for inv in db.invoices.find(
+                            {"payment_id": {"$in": pay_ids}},
+                            {"_id": 0, "id": 1, "payment_id": 1, "invoice_number": 1},
+                        ):
+                            if inv.get("payment_id"):
+                                inv_by_pay[str(inv["payment_id"])] = inv
+                    if inv_ids:
+                        async for inv in db.invoices.find(
+                            {"id": {"$in": inv_ids}},
+                            {"_id": 0, "id": 1, "payment_id": 1, "invoice_number": 1},
+                        ):
+                            if inv.get("id"):
+                                inv_by_id[str(inv["id"])] = inv
+                    for sp in missing_inv:
+                        inv = inv_by_pay.get(str(sp.get("id") or "")) or inv_by_id.get(
+                            str(sp.get("invoice_id") or "")
+                        )
+                        if inv:
+                            sp["invoice_id"] = inv.get("id") or sp.get("invoice_id")
+                            sp["invoice_number"] = inv.get("invoice_number")
+                except Exception:
+                    logger.exception("enrich invoice_number for payment list")
 
             # Enrich missing course names from enrollment → course (older rows may lack course_details)
             missing_course = [sp for sp in serialized_payments if not sp.get("course_name") and sp.get("enrollment_id")]

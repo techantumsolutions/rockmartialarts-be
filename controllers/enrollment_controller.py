@@ -13,6 +13,7 @@ from utils.helpers import serialize_doc, send_whatsapp
 from utils.admission_fee_rules import should_charge_admission_fee_for_checkout
 from utils.branch_geography import assert_branch_accepts_enrollment
 from utils.branch_courses import assert_course_available_at_branch
+from controllers.settings_controller import SettingsController
 
 class EnrollmentController:
     @staticmethod
@@ -360,8 +361,8 @@ class EnrollmentController:
         if existing_enrollment:
             raise HTTPException(status_code=400, detail="Student already enrolled in this course.")
 
-        # Determine fee_amount based on branch pricing and branch-specific admission fee
-        admission_fee = 500.0
+        # Admission + course fees from admin setup (system/branch settings), never hardcoded.
+        admission_fee = await SettingsController.get_default_registration_fee()
         try:
             branch_adm = branch.get("admission_fee")
             if isinstance(branch_adm, (int, float)):
@@ -372,10 +373,31 @@ class EnrollmentController:
         if not await should_charge_admission_fee_for_checkout(db, student_id, {"beneficiary_type": "self"}):
             admission_fee = 0.0
 
-        # Base course fee (can be overridden by branch_pricing)
-        fee_amount = course["base_fee"]
-        if enrollment_data.branch_id in course.get("branch_pricing", {}):
-            fee_amount = course["branch_pricing"][enrollment_data.branch_id]
+        # Prefer live payment-info (batch fee_per_duration from academy setup).
+        fee_amount = None
+        duration_hint = getattr(enrollment_data, "duration_id", None) or getattr(
+            enrollment_data, "duration", None
+        )
+        try:
+            from controllers.payment_controller import PaymentController
+
+            if duration_hint:
+                info = await PaymentController.get_course_payment_info(
+                    enrollment_data.course_id,
+                    enrollment_data.branch_id,
+                    str(duration_hint),
+                    optional_student_id=student_id,
+                )
+                fee_amount = float(info.pricing.course_fee)
+                if admission_fee > 0 and getattr(info.pricing, "admission_fee", None) is not None:
+                    admission_fee = float(info.pricing.admission_fee)
+        except Exception:
+            fee_amount = None
+
+        if fee_amount is None:
+            fee_amount = course.get("base_fee")
+            if enrollment_data.branch_id in course.get("branch_pricing", {}):
+                fee_amount = course["branch_pricing"][enrollment_data.branch_id]
 
         # Calculate end date
         end_date = enrollment_data.start_date + timedelta(days=course["duration_months"] * 30)

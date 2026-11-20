@@ -54,6 +54,35 @@ def _parse_iso_date(value: Optional[str], *, end_of_day: bool = False) -> Option
         return None
 
 
+async def _resolve_branch_id_from_param(db, value: Optional[str]) -> str:
+    """Accept UUID, stored slug, or name-derived slug and return branch id."""
+    key = (value or "").strip()
+    if not key or key == "all":
+        return ""
+    by_id = await db.branches.find_one({"id": key}, {"id": 1})
+    if by_id and by_id.get("id"):
+        return str(by_id["id"])
+    slug = key.lower()
+    by_slug = await db.branches.find_one({"slug": slug}, {"id": 1})
+    if by_slug and by_slug.get("id"):
+        return str(by_slug["id"])
+    # Older rows may lack slug — match name-normalized slug.
+    import re
+
+    def _name_to_slug(name: str) -> str:
+        s = (name or "").strip().lower()
+        s = re.sub(r"\s+", "-", s)
+        s = re.sub(r"[^a-z0-9-]", "", s)
+        s = re.sub(r"-+", "-", s).strip("-")
+        return s
+
+    async for br in db.branches.find({}, {"id": 1, "name": 1, "branch.name": 1, "slug": 1}):
+        name = str((br.get("branch") or {}).get("name") or br.get("name") or "")
+        if (br.get("slug") or "").lower() == slug or _name_to_slug(name) == slug:
+            return str(br.get("id") or "")
+    return key
+
+
 async def resolve_authorized_branch_scope(
     db,
     current_user: dict,
@@ -67,9 +96,7 @@ async def resolve_authorized_branch_scope(
       - requesting another branch => 403
     """
     role = _role(current_user)
-    req = (requested_branch_id or "").strip()
-    if req in {"", "all"}:
-        req = ""
+    req = await _resolve_branch_id_from_param(db, requested_branch_id)
 
     if role in {"super_admin", "superadmin"}:
         from utils.partner_tenant import rock_dashboard_branch_clause
@@ -200,20 +227,20 @@ async def query_student_report_rows(
 
     start_dt = _parse_iso_date(start_date)
     end_dt = _parse_iso_date(end_date, end_of_day=True)
-    if start_dt or end_dt:
-        created: Dict[str, Any] = {}
-        if start_dt:
-            created["$gte"] = start_dt
-        if end_dt:
-            created["$lt"] = end_dt
-        student_filter["created_at"] = created
 
-    # Enrollment-scoped student ids when branch/course filters apply
+    # Enrollment-scoped student ids when branch/course/date filters apply.
+    # Date range filters by enrollment activity (not account created_at), so
+    # academy + duration filters return students who enrolled in that window.
     course_ref = (course_id or "").strip()
     if course_ref in {"", "all"}:
         course_ref = ""
 
-    need_enrollment_scope = bool(allowed_branches) or bool(effective_branch) or bool(course_ref)
+    need_enrollment_scope = (
+        bool(allowed_branches)
+        or bool(effective_branch)
+        or bool(course_ref)
+        or bool(start_dt or end_dt)
+    )
     scoped_student_ids: Optional[List[str]] = None
     if need_enrollment_scope:
         enr_filter: Dict[str, Any] = {}
@@ -223,6 +250,18 @@ async def query_student_report_rows(
             enr_filter["branch_id"] = {"$in": branch_scope}
         if course_ref:
             enr_filter["course_id"] = course_ref
+        if start_dt or end_dt:
+            created: Dict[str, Any] = {}
+            if start_dt:
+                created["$gte"] = start_dt
+            if end_dt:
+                created["$lt"] = end_dt
+            # Prefer enrollment start/join date; fall back to created_at via $or.
+            enr_filter["$or"] = [
+                {"start_date": created},
+                {"enrollment_date": created},
+                {"created_at": created},
+            ]
         if enr_filter:
             scoped_student_ids = await db.enrollments.distinct("student_id", enr_filter)
             if not scoped_student_ids:

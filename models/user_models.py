@@ -102,6 +102,7 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     date_of_birth: Optional[date] = None
     gender: Optional[str] = None
+    profile_image: Optional[str] = None  # public path e.g. /uploads/images/...
     address: Optional[dict] = None  # { line1, area, city, state, pincode, country }
     emergency_contact: Optional[dict] = None  # { name, phone, relationship }
     # DEPRECATED: Course enrollment should be handled via enrollments collection

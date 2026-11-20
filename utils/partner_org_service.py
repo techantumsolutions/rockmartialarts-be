@@ -21,6 +21,7 @@ from models.partner_org_models import (
     PartnerOrgUpdateStatus,
     PartnerPaymentMethod,
     PartnerProfileUpdate,
+    PartnerPublicSiteSettingsUpdate,
     PartnerSetPassword,
     PartnerOrgVerifyPayment,
     PartnerValidityUpdate,
@@ -813,6 +814,84 @@ async def resend_partner_invite(partner_org_id: str, current_user: dict) -> Dict
     }
 
 
+async def admin_reset_partner_password(
+    partner_org_id: str, new_password: str, current_user: dict
+) -> Dict[str, Any]:
+    """Rock Super Admin resets partner admin password without email invite."""
+    db = get_db()
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+
+    if org.get("status") == PartnerOrgStatus.PENDING_PAYMENT.value:
+        raise HTTPException(
+            status_code=400,
+            detail="Partner payment is still pending. Complete payment before setting a password.",
+        )
+
+    admin = None
+    if org.get("admin_user_id"):
+        admin = await db[COL_USERS].find_one({"id": org["admin_user_id"]})
+    if not admin and org.get("email"):
+        admin = await db[COL_USERS].find_one(
+            {
+                "email": str(org["email"]).lower(),
+                "role": UserRole.PARTNER_SUPER_ADMIN.value,
+            }
+        )
+    if not admin:
+        raise HTTPException(status_code=404, detail="Partner admin user not found")
+
+    pwd = (new_password or "").strip()
+    if len(pwd) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    now = datetime.utcnow()
+    await db[COL_USERS].update_one(
+        {"id": admin["id"]},
+        {
+            "$set": {
+                "password_hash": hash_password(pwd),
+                "must_set_password": False,
+                "updated_at": now,
+                "updated_by": current_user.get("id"),
+            }
+        },
+    )
+
+    org_set: Dict[str, Any] = {
+        "updated_at": now,
+        "updated_by": current_user.get("id"),
+        "invite_token": None,
+        "invite_expires_at": None,
+    }
+    if org.get("status") in (
+        PartnerOrgStatus.INVITED.value,
+        PartnerOrgStatus.PENDING_PAYMENT.value,
+        None,
+        "",
+    ):
+        org_set["status"] = PartnerOrgStatus.ACTIVE.value
+        if not org.get("activated_at"):
+            org_set["activated_at"] = now
+    elif org.get("is_active") is not False and org.get("status") != PartnerOrgStatus.DISABLED.value:
+        # Keep current status (e.g. active/disabled); only clear invite tokens above
+        pass
+
+    if not org.get("admin_user_id"):
+        org_set["admin_user_id"] = admin["id"]
+
+    await db[COL].update_one({"id": partner_org_id}, {"$set": org_set})
+    updated = await db[COL].find_one({"id": partner_org_id})
+    return {
+        "message": "Partner password has been reset successfully.",
+        "partner": partner_org_public(updated),
+    }
+
+
 async def set_partner_password(body: PartnerSetPassword) -> Dict[str, Any]:
     db = get_db()
     if db is None:
@@ -890,13 +969,25 @@ async def login_partner(slug: str, body: PartnerLogin) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if user.get("is_active") is False:
         raise HTTPException(status_code=401, detail="Account is inactive")
-    if user.get("must_set_password") or not user.get("password_hash"):
+    stored_hash = user.get("password_hash") or user.get("password")
+    if user.get("must_set_password") or not stored_hash:
         raise HTTPException(
             status_code=403,
             detail="Please create your password using the invitation email link first.",
         )
-    if not verify_password(body.password, user["password_hash"]):
+    if not verify_password(body.password, stored_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    # Heal legacy resets that only wrote ``password`` (not ``password_hash``)
+    if not user.get("password_hash") and user.get("password"):
+        await db[COL_USERS].update_one(
+            {"id": user["id"]},
+            {
+                "$set": {
+                    "password_hash": user["password"],
+                    "must_set_password": False,
+                }
+            },
+        )
 
     token = create_access_token(
         data={
@@ -1327,6 +1418,40 @@ async def update_partner_course_permissions(
         "message": "Course permissions updated",
         "course_permissions": get_partner_course_permissions(updated),
         "partner": partner_org_public(updated),
+    }
+
+
+async def update_partner_public_site_settings(
+    partner_org_id: str,
+    body: PartnerPublicSiteSettingsUpdate,
+    current_user: dict,
+) -> Dict[str, Any]:
+    """Super Admin: toggle partner public Page CMS + website footer."""
+    db = get_db()
+    org = await db[COL].find_one({"id": partner_org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Partner not found")
+    patch: Dict[str, Any] = {
+        "updated_at": datetime.utcnow(),
+        "updated_by": current_user.get("id"),
+    }
+    if body.page_cms_enabled is not None:
+        patch["page_cms_enabled"] = bool(body.page_cms_enabled)
+    if body.public_footer_enabled is not None:
+        patch["public_footer_enabled"] = bool(body.public_footer_enabled)
+    if len(patch) <= 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide page_cms_enabled and/or public_footer_enabled",
+        )
+    await db[COL].update_one({"id": partner_org_id}, {"$set": patch})
+    updated = await db[COL].find_one({"id": partner_org_id})
+    extras = partner_org_public(updated) or {}
+    return {
+        "message": "Public website settings updated",
+        "page_cms_enabled": extras.get("page_cms_enabled", True),
+        "public_footer_enabled": extras.get("public_footer_enabled", False),
+        "partner": extras,
     }
 
 

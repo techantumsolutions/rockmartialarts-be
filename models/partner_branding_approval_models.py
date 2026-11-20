@@ -26,9 +26,14 @@ class BrandingEditPermission(str, Enum):
 
 
 class BrandingEditRequestCreate(BaseModel):
-    """Partner-initiated request body (no fields required)."""
+    """Partner-initiated request body.
+
+    Optional ``branch_id`` scopes the request to one academy (per-academy branding).
+    Omitting it requests Partner Organization branding edit access.
+    """
 
     note: Optional[str] = Field(None, max_length=500)
+    branch_id: Optional[str] = Field(None, max_length=80)
 
 
 class BrandingEditReviewBody(BaseModel):
@@ -47,6 +52,9 @@ def branding_request_public(doc: Optional[dict]) -> Optional[Dict[str, Any]]:
         "partner_org_id": doc.get("partner_org_id"),
         "partner_name": doc.get("partner_name"),
         "partner_slug": doc.get("partner_slug"),
+        "branch_id": doc.get("branch_id"),
+        "branch_name": doc.get("branch_name"),
+        "scope": "academy" if doc.get("branch_id") else "organization",
         "requested_by": doc.get("requested_by"),
         "requested_by_name": doc.get("requested_by_name"),
         "requested_by_email": doc.get("requested_by_email"),

@@ -16,7 +16,12 @@ async def get_testimonials_public(
     is_global: Optional[bool] = Query(None),
     limit: int = Query(10, ge=1, le=50),
 ):
-    """Public active testimonials. Home: is_global=true; branch: branch_id=…"""
+    """Public active testimonials.
+
+    Site-wide (no branch_id): all academy testimonials with academy_name.
+    Academy page: pass branch_id for that academy only.
+    Legacy: is_global=true still returns global-only rows.
+    """
     items = await ctrl.list_public(branch_id=branch_id, is_global=is_global, limit=limit)
     return {"testimonials": items}
 

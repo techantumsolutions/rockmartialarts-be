@@ -202,7 +202,10 @@ async def public_branch_discovery_query(
 
 
 async def count_active_branches_for_location(db, location_ref: str) -> int:
+    from utils.academy_visibility import merge_public_academy_clause_for_db
+
     query, _ = await branches_matching_location_query(db, location_ref, active_only=True)
+    query = await merge_public_academy_clause_for_db(db, query, active_only=True)
     return await db.branches.count_documents(query)
 
 

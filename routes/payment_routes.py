@@ -279,7 +279,10 @@ async def get_payment_stats(
         None,
         description="Rock SA: all | rock | partners — separate Rock vs partner revenue",
     ),
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
+    payer_category: Optional[str] = Query(
+        None, description="student | partner — Finance Transactions tabs"
+    ),
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT, UserRole.PARTNER_SUPER_ADMIN]))
 ):
     """Get payment statistics for dashboard - Students get their own payment stats"""
     return await PaymentController.get_payment_stats(
@@ -289,6 +292,7 @@ async def get_payment_stats(
         branch_id=branch_id,
         partner_org_id=partner_org_id,
         partner_scope=partner_scope,
+        payer_category=payer_category,
     )
 
 @router.get("")
@@ -305,10 +309,14 @@ async def get_payments(
         None,
         description="Rock SA: all | rock | partners — separate Rock vs partner transactions",
     ),
+    payer_category: Optional[str] = Query(
+        None, description="student | partner — Finance Transactions tabs"
+    ),
+    course_id: Optional[str] = Query(None, description="Filter by course id"),
     search: Optional[str] = Query(None, description="Search by student name/email/phone or transaction id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
-    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT]))
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER, UserRole.COACH, UserRole.STUDENT, UserRole.PARTNER_SUPER_ADMIN]))
 ):
     """Get payments with filtering - Students can only see their own payments"""
     return await PaymentController.get_payments(
@@ -323,6 +331,8 @@ async def get_payments(
         branch_id=branch_id,
         partner_org_id=partner_org_id,
         partner_scope=partner_scope,
+        payer_category=payer_category,
+        course_id=course_id,
     )
 
 @router.put("/{payment_id}/cancel")

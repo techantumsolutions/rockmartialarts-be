@@ -118,11 +118,15 @@ async def get_coach_attendance(
     date: Optional[str] = Query(None, description="Single date in ISO format (YYYY-MM-DD)"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    include_all_coaches: bool = Query(
+        False,
+        description="When true, Rock super admins see all coaches (not only those assigned to active batches)",
+    ),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN, UserRole.COACH_ADMIN, UserRole.BRANCH_MANAGER]))
 ):
     """Get coach attendance data"""
     return await AttendanceController.get_coach_attendance(
-        branch_id, date, start_date, end_date, current_user
+        branch_id, date, start_date, end_date, include_all_coaches, current_user
     )
 
 @router.get("/stats")

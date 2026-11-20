@@ -20,6 +20,8 @@ from models.academy_event_models import (
     AcademyEventStatus,
     AcademyEventType,
     AcademyEventUpdate,
+    event_bounds_from_batches,
+    normalize_event_batches,
     normalize_reminder_offsets,
     slugify,
 )
@@ -72,6 +74,7 @@ def _public_landing_view(doc: dict, *, branch_name=None, branch_code=None) -> Di
         "venue_address": doc.get("venue_address"),
         "start_at": doc.get("start_at"),
         "end_at": doc.get("end_at"),
+        "batches": doc.get("batches") or [],
         "branch_id": doc.get("branch_id"),
         "branch_name": branch_name,
         "branch_code": branch_code,
@@ -131,6 +134,10 @@ async def _validate_branch(db, branch_id: Optional[str]) -> Optional[str]:
     if not branch:
         raise HTTPException(status_code=400, detail="Branch not found")
     return branch_id
+
+
+def _is_rock_super_admin(role: str) -> bool:
+    return str(role or "").lower() in {"super_admin", "superadmin"}
 
 
 def _rock_role(role: str) -> bool:
@@ -226,11 +233,13 @@ async def event_is_partner_owned(db, doc: Optional[dict]) -> bool:
 
 
 async def assert_event_tenant_access(db, doc: Optional[dict], user: Optional[dict]) -> None:
-    """Partner sees only their events. Rock admin does not see partner events. Branch managers unchanged."""
+    """Partner sees only their events. Rock Super Admin sees all. Coach admin excludes partner events."""
     if not doc:
         raise HTTPException(status_code=404, detail="Event not found")
     role = str((user or {}).get("role") or "").lower()
     if role == "branch_manager":
+        return
+    if _is_rock_super_admin(role):
         return
     if is_partner_super_admin(user):
         if not await event_belongs_to_partner(db, doc, user):
@@ -257,8 +266,35 @@ async def assert_event_branch_for_actor(db, user: Optional[dict], branch_id: Opt
         )
 
 
+def _resolve_event_schedule(
+    *,
+    batches_raw: Optional[list],
+    start_at: Optional[str],
+    end_at: Optional[str],
+) -> tuple[list, str, Optional[str]]:
+    if batches_raw is not None:
+        try:
+            dumped = [
+                b.model_dump() if hasattr(b, "model_dump") else b for b in batches_raw
+            ]
+            batches = normalize_event_batches(dumped)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not batches:
+            raise HTTPException(status_code=400, detail="At least one time slot is required")
+        try:
+            start, end = event_bounds_from_batches(batches)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return batches, start, end
+    if not start_at:
+        raise HTTPException(status_code=400, detail="start_at or batches is required")
+    return [], start_at, end_at
+
+
 async def _enrich(db, doc: dict) -> Dict[str, Any]:
     out = _public(doc)
+    out["batches"] = doc.get("batches") or []
     out["registration_fields"] = normalize_registration_fields(
         doc.get("registration_fields")
     )
@@ -267,11 +303,45 @@ async def _enrich(db, doc: dict) -> Dict[str, Any]:
         doc.get("reminder_offsets_hours")
     )
     bid = doc.get("branch_id")
+    partner_org_id = str(doc.get("partner_org_id") or "").strip() or None
+    branch_name = None
     if bid:
         br = await db[COL_BRANCHES].find_one({"id": bid})
         if br:
-            out["branch_name"] = br.get("name") or br.get("branch_name")
+            branch_name = br.get("name") or br.get("branch_name")
+            out["branch_name"] = branch_name
             out["branch_code"] = br.get("code") or br.get("branch_code")
+            if not partner_org_id:
+                partner_org_id = str(br.get("partner_org_id") or "").strip() or None
+    partner_org_name = None
+    if partner_org_id:
+        org = await db.partner_organizations.find_one(
+            {"id": partner_org_id},
+            {"name": 1, "display_name": 1},
+        )
+        if org:
+            partner_org_name = org.get("display_name") or org.get("name")
+    out["partner_org_id"] = partner_org_id
+    out["partner_org_name"] = partner_org_name
+    if partner_org_name and branch_name:
+        posted = f"{partner_org_name} · {branch_name}"
+    elif branch_name:
+        posted = branch_name
+    elif partner_org_name:
+        posted = partner_org_name
+    else:
+        try:
+            from utils.email_layout import academy_display_name
+
+            posted = academy_display_name()
+        except Exception:
+            posted = "Rock Martial Arts Academy"
+    try:
+        from utils.platform_branding import format_academy_powered_by
+
+        out["posted_by_academy"] = format_academy_powered_by(posted)
+    except Exception:
+        out["posted_by_academy"] = posted
     return out
 
 
@@ -305,6 +375,10 @@ async def list_academy_events(
         q["branch_id"] = {"$in": allowed or ["__none__"]}
     elif is_partner_super_admin(current_user):
         q = merge_and_clause(q, await partner_event_scope(db, current_user))
+        if branch_id and branch_id != "all":
+            q = merge_and_clause(q, {"branch_id": branch_id})
+    elif _is_rock_super_admin(role):
+        # Super Admin sees Rock + academy/partner events.
         if branch_id and branch_id != "all":
             q = merge_and_clause(q, {"branch_id": branch_id})
     elif _rock_role(role):
@@ -484,6 +558,12 @@ async def create_academy_event(
     )
     slug = await _unique_slug(db, body.slug or body.title)
 
+    batches, start_at, end_at = _resolve_event_schedule(
+        batches_raw=body.batches,
+        start_at=body.start_at,
+        end_at=body.end_at,
+    )
+
     doc = {
         "id": str(uuid.uuid4()),
         "title": body.title.strip(),
@@ -493,8 +573,9 @@ async def create_academy_event(
         "description": body.description,
         "venue": body.venue,
         "venue_address": body.venue_address,
-        "start_at": body.start_at,
-        "end_at": body.end_at,
+        "start_at": start_at,
+        "end_at": end_at,
+        "batches": batches,
         "branch_id": branch_id,
         "fee_inr": float(body.fee_inr or 0),
         "capacity": body.capacity,
@@ -570,6 +651,16 @@ async def update_academy_event(
         patch["reminder_offsets_hours"] = normalize_reminder_offsets(
             data["reminder_offsets_hours"]
         )
+
+    if "batches" in data:
+        batches, start_at, end_at = _resolve_event_schedule(
+            batches_raw=data["batches"],
+            start_at=data.get("start_at", existing.get("start_at")),
+            end_at=data.get("end_at", existing.get("end_at")),
+        )
+        patch["batches"] = batches
+        patch["start_at"] = start_at
+        patch["end_at"] = end_at
 
     if "clear_capacity" in data and data["clear_capacity"]:
         patch["capacity"] = None

@@ -10,6 +10,8 @@ from utils.branch_courses import assert_course_available_at_branch
 from utils.auth import hash_password
 from models.enrollment_models import Enrollment, PaymentStatus
 from models.payment_models import Payment, PaymentType, PaymentMethod, PaymentStatus as PayStatus
+from controllers.settings_controller import SettingsController
+from controllers.payment_controller import PaymentController
 
 # Token valid for 5 days (super admin only)
 ONBOARDING_TOKEN_EXPIRY_DAYS = 5
@@ -202,23 +204,43 @@ class OnboardingController:
 
         duration_months = duration_doc.get("duration_months", 1)
         end_date = start_date + timedelta(days=duration_months * 30)
-        admission_fee = 500.0
+        # Fees from admin setup via payment-info (batch fee_per_duration), not static defaults.
+        admission_fee = await SettingsController.get_default_registration_fee()
         if isinstance(branch.get("admission_fee"), (int, float)):
             admission_fee = float(branch["admission_fee"])
 
         if not await should_charge_admission_fee_for_checkout(db, student_id, {"beneficiary_type": "self"}):
             admission_fee = 0.0
 
-        fee_amount = course.get("base_fee")
+        fee_amount = None
+        try:
+            info = await PaymentController.get_course_payment_info(
+                course_id,
+                branch_id,
+                str(duration_id),
+                optional_student_id=student_id,
+            )
+            fee_amount = float(info.pricing.course_fee)
+            if admission_fee > 0 and getattr(info.pricing, "admission_fee", None) is not None:
+                admission_fee = float(info.pricing.admission_fee)
+        except Exception:
+            fee_amount = None
+
         if fee_amount is None:
-            fee_amount = course.get("pricing", {}).get("amount", 0) if isinstance(course.get("pricing"), dict) else 0
-        bp = course.get("branch_pricing") or {}
-        if branch_id in bp:
-            branch_fees = bp[branch_id]
-            if isinstance(branch_fees, dict) and duration_id in branch_fees:
-                fee_amount = branch_fees[duration_id]
-            elif isinstance(branch_fees, (int, float)):
-                fee_amount = float(branch_fees)
+            fee_amount = course.get("base_fee")
+            if fee_amount is None:
+                fee_amount = (
+                    course.get("pricing", {}).get("amount", 0)
+                    if isinstance(course.get("pricing"), dict)
+                    else 0
+                )
+            bp = course.get("branch_pricing") or {}
+            if branch_id in bp:
+                branch_fees = bp[branch_id]
+                if isinstance(branch_fees, dict) and duration_id in branch_fees:
+                    fee_amount = branch_fees[duration_id]
+                elif isinstance(branch_fees, (int, float)):
+                    fee_amount = float(branch_fees)
         if fee_amount is None:
             fee_amount = 0.0
 

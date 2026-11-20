@@ -190,9 +190,25 @@ class BranchController:
             branch_dict["description"] = description
         apply_collaboration_flag(branch_dict, flag)
         await assign_partner_org_to_branch_doc(db, branch_dict, partner_org_id)
+        # New academies are public by default (backward-compatible visibility).
+        if "is_public" not in branch_dict or branch_dict.get("is_public") is None:
+            branch_dict["is_public"] = True
         
         await db.branches.insert_one(branch_dict)
         await sync_branch_courses_from_assignments(db, branch.id, branch_dict)
+
+        if partner_org_id:
+            from utils.academy_ownership_audit import record_academy_ownership_change
+
+            b_info = branch_dict.get("branch") if isinstance(branch_dict.get("branch"), dict) else {}
+            await record_academy_ownership_change(
+                branch_id=branch_dict.get("id") or branch.id,
+                branch_name=b_info.get("name"),
+                previous_partner_org_id=None,
+                new_partner_org_id=str(partner_org_id).strip() or None,
+                current_user=current_user,
+                reason="Created under Partner",
+            )
 
         mid = branch_dict.get("manager_id")
         if mid:
@@ -257,14 +273,42 @@ class BranchController:
             tenant_or_rock_owned_filter,
         )
 
-        # Partner → own tenant only; Rock SA/BM → rock-owned only (no partner /
-        # collaboration-partner branches on the main RMA dashboard).
+        # Partner → own tenant only.
+        # Rock Super Admin → all physical branches (Rock-owned + Partner Branches).
+        # Other Rock roles (BM/coach) → rock-owned only (exclude partner tenants).
+        role_val = str(current_user.get("role") or "").lower()
+        is_super = role_val in ("super_admin", "superadmin")
         if partner_org_id_of(current_user):
+            # Partner dashboard: own genuine academies only (never auto stubs).
+            from utils.academy_visibility import genuine_academy_mongo_clause
+
             filter_query = tenant_or_rock_owned_filter(filter_query, current_user)
+            filter_query = merge_and_clause(filter_query, genuine_academy_mongo_clause())
+        elif is_super:
+            filter_query = merge_and_clause(
+                filter_query,
+                {"created_via": {"$ne": "partner_org_auto_branch"}},
+            )
         else:
             filter_query = merge_and_clause(filter_query, rock_dashboard_branch_clause())
 
         branches = await db.branches.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
+
+        # Enrich partner org names for SA Partner label
+        org_ids = list(
+            {
+                str(b.get("partner_org_id") or "").strip()
+                for b in branches
+                if str(b.get("partner_org_id") or "").strip()
+            }
+        )
+        org_name_by_id: dict = {}
+        if org_ids:
+            async for org in db.partner_organizations.find(
+                {"id": {"$in": org_ids}}, {"_id": 0, "id": 1, "name": 1, "slug": 1}
+            ):
+                if org.get("id"):
+                    org_name_by_id[str(org["id"])] = org
 
         for b in branches:
             b_info = b.get("branch") if isinstance(b.get("branch"), dict) else {}
@@ -272,6 +316,14 @@ class BranchController:
                 b["name"] = b_info.get("name")
             if not b.get("code") and b_info.get("code"):
                 b["code"] = b_info.get("code")
+            org_id = str(b.get("partner_org_id") or "").strip()
+            if org_id and org_id in org_name_by_id:
+                org = org_name_by_id[org_id]
+                b["partner_org_name"] = org.get("name")
+                b["partner_org_slug"] = org.get("slug")
+                b["is_partner_branch"] = True
+            else:
+                b["is_partner_branch"] = bool(org_id)
 
         if not include_stats:
             for branch in branches:
@@ -337,12 +389,10 @@ class BranchController:
         """Get all branches - Public endpoint (no authentication required)"""
         db = get_db()
 
-        # Build query — physical branches only (never Partner Organization stubs).
-        query: dict = {
-            "created_via": {"$ne": "partner_org_auto_branch"},
-        }
-        if active_only:
-            query["is_active"] = True
+        # Genuine active publicly-enabled academies; hide disabled/expired partners.
+        from utils.academy_visibility import public_academy_mongo_clause_for_db
+
+        query = await public_academy_mongo_clause_for_db(db, active_only=active_only)
 
         # Apply pagination with limit for public endpoint
         if limit > 100:
@@ -355,10 +405,14 @@ class BranchController:
         # Get total count
         total = await db.branches.count_documents(query)
 
+        from utils.google_place_rating import enrich_branches_google_ratings
+
+        await enrich_branches_google_ratings(db, branches)
         formatted_branches = []
         for branch in branches:
             await _enrich_course_schedule_trainers(db, branch)
             formatted_branches.append(BranchController._public_list_item(branch))
+        await BranchController._enrich_public_partner_names(db, formatted_branches)
 
         return {
             "message": f"Retrieved {len(formatted_branches)} branches successfully",
@@ -395,6 +449,7 @@ class BranchController:
 
         branches = await db.branches.find(query).limit(100).to_list(length=100)
         formatted = [BranchController._public_list_item(branch) for branch in branches]
+        await BranchController._enrich_public_partner_names(db, formatted)
         return {
             "branches": formatted,
             "total": len(formatted),
@@ -405,9 +460,16 @@ class BranchController:
         branch_info = branch.get("branch") or {}
         operational = branch.get("operational_details") or {}
         assignments = branch.get("assignments") or {}
+        org_id = str(branch.get("partner_org_id") or "").strip() or None
+        partner_name = str(branch.get("partner_org_name") or "").strip() or None
+        branch_name = branch_info.get("name")
+        # Public brand label: partner org name when assigned, else Rock Martial Arts.
+        brand_name = partner_name if org_id and partner_name else (
+            "Rock Martial Arts" if not org_id else None
+        )
         return {
             "id": branch.get("id"),
-            "name": branch_info.get("name"),
+            "name": branch_name,
             "code": branch_info.get("code"),
             "email": branch_info.get("email"),
             "phone": branch_info.get("phone"),
@@ -420,7 +482,9 @@ class BranchController:
                 "address": branch_info.get("address", {}),
             },
             "location_id": branch.get("location_id"),
-            "partner_org_id": branch.get("partner_org_id"),
+            "partner_org_id": org_id,
+            "partner_org_name": partner_name,
+            "brand_name": brand_name or "Rock Martial Arts",
             "slug": branch.get("slug") or BranchController._name_to_slug(
                 str(branch_info.get("name") or "")
             ),
@@ -429,7 +493,11 @@ class BranchController:
             "is_collaboration_partner": bool(branch.get("allows_collaboration", False))
             or bool(branch.get("is_collaboration_partner", False)),
             "is_active": branch.get("is_active", True),
-            "admission_fee": branch.get("admission_fee", 500.0),
+            # Missing is_public ⇒ publicly visible (backward compatible).
+            "is_public": branch.get("is_public") is not False,
+            "admission_fee": branch.get("admission_fee"),
+            "admission_fee_mode": branch.get("admission_fee_mode") or "fixed",
+            "admission_fee_by_course": branch.get("admission_fee_by_course") or {},
             "latitude": branch.get("latitude"),
             "longitude": branch.get("longitude"),
             "coordinates": branch.get("coordinates"),
@@ -448,6 +516,82 @@ class BranchController:
                 "course_schedule": assignments.get("course_schedule") or [],
             },
         }
+
+    @staticmethod
+    async def _enrich_public_partner_names(db, items: list) -> list:
+        """Attach partner_org_name / brand_name / logo_url onto public branch payloads."""
+        if not items:
+            return items
+        org_ids = list(
+            {
+                str(b.get("partner_org_id") or "").strip()
+                for b in items
+                if str(b.get("partner_org_id") or "").strip()
+            }
+        )
+        name_by_id: dict = {}
+        logo_by_id: dict = {}
+        if org_ids:
+            async for org in db.partner_organizations.find(
+                {"id": {"$in": org_ids}}, {"_id": 0, "id": 1, "name": 1}
+            ):
+                if org.get("id"):
+                    name_by_id[str(org["id"])] = str(org.get("name") or "").strip()
+            async for branding in db.partner_org_branding.find(
+                {"partner_org_id": {"$in": org_ids}},
+                {"_id": 0, "partner_org_id": 1, "media": 1},
+            ):
+                oid = str(branding.get("partner_org_id") or "").strip()
+                media = branding.get("media") or {}
+                logo = str((media or {}).get("logo_url") or "").strip()
+                if oid and logo:
+                    logo_by_id[oid] = logo
+
+        platform_logo = ""
+        try:
+            from utils.platform_branding import get_platform_branding
+
+            platform = await get_platform_branding(db)
+            platform_logo = str(
+                platform.get("navbar_logo") or platform.get("footer_logo") or ""
+            ).strip()
+        except Exception:
+            platform_logo = ""
+
+        # Also pull per-branch academy logos when stored on the source docs
+        branch_ids = [str(b.get("id") or "").strip() for b in items if b.get("id")]
+        academy_logo_by_id: dict = {}
+        if branch_ids:
+            async for raw in db.branches.find(
+                {"id": {"$in": branch_ids}},
+                {"_id": 0, "id": 1, "site_branding": 1},
+            ):
+                bid = str(raw.get("id") or "").strip()
+                site = raw.get("site_branding") or {}
+                if isinstance(site, dict):
+                    logo = str(site.get("logo_url") or "").strip()
+                    if bid and logo:
+                        academy_logo_by_id[bid] = logo
+
+        for b in items:
+            org_id = str(b.get("partner_org_id") or "").strip()
+            bid = str(b.get("id") or "").strip()
+            if org_id:
+                pname = name_by_id.get(org_id) or str(b.get("partner_org_name") or "").strip()
+                b["partner_org_name"] = pname or None
+                b["brand_name"] = pname or "Partner"
+                b["logo_url"] = (
+                    academy_logo_by_id.get(bid)
+                    or logo_by_id.get(org_id)
+                    or platform_logo
+                    or None
+                )
+            else:
+                b["partner_org_id"] = None
+                b["partner_org_name"] = None
+                b["brand_name"] = "Rock Martial Arts"
+                b["logo_url"] = academy_logo_by_id.get(bid) or platform_logo or None
+        return items
 
     @staticmethod
     async def _public_courses_for_branch(db, branch: dict) -> list:
@@ -470,6 +614,16 @@ class BranchController:
         ]
         branch_id = branch.get("id")
         cards = []
+        # Live fees from academy/batch setup (same source as payment-info / course detail).
+        from controllers.course_controller import (
+            _collect_coach_ids_from_branch_schedule,
+            _public_branch_batches_for_course,
+            _user_display_names_by_ids,
+        )
+
+        coach_ids = _collect_coach_ids_from_branch_schedule(branch)
+        coach_names = await _user_display_names_by_ids(db, coach_ids)
+
         for course in courses:
             pricing = course.get("pricing") or {}
             branch_prices = pricing.get("branch_prices") or []
@@ -477,6 +631,51 @@ class BranchController:
             src = branch_entry or pricing
             media = course.get("media_resources") or {}
             hero = ((course.get("page_content") or {}).get("hero_section") or {}).get("hero_image")
+            course_id = course.get("id")
+            fees = {
+                "currency": src.get("currency") or pricing.get("currency", "INR"),
+                "amount": src.get("amount"),
+                "fee_1_month": src.get("fee_1_month"),
+                "fee_3_months": src.get("fee_3_months"),
+                "fee_6_months": src.get("fee_6_months"),
+                "fee_1_year": src.get("fee_1_year"),
+                "fee_per_duration": src.get("fee_per_duration"),
+            }
+            if course_id:
+                branch_batches = await _public_branch_batches_for_course(
+                    branch, course_id, coach_names, db=db
+                )
+                live_fpd: dict = {}
+                live_amounts = []
+                for bat in branch_batches:
+                    fpd = bat.get("fee_per_duration") or {}
+                    if isinstance(fpd, dict):
+                        for k, v in fpd.items():
+                            if v is None:
+                                continue
+                            try:
+                                fv = float(v)
+                            except (TypeError, ValueError):
+                                continue
+                            if fv <= 0:
+                                continue
+                            live_amounts.append(fv)
+                            if k not in live_fpd or fv < float(live_fpd[k]):
+                                live_fpd[k] = fv
+                    bf = bat.get("batch_fee")
+                    if bf is not None:
+                        try:
+                            bfv = float(bf)
+                            if bfv > 0:
+                                live_amounts.append(bfv)
+                        except (TypeError, ValueError):
+                            pass
+                if live_fpd:
+                    fees["fee_per_duration"] = live_fpd
+                if live_amounts:
+                    lowest = min(live_amounts)
+                    fees["amount"] = lowest
+                    fees["fee_1_month"] = lowest
             cards.append({
                 "id": course.get("id"),
                 "title": course.get("title"),
@@ -492,21 +691,16 @@ class BranchController:
                 "media_resources": {
                     "course_image_url": media.get("course_image_url") or hero,
                 },
-                "pricing": {
-                    "currency": src.get("currency") or pricing.get("currency", "INR"),
-                    "amount": src.get("amount"),
-                    "fee_1_month": src.get("fee_1_month"),
-                    "fee_3_months": src.get("fee_3_months"),
-                    "fee_6_months": src.get("fee_6_months"),
-                    "fee_1_year": src.get("fee_1_year"),
-                    "fee_per_duration": src.get("fee_per_duration"),
-                },
+                "pricing": fees,
                 "available_durations": duration_rows,
             })
         return cards
 
     @staticmethod
     async def _public_branch_detail(db, branch: dict) -> dict:
+        from utils.google_place_rating import ensure_branch_google_rating
+
+        await ensure_branch_google_rating(db, branch, force=False)
         await _enrich_course_schedule_trainers(db, branch)
         payload = BranchController._public_list_item(branch)
         payload["description"] = branch.get("description")
@@ -530,69 +724,48 @@ class BranchController:
         for key in ("manager_id", "bank_details", "bank_info", "bank_account"):
             payload.pop(key, None)
 
-        # Partner-org branches: attach their own site branding for the public
-        # branch detail page (treated as a normal branch URL, not a partner directory).
-        org_id = str(branch.get("partner_org_id") or "").strip()
-        if org_id:
-            try:
-                org = await db.partner_organizations.find_one({"id": org_id})
-                branding = await db.partner_org_branding.find_one({"partner_org_id": org_id})
-                if org:
-                    media = (branding or {}).get("media") or {}
-                    content = (branding or {}).get("content") or {}
-                    facilities = (branding or {}).get("facilities") or {}
-                    social = (branding or {}).get("social_links") or {}
-                    contact_page = (branding or {}).get("contact_page") or {}
-                    footer = (branding or {}).get("footer") or {}
-                    payload["partner_org_slug"] = org.get("slug")
-                    payload["partner_org_name"] = org.get("name")
-                    payload["has_own_branding"] = bool(branding)
-                    payload["site_branding"] = {
-                        "org_name": org.get("name"),
-                        "org_slug": org.get("slug"),
-                        "logo_url": media.get("logo_url"),
-                        "logo_alt": media.get("logo_alt"),
-                        "cover_banner_url": media.get("cover_banner_url"),
-                        "cover_banner_alt": media.get("cover_banner_alt"),
-                        "tagline": content.get("tagline"),
-                        "short_description": content.get("short_description"),
-                        "about_content": content.get("about_content"),
-                        "vision": content.get("vision"),
-                        "mission": content.get("mission"),
-                        "our_story": content.get("our_story"),
-                        "why_choose_us": content.get("why_choose_us"),
-                        "facilities": facilities.get("facilities") or [],
-                        "parking_info": facilities.get("parking_info"),
-                        "location_highlights": facilities.get("location_highlights") or [],
-                        "map_embed_url": facilities.get("map_embed_url")
-                        or contact_page.get("map_embed_url"),
-                        "social_links": social,
-                        "contact": {
-                            "headline": contact_page.get("headline"),
-                            "intro": contact_page.get("intro"),
-                            "address": contact_page.get("address") or org.get("address"),
-                            "phone": contact_page.get("phone") or org.get("phone"),
-                            "email": contact_page.get("email") or org.get("email"),
-                        },
-                        "footer": {
-                            "logo_url": footer.get("logo_url"),
-                            "description": footer.get("description"),
-                        },
-                    }
-                    # Prefer partner cover on the branch page when branch has none.
-                    if not payload.get("cover_image_url") and media.get("cover_banner_url"):
-                        payload["cover_image_url"] = media.get("cover_banner_url")
-                    if not payload.get("description") and (
-                        content.get("short_description") or content.get("tagline")
-                    ):
-                        payload["description"] = (
-                            content.get("short_description") or content.get("tagline")
-                        )
-            except Exception:
-                logger.exception(
-                    "Failed attaching partner site branding for branch %s",
-                    branch.get("id"),
-                )
+        # Branding hierarchy: academy site_branding → partner org → RMAA default.
+        from utils.academy_branding import resolve_public_academy_branding
+
+        payload.pop("site_branding", None)
+        payload["has_own_branding"] = False
+        payload["brand_name"] = "Rock Martial Arts"
+        try:
+            resolved = await resolve_public_academy_branding(db, branch)
+            org_id = resolved.get("partner_org_id")
+            payload["partner_org_id"] = org_id
+            payload["partner_org_name"] = resolved.get("partner_org_name")
+            payload["partner_org_slug"] = resolved.get("partner_org_slug")
+            payload["brand_name"] = resolved.get("brand_name") or "Rock Martial Arts"
+            payload["has_own_branding"] = bool(resolved.get("has_own_branding"))
+            payload["branding_sources"] = resolved.get("branding_sources") or []
+            if org_id:
+                payload["page_cms_enabled"] = resolved.get("page_cms_enabled")
+                payload["public_footer_enabled"] = resolved.get("public_footer_enabled")
+            site = resolved.get("site_branding")
+            if site and (org_id or "academy" in (resolved.get("branding_sources") or [])):
+                # Only expose partner/academy overlay branding on partner academies,
+                # or academy-specific branding when present.
+                if org_id or "academy" in (resolved.get("branding_sources") or []):
+                    payload["site_branding"] = site if org_id else None
+                    if org_id:
+                        payload["site_branding"] = site
+                        if not payload.get("cover_image_url") and site.get("cover_banner_url"):
+                            payload["cover_image_url"] = site.get("cover_banner_url")
+                        if not payload.get("description") and (
+                            site.get("short_description") or site.get("tagline")
+                        ):
+                            payload["description"] = (
+                                site.get("short_description") or site.get("tagline")
+                            )
+            # Raw academy overlay (for dashboard editors) when present on the branch doc.
+            if isinstance(branch.get("site_branding"), dict):
+                payload["academy_branding"] = branch.get("site_branding")
+        except Exception:
+            logger.exception(
+                "Failed resolving academy branding for branch %s",
+                branch.get("id"),
+            )
 
         return payload
 
@@ -617,9 +790,12 @@ class BranchController:
             q=q,
             active_only=active_only,
         )
-        # Exclude Partner Organization auto-stub branches — only real physical branches.
-        auto_stub_clause = {"created_via": {"$ne": "partner_org_auto_branch"}}
-        query = {"$and": [query, auto_stub_clause]} if query else auto_stub_clause
+        # Genuine academies only: not stubs, active, publicly enabled; partner org must be active.
+        from utils.academy_visibility import merge_public_academy_clause_for_db
+
+        query = await merge_public_academy_clause_for_db(
+            db, query, active_only=active_only
+        )
         if collaboration_partners_only:
             partner_clause = {
                 "$or": [
@@ -630,10 +806,14 @@ class BranchController:
             query = {"$and": [query, partner_clause]} if query else partner_clause
         total = await db.branches.count_documents(query)
         branches = await db.branches.find(query).skip(skip).limit(limit).to_list(limit)
+        from utils.google_place_rating import enrich_branches_google_ratings
+
+        await enrich_branches_google_ratings(db, branches)
         formatted = []
         for branch in branches:
             await _enrich_course_schedule_trainers(db, branch)
             formatted.append(BranchController._public_list_item(branch))
+        await BranchController._enrich_public_partner_names(db, formatted)
         return {
             "message": f"Retrieved {len(formatted)} branches successfully",
             "branches": formatted,
@@ -652,8 +832,12 @@ class BranchController:
     async def get_branch_public(branch_id: str):
         """Get one branch by ID for public detail page (no auth)."""
         db = get_db()
-        branch = await db.branches.find_one({"id": branch_id, "is_active": True})
-        if not branch:
+        from utils.academy_visibility import is_academy_publicly_visible_db
+
+        branch = await db.branches.find_one({"id": branch_id})
+        if not branch or not await is_academy_publicly_visible_db(
+            db, branch, require_active=True
+        ):
             raise HTTPException(status_code=404, detail="Branch not found")
         return await BranchController._public_branch_detail(db, branch)
 
@@ -669,23 +853,45 @@ class BranchController:
         return s or "branch"
 
     @staticmethod
+    async def resolve_branch_doc(db, branch_id_or_slug: str):
+        """Resolve academy by UUID id or public slug (admin dashboard URLs use name slugs)."""
+        key = (branch_id_or_slug or "").strip()
+        if not key:
+            return None
+        branch = await db.branches.find_one({"id": key})
+        if branch:
+            return branch
+        slug = key.lower()
+        return await db.branches.find_one({"slug": slug})
+
+    @staticmethod
     async def get_branch_by_slug(slug: str):
         """Get one branch by URL slug for public detail page (no auth). Slug matches branch name normalized."""
         if not slug or not slug.strip():
             raise HTTPException(status_code=404, detail="Branch not found")
         slug = slug.strip().lower()
         db = get_db()
+        from utils.academy_visibility import (
+            is_academy_publicly_visible_db,
+            public_academy_mongo_clause_for_db,
+        )
+
+        pub = await public_academy_mongo_clause_for_db(db, active_only=True)
         # Prefer stored slug (S02); fall back to name-derived slug for older rows.
-        stored = await db.branches.find_one({"slug": slug, "is_active": True})
-        if stored:
+        stored = await db.branches.find_one({"slug": slug})
+        if stored and await is_academy_publicly_visible_db(
+            db, stored, require_active=True
+        ):
             return await BranchController._public_branch_detail(db, stored)
         # If slug looks like UUID, try by id first
         if re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", slug, re.I):
-            branch = await db.branches.find_one({"id": slug, "is_active": True})
-            if branch:
+            branch = await db.branches.find_one({"id": slug})
+            if branch and await is_academy_publicly_visible_db(
+                db, branch, require_active=True
+            ):
                 return await BranchController._public_branch_detail(db, branch)
-        # Find by name slug (check both nested branch.name and top-level name)
-        branches = await db.branches.find({"is_active": True}).to_list(length=500)
+        # Find by name slug among publicly visible academies only.
+        branches = await db.branches.find(pub).to_list(length=500)
         for b in branches:
             name = (b.get("branch") or {}).get("name") or b.get("name") or ""
             if not name:
@@ -705,6 +911,11 @@ class BranchController:
 
         db = get_db()
 
+        branch = await BranchController.resolve_branch_doc(db, branch_id)
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        branch_id = branch["id"]
+
         # Check role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
@@ -712,10 +923,6 @@ class BranchController:
             managed_branches = current_user.get("managed_branches", [])
             if branch_id not in managed_branches:
                 raise HTTPException(status_code=403, detail="You don't have permission to access this branch")
-
-        branch = await db.branches.find_one({"id": branch_id})
-        if not branch:
-            raise HTTPException(status_code=404, detail="Branch not found")
 
         from utils.partner_tenant import assert_tenant_doc_access
 
@@ -768,6 +975,18 @@ class BranchController:
         await _enrich_course_schedule_trainers(db, branch_with_stats)
         enrich_collaboration_flag(branch_with_stats)
 
+        org_id = str(branch_with_stats.get("partner_org_id") or "").strip()
+        if org_id:
+            org = await db.partner_organizations.find_one(
+                {"id": org_id}, {"_id": 0, "id": 1, "name": 1, "slug": 1}
+            )
+            if org:
+                branch_with_stats["partner_org_name"] = org.get("name")
+                branch_with_stats["partner_org_slug"] = org.get("slug")
+            branch_with_stats["is_partner_branch"] = True
+        else:
+            branch_with_stats["is_partner_branch"] = False
+
         return serialize_doc(branch_with_stats)
 
     @staticmethod
@@ -781,6 +1000,11 @@ class BranchController:
 
         db = get_db()
 
+        branch = await BranchController.resolve_branch_doc(db, branch_id)
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branch not found")
+        branch_id = branch["id"]
+
         # Check role-based access control
         current_role = current_user.get("role")
         if current_role == "branch_manager":
@@ -788,10 +1012,6 @@ class BranchController:
             managed_branches = current_user.get("managed_branches", [])
             if branch_id not in managed_branches:
                 raise HTTPException(status_code=403, detail="You don't have permission to access this branch")
-
-        branch = await db.branches.find_one({"id": branch_id})
-        if not branch:
-            raise HTTPException(status_code=404, detail="Branch not found")
 
         # Count coaches assigned to this branch
         coach_count = 0
@@ -907,9 +1127,10 @@ class BranchController:
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid user role")
         
-        existing_branch_for_tenant = await db.branches.find_one({"id": branch_id})
+        existing_branch_for_tenant = await BranchController.resolve_branch_doc(db, branch_id)
         if not existing_branch_for_tenant:
             raise HTTPException(status_code=404, detail="Branch not found")
+        branch_id = existing_branch_for_tenant["id"]
         from utils.partner_tenant import (
             assert_tenant_doc_access,
             assign_partner_org_to_branch_doc,
@@ -950,15 +1171,62 @@ class BranchController:
         if not existing_for_geo:
             raise HTTPException(status_code=404, detail="Branch not found")
 
-        # Partner org assignment (Rock SA only); partners cannot reassign
-        if "partner_org_id" in update_data:
-            if is_partner_super_admin(current_user):
+        role_val = str(current_user.get("role") or "").lower()
+        is_super = role_val in ("super_admin", "superadmin")
+
+        # Partner SA must have Super Admin–approved Edit Academy access for this branch.
+        if is_partner_super_admin(current_user):
+            org_id = str(current_user.get("partner_org_id") or "").strip()
+            branch_org = str(existing_for_geo.get("partner_org_id") or "").strip()
+            if not org_id or org_id != branch_org:
                 raise HTTPException(
                     status_code=403,
-                    detail="Partners cannot change branch organization assignment",
+                    detail="Partners can only edit their assigned academies",
                 )
-            role_val = str(current_user.get("role") or "").lower()
-            if role_val not in ("super_admin", "superadmin"):
+            from utils.partner_branding_approval import assert_partner_can_edit_branding
+
+            await assert_partner_can_edit_branding(org_id, branch_id=branch_id)
+            # Partners never reassign ownership — ignore accidental partner_org_id in payload.
+            update_data.pop("partner_org_id", None)
+            update_data.pop("is_public", None)
+            update_data.pop("allows_collaboration", None)
+            update_data.pop("is_collaboration_partner", None)
+            # Branding CMS lives on Organization Branding — ignore overlay patches here.
+            update_data.pop("site_branding", None)
+
+        # Public visibility — Super Admin only (partners cannot hide/show academies).
+        if "is_public" in update_data:
+            if not is_super:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only Super Admin can change public academy visibility",
+                )
+            update_data["is_public"] = bool(update_data.get("is_public"))
+
+        # Per-academy branding overlay (Rock SA only; partners use Organization Branding)
+        ownership_reason = update_data.pop("ownership_change_reason", None)
+        if "site_branding" in update_data:
+            if not is_super:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Academy branding overlays are managed by Super Admin; partners use Organization Branding",
+                )
+            from utils.academy_branding import normalize_academy_branding_patch
+
+            raw_branding = update_data.get("site_branding")
+            if raw_branding is None:
+                update_data["site_branding"] = None
+            elif isinstance(raw_branding, dict):
+                update_data["site_branding"] = normalize_academy_branding_patch(raw_branding)
+            else:
+                raise HTTPException(status_code=400, detail="Invalid site_branding payload")
+
+        # Partner org assignment (Rock SA only); partners cannot reassign
+        previous_partner_org_id = str(existing_for_geo.get("partner_org_id") or "").strip() or None
+        ownership_changed = False
+        new_partner_org_id = previous_partner_org_id
+        if "partner_org_id" in update_data:
+            if not is_super:
                 raise HTTPException(
                     status_code=403,
                     detail="Only Super Admin can assign a partner to a branch",
@@ -971,6 +1239,8 @@ class BranchController:
                 org_id,
                 exclude_branch_id=branch_id,
             )
+            new_partner_org_id = org_id
+            ownership_changed = (previous_partner_org_id or None) != (org_id or None)
 
         if (
             "allows_collaboration" in update_data
@@ -1074,6 +1344,19 @@ class BranchController:
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Branch not found")
+
+        if ownership_changed:
+            from utils.academy_ownership_audit import record_academy_ownership_change
+
+            binfo = existing_for_geo.get("branch") if isinstance(existing_for_geo.get("branch"), dict) else {}
+            await record_academy_ownership_change(
+                branch_id=branch_id,
+                branch_name=binfo.get("name") or existing_for_geo.get("name"),
+                previous_partner_org_id=previous_partner_org_id,
+                new_partner_org_id=new_partner_org_id,
+                current_user=current_user,
+                reason=ownership_reason,
+            )
 
         if "manager_id" in update_data:
             new_mid = update_data.get("manager_id")

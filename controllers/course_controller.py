@@ -155,6 +155,16 @@ async def _public_branch_batches_for_course(
             if coach_names and coach_id:
                 trainer_name = coach_names.get(coach_id)
             fpd = b.get("fee_per_duration") if isinstance(b.get("fee_per_duration"), dict) else None
+            ptype = (
+                b.get("pricing_type_per_duration")
+                if isinstance(b.get("pricing_type_per_duration"), dict)
+                else None
+            )
+            enabled_map = (
+                b.get("enabled_per_duration")
+                if isinstance(b.get("enabled_per_duration"), dict)
+                else None
+            )
             max_stu = b.get("max_students")
             if max_stu is not None:
                 try:
@@ -187,6 +197,8 @@ async def _public_branch_batches_for_course(
                 "label": label,
                 "batch_fee": fee,
                 "fee_per_duration": fpd,
+                "pricing_type_per_duration": ptype,
+                "enabled_per_duration": enabled_map,
                 "days": days,
                 "start_time": st,
                 "end_time": et,
@@ -201,6 +213,58 @@ async def _public_branch_batches_for_course(
             out.append(row)
         return out
     return []
+
+
+def _positive_fee_value(value: Any) -> bool:
+    try:
+        return value is not None and float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _batch_has_fee_details(bat: dict) -> bool:
+    """True when a public batch has at least one usable fee for registration."""
+    if not isinstance(bat, dict):
+        return False
+    fpd = bat.get("fee_per_duration") or {}
+    enabled = bat.get("enabled_per_duration") or {}
+    if isinstance(fpd, dict):
+        for key, raw in fpd.items():
+            if not _positive_fee_value(raw):
+                continue
+            if isinstance(enabled, dict) and key in enabled and not bool(enabled.get(key)):
+                continue
+            return True
+    return _positive_fee_value(bat.get("batch_fee"))
+
+
+def _filter_enrollable_batches(branch_batches: list) -> list:
+    return [b for b in (branch_batches or []) if _batch_has_fee_details(b)]
+
+
+def _duration_keys_with_fees(branch_batches: list) -> set:
+    """Duration id/code keys that have a positive fee on at least one enrollable batch."""
+    keys: set = set()
+    only_flat_batch_fee = False
+    for bat in branch_batches or []:
+        if not _batch_has_fee_details(bat):
+            continue
+        fpd = bat.get("fee_per_duration") or {}
+        enabled = bat.get("enabled_per_duration") or {}
+        found_fpd = False
+        if isinstance(fpd, dict):
+            for key, raw in fpd.items():
+                if not _positive_fee_value(raw):
+                    continue
+                if isinstance(enabled, dict) and key in enabled and not bool(enabled.get(key)):
+                    continue
+                keys.add(str(key))
+                found_fpd = True
+        if not found_fpd and _positive_fee_value(bat.get("batch_fee")):
+            only_flat_batch_fee = True
+    if only_flat_batch_fee and not keys:
+        return set()  # caller treats empty set + enrollable batches as "all durations"
+    return keys
 
 
 def _timing_field(t: Dict[str, Any], *keys: str) -> str:
@@ -541,9 +605,22 @@ class CourseController:
             if not managed_branch_ids:
                 return {"courses": []}
 
-        from utils.partner_tenant import apply_tenant_filter
+        from utils.partner_tenant import (
+            merge_and_clause,
+            partner_assigned_course_ids,
+            partner_courses_list_filter,
+            partner_org_id_of,
+        )
 
-        filter_query = apply_tenant_filter(filter_query, current_user)
+        # Partners: own courses + Rock courses already assigned to their branch(es).
+        # Do not re-stamp Rock masters onto the partner tenant.
+        org_id = partner_org_id_of(current_user)
+        if org_id:
+            assigned_ids = await partner_assigned_course_ids(db, current_user)
+            filter_query = merge_and_clause(
+                filter_query,
+                partner_courses_list_filter(org_id, assigned_ids),
+            )
 
         courses = await db.courses.find(filter_query).skip(skip).limit(limit).to_list(length=limit)
 
@@ -662,9 +739,16 @@ class CourseController:
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
 
-        from utils.partner_tenant import assert_tenant_doc_access
+        from utils.partner_tenant import (
+            assert_partner_course_read_access,
+            assert_tenant_doc_access,
+            partner_org_id_of,
+        )
 
-        assert_tenant_doc_access(course, current_user, entity="course")
+        if partner_org_id_of(current_user):
+            await assert_partner_course_read_access(db, course, current_user, entity="course")
+        else:
+            assert_tenant_doc_access(course, current_user, entity="course")
 
         if current_user.get("role") == UserRole.BRANCH_MANAGER:
             from utils.student_status_service import get_managed_branch_ids_for_user
@@ -720,8 +804,16 @@ class CourseController:
         db = get_db()
 
         try:
-            # Apply role-based access control
             current_role = current_user.get("role")
+
+            # First, get the branch to find assigned courses (id or slug)
+            from controllers.branch_controller import BranchController
+
+            branch = await BranchController.resolve_branch_doc(db, branch_id)
+            if not branch:
+                raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+            branch_id = branch["id"]
+
             if current_role == "branch_manager":
                 from utils.student_status_service import get_managed_branch_ids_for_user
 
@@ -731,11 +823,6 @@ class CourseController:
                         status_code=403,
                         detail="You can only access courses from your selected branch",
                     )
-
-            # First, get the branch to find assigned courses
-            branch = await db.branches.find_one({"id": branch_id})
-            if not branch:
-                raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
 
             from utils.partner_tenant import assert_tenant_doc_access
             assert_tenant_doc_access(branch, current_user, entity="branch")
@@ -1404,22 +1491,70 @@ class CourseController:
         branch_prices = pricing.get("branch_prices") or []
         branch_entry = next((b for b in branch_prices if b.get("branch_id") == branch_id), None)
         amount = None
-        if branch_entry:
+        branch_fee_per_duration = None
+        pricing_type_per_duration = None
+
+        # Prefer live fees from academy/batch setup (super admin / admin), not stale catalog pricing.
+        coach_ids = _collect_coach_ids_from_branch_schedule(branch)
+        coach_names = await _user_display_names_by_ids(db, coach_ids)
+        branch_batches = await _public_branch_batches_for_course(
+            branch, course_id, coach_names, db=db
+        )
+        live_fpd: dict = {}
+        live_ptype: dict = {}
+        live_amounts = []
+        for bat in branch_batches:
+            fpd = bat.get("fee_per_duration") or {}
+            if isinstance(fpd, dict):
+                for k, v in fpd.items():
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if fv <= 0:
+                        continue
+                    live_amounts.append(fv)
+                    if k not in live_fpd or fv < float(live_fpd[k]):
+                        live_fpd[k] = fv
+            pmap = bat.get("pricing_type_per_duration") or {}
+            if isinstance(pmap, dict):
+                for k, v in pmap.items():
+                    if v and k not in live_ptype:
+                        live_ptype[k] = v
+            bf = bat.get("batch_fee")
+            if bf is not None:
+                try:
+                    bfv = float(bf)
+                    if bfv > 0:
+                        live_amounts.append(bfv)
+                except (TypeError, ValueError):
+                    pass
+
+        if live_fpd:
+            branch_fee_per_duration = live_fpd
+            vals = list(live_fpd.values())
+            amount = min(vals) if vals else None
+        if live_ptype:
+            pricing_type_per_duration = live_ptype
+        if amount is None and live_amounts:
+            amount = min(live_amounts)
+
+        if amount is None and branch_entry:
             amount = branch_entry.get("amount") or branch_entry.get("fee_1_month") or branch_entry.get("fee_1_year")
             fee_per_duration = branch_entry.get("fee_per_duration")
             if amount is None and fee_per_duration and isinstance(fee_per_duration, dict):
                 vals = [v for v in fee_per_duration.values() if v is not None]
                 amount = vals[0] if vals else None
+            if branch_fee_per_duration is None and isinstance(fee_per_duration, dict):
+                branch_fee_per_duration = fee_per_duration
         if amount is None:
             amount = pricing.get("amount") or pricing.get("fee_1_month") or pricing.get("fee_1_year")
         currency = (branch_entry or {}).get("currency") or pricing.get("currency", "INR")
         price_display = f"{currency} {amount}" if amount is not None else "—"
         if currency == "INR":
             price_display = f"₹ {amount}" if amount is not None else "—"
-
-        branch_fee_per_duration = None
-        if branch_entry and isinstance(branch_entry.get("fee_per_duration"), dict):
-            branch_fee_per_duration = branch_entry.get("fee_per_duration")
 
         return {
             "branch_id": branch_id,
@@ -1428,6 +1563,7 @@ class CourseController:
             "price_display": price_display,
             "timings": timings_display,
             "fee_per_duration": branch_fee_per_duration,
+            "pricing_type_per_duration": pricing_type_per_duration,
         }
 
     @staticmethod
@@ -1476,9 +1612,13 @@ class CourseController:
                     "fee_per_duration": pricing.get("fee_per_duration"),
                 }
             # Live prices come from super-admin batch setup, not leftover course catalog amounts.
-            branch_batches = await _public_branch_batches_for_course(
+            all_batches = await _public_branch_batches_for_course(
                 branch, serialized.get("id"), coach_names, db=db
             )
+            # Registration / student-add: only courses with batches that have fee details.
+            branch_batches = _filter_enrollable_batches(all_batches)
+            if not branch_batches:
+                continue
             live_fpd: dict = {}
             live_amounts = []
             for bat in branch_batches:
@@ -1491,13 +1631,17 @@ class CourseController:
                             fv = float(v)
                         except (TypeError, ValueError):
                             continue
+                        if fv <= 0:
+                            continue
                         live_amounts.append(fv)
                         if k not in live_fpd or fv < float(live_fpd[k]):
                             live_fpd[k] = fv
                 bf = bat.get("batch_fee")
                 if bf is not None:
                     try:
-                        live_amounts.append(float(bf))
+                        bfv = float(bf)
+                        if bfv > 0:
+                            live_amounts.append(bfv)
                     except (TypeError, ValueError):
                         pass
             if live_fpd:
@@ -1506,8 +1650,13 @@ class CourseController:
                 lowest = min(live_amounts)
                 fees["amount"] = lowest
                 fees["fee_1_month"] = lowest
+            fee_duration_keys = _duration_keys_with_fees(branch_batches)
             available_durations = []
             for d in durations:
+                did = str(d.get("id") or "")
+                dcode = str(d.get("code") or "")
+                if fee_duration_keys and did not in fee_duration_keys and dcode not in fee_duration_keys:
+                    continue
                 available_durations.append({
                     "id": d["id"],
                     "name": d.get("name", d.get("id", "")),
@@ -1515,6 +1664,9 @@ class CourseController:
                     "duration_months": d.get("duration_months", 1),
                     "pricing_multiplier": d.get("pricing_multiplier", 1.0),
                 })
+            # No priced tenures configured → not enrollable via dropdowns.
+            if not available_durations:
+                continue
             result_courses.append({
                 "id": serialized.get("id"),
                 "title": serialized.get("title"),

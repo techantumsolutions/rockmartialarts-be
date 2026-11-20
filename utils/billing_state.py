@@ -22,6 +22,50 @@ def grace_days_configured() -> int:
         return 10
 
 
+def renewal_early_window_days() -> int:
+    """How many calendar days before due date renewal becomes available (default 7)."""
+    try:
+        return max(0, int(os.getenv("RENEWAL_EARLY_WINDOW_DAYS", "7") or "7"))
+    except (TypeError, ValueError):
+        return 7
+
+
+def is_renewal_window_open(
+    due_date: DateLike,
+    *,
+    now: Optional[datetime] = None,
+    window_days: Optional[int] = None,
+) -> bool:
+    """
+    Renew is allowed when due date is already past, or within the next
+    ``window_days`` calendar days (inclusive of today = due day).
+    """
+    days = renewal_early_window_days() if window_days is None else max(0, int(window_days))
+    current = _now_utc(now)
+    end_eod = subscription_end_of_day_utc(due_date)
+    if end_eod is None:
+        return False
+    days_until = (end_eod.date() - current.date()).days
+    return days_until <= days
+
+
+def assert_renewal_window_open(enrollment: Dict[str, Any], *, now: Optional[datetime] = None) -> None:
+    """Raise HTTP 400 when renew is attempted outside the early window."""
+    from fastapi import HTTPException
+
+    due = enrollment.get("next_due_date") or enrollment.get("end_date")
+    if is_renewal_window_open(due, now=now):
+        return
+    window = renewal_early_window_days()
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Renewal opens {window} day(s) before the renewal due date "
+            "(and remains available after it has passed)."
+        ),
+    )
+
+
 def _now_utc(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:

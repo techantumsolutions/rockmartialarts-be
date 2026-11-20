@@ -35,7 +35,12 @@ async def ensure_partner_org_branding_indexes(db) -> None:
 
 
 async def _partner_org_branch_docs(db, partner_org_id: str, *, active_only: bool = True) -> list:
-    q: Dict[str, Any] = {"partner_org_id": partner_org_id}
+    from utils.academy_visibility import AUTO_STUB_CREATED_VIA
+
+    q: Dict[str, Any] = {
+        "partner_org_id": partner_org_id,
+        "created_via": {"$ne": AUTO_STUB_CREATED_VIA},
+    }
     if active_only:
         q["is_active"] = True
     return await db.branches.find(q).sort([("branch.name", 1)]).to_list(200)
@@ -292,6 +297,73 @@ class PartnerOrgBrandingController:
         }
 
     @staticmethod
+    async def get_admin_branding(partner_org_id: str, current_user: dict):
+        """Rock Super Admin: read partner org Page CMS / branding."""
+        _ = current_user
+        db = get_db()
+        org = await db[ORG_COL].find_one({"id": partner_org_id})
+        if not org:
+            raise HTTPException(status_code=404, detail="Partner organization not found")
+        doc = await db[COL].find_one({"partner_org_id": partner_org_id})
+        sections = await _site_sections_for_org(db, partner_org_id)
+        if not doc:
+            out = empty_branding_response(partner_org_id, org)
+            out.update(sections)
+            return out
+        out = _serialize_branding(doc, org)
+        out.update(sections)
+        return out
+
+    @staticmethod
+    async def upsert_admin_branding(
+        partner_org_id: str, body: PartnerOrgBrandingUpsert, current_user: dict
+    ):
+        """Rock Super Admin: create/update partner org Page CMS / branding (no approval gate)."""
+        db = get_db()
+        await ensure_partner_org_branding_indexes(db)
+        org = await db[ORG_COL].find_one({"id": partner_org_id})
+        if not org:
+            raise HTTPException(status_code=404, detail="Partner organization not found")
+
+        existing = await db[COL].find_one({"partner_org_id": partner_org_id})
+        now = datetime.utcnow()
+        patch: Dict[str, Any] = {
+            "updated_at": now,
+            "updated_by": current_user.get("id"),
+        }
+        if body.media is not None:
+            patch["media"] = _dump(body.media)
+        if body.content is not None:
+            patch["content"] = _dump(body.content)
+        if body.facilities is not None:
+            patch["facilities"] = _dump(body.facilities)
+        if body.social_links is not None:
+            patch["social_links"] = _dump(body.social_links)
+        if body.contact_page is not None:
+            patch["contact_page"] = _dump(body.contact_page)
+        if body.footer is not None:
+            patch["footer"] = _dump(body.footer)
+
+        if existing:
+            await db[COL].update_one({"id": existing["id"]}, {"$set": patch})
+            doc = await db[COL].find_one({"id": existing["id"]})
+        else:
+            branding = PartnerOrgBranding(partner_org_id=partner_org_id)
+            doc = branding.dict()
+            doc.update(patch)
+            doc["id"] = doc.get("id") or str(uuid4())
+            doc["created_at"] = now
+            await db[COL].insert_one(doc)
+            doc = await db[COL].find_one({"partner_org_id": partner_org_id})
+
+        branding = _serialize_branding(doc or {}, org)
+        branding.update(await _site_sections_for_org(db, partner_org_id))
+        return {
+            "message": "Branding saved successfully",
+            "branding": branding,
+        }
+
+    @staticmethod
     async def public_directory(q: Optional[str] = None, skip: int = 0, limit: int = 50):
         from utils.partner_org_access import compute_partner_effective_status
 
@@ -356,7 +428,13 @@ class PartnerOrgBrandingController:
         if not org or compute_partner_effective_status(org) != "active":
             raise HTTPException(status_code=404, detail="Partner not found")
 
-        doc = await db[COL].find_one({"partner_org_id": org["id"]})
+        from utils.partner_org_access import partner_org_public_extras
+
+        site_flags = partner_org_public_extras(org)
+        page_cms_enabled = bool(site_flags.get("page_cms_enabled", True))
+        public_footer_enabled = bool(site_flags.get("public_footer_enabled", False))
+
+        doc = await db[COL].find_one({"partner_org_id": org["id"]}) if page_cms_enabled else None
         media = (doc or {}).get("media") or {}
         content = (doc or {}).get("content") or {}
         facilities = (doc or {}).get("facilities") or {}
@@ -373,7 +451,9 @@ class PartnerOrgBrandingController:
         return {
             "partner_org_id": org["id"],
             "slug": org.get("slug"),
-            "has_branding": bool(doc),
+            "has_branding": bool(doc) and page_cms_enabled,
+            "page_cms_enabled": page_cms_enabled,
+            "public_footer_enabled": public_footer_enabled,
             "hero": {
                 "name": org.get("name"),
                 "tagline": content.get("tagline") or content.get("short_description"),
@@ -465,21 +545,29 @@ class PartnerOrgBrandingController:
     # ── Branding edit approval ──────────────────────────────────────────
 
     @staticmethod
-    async def get_my_branding_edit_permission(current_user: dict):
+    async def get_my_branding_edit_permission(
+        current_user: dict, branch_id: Optional[str] = None
+    ):
         if not is_partner_super_admin(current_user):
             raise HTTPException(status_code=403, detail="Partner admin access only")
         org_id = require_partner_org_id(current_user)
         from utils.partner_branding_approval import get_partner_branding_permission
 
-        return await get_partner_branding_permission(org_id)
+        return await get_partner_branding_permission(org_id, branch_id=branch_id)
 
     @staticmethod
-    async def request_branding_edit(current_user: dict, note: Optional[str] = None):
+    async def request_branding_edit(
+        current_user: dict,
+        note: Optional[str] = None,
+        branch_id: Optional[str] = None,
+    ):
         if not is_partner_super_admin(current_user):
             raise HTTPException(status_code=403, detail="Partner admin access only")
         from utils.partner_branding_approval import request_branding_edit
 
-        return await request_branding_edit(current_user, note=note)
+        return await request_branding_edit(
+            current_user, note=note, branch_id=branch_id
+        )
 
     @staticmethod
     async def list_branding_edit_requests(
@@ -511,8 +599,13 @@ class PartnerOrgBrandingController:
 
     @staticmethod
     async def revoke_branding_edit_access(
-        partner_org_id: str, current_user: dict, reason: Optional[str] = None
+        partner_org_id: str,
+        current_user: dict,
+        reason: Optional[str] = None,
+        branch_id: Optional[str] = None,
     ):
         from utils.partner_branding_approval import revoke_branding_edit_access
 
-        return await revoke_branding_edit_access(partner_org_id, current_user, reason=reason)
+        return await revoke_branding_edit_access(
+            partner_org_id, current_user, reason=reason, branch_id=branch_id
+        )

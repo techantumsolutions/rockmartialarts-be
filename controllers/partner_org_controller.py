@@ -1,6 +1,7 @@
 """White-label partner organization APIs."""
 
 from models.partner_org_models import (
+    PartnerAdminResetPassword,
     PartnerCoursePermissionsUpdate,
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
@@ -9,6 +10,7 @@ from models.partner_org_models import (
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
     PartnerProfileUpdate,
+    PartnerPublicSiteSettingsUpdate,
     PartnerSetPassword,
     PartnerValidityUpdate,
 )
@@ -37,6 +39,14 @@ class PartnerOrgController:
     @staticmethod
     async def resend_invite(partner_org_id: str, current_user: dict):
         return await svc.resend_partner_invite(partner_org_id, current_user)
+
+    @staticmethod
+    async def admin_reset_password(
+        partner_org_id: str, body: PartnerAdminResetPassword, current_user: dict
+    ):
+        return await svc.admin_reset_partner_password(
+            partner_org_id, body.new_password, current_user
+        )
 
     @staticmethod
     async def set_password(body: PartnerSetPassword):
@@ -99,6 +109,14 @@ class PartnerOrgController:
         partner_org_id: str, body: PartnerCoursePermissionsUpdate, current_user: dict
     ):
         return await svc.update_partner_course_permissions(
+            partner_org_id, body, current_user
+        )
+
+    @staticmethod
+    async def patch_public_site_settings(
+        partner_org_id: str, body: PartnerPublicSiteSettingsUpdate, current_user: dict
+    ):
+        return await svc.update_partner_public_site_settings(
             partner_org_id, body, current_user
         )
 

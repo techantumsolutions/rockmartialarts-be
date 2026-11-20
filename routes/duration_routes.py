@@ -66,13 +66,19 @@ async def get_durations_by_course(
     active_only: bool = True,
     include_pricing: bool = True,
     branch_id: Optional[str] = None,
+    batch_ref: Optional[str] = None,
 ):
-    """Get available durations for a specific course - Public endpoint (no authentication required)"""
+    """Get available durations for a specific course - Public endpoint (no authentication required).
+
+    When ``branch_id`` + ``batch_ref`` are provided, tenures follow that batch's
+    enabled/fee_per_duration setup from Academy → Course Assignments.
+    """
     return await DurationController.get_durations_by_course(
         course_id,
         active_only,
         include_pricing,
         branch_id=branch_id,
+        batch_ref=batch_ref,
     )
 
 @router.get("/public/by-location-course")

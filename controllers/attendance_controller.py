@@ -1229,6 +1229,7 @@ class AttendanceController:
         date: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        include_all_coaches: bool = False,
         current_user: dict = None
     ):
         """Get coach attendance data with unified attendance system"""
@@ -1288,30 +1289,37 @@ class AttendanceController:
             # Get coaches from the coaches collection (not users collection)
             coaches = await db.coaches.find(coach_filter).to_list(length=1000)
 
-            # Attendance marking only applies to coaches with an assigned batch on an
-            # available/active course. Skip coaches with no schedulable assignment.
-            from utils.coach_batch_schedule import coach_ids_assigned_to_active_course_batches
-
-            scope_branch_ids = None
-            if managed_branch_ids is not None:
-                scope_branch_ids = list(managed_branch_ids)
-            elif partner_bids is not None:
-                scope_branch_ids = list(partner_bids or [])
-            elif branch_id:
-                scope_branch_ids = [branch_id]
-
-            eligible_coach_ids = await coach_ids_assigned_to_active_course_batches(
-                db, branch_ids=scope_branch_ids
+            user_role = str((current_user or {}).get("role") or "").lower()
+            rock_super_admin_roles = {"super_admin", "superadmin", "coach_admin"}
+            skip_assigned_batch_filter = user_role in rock_super_admin_roles and (
+                include_all_coaches or user_role in ("super_admin", "superadmin")
             )
-            if eligible_coach_ids:
-                coaches = [
-                    c
-                    for c in coaches
-                    if str(c.get("id") or "") in eligible_coach_ids
-                    or str(c.get("user_id") or "").strip() in eligible_coach_ids
-                ]
-            else:
-                coaches = []
+
+            if not skip_assigned_batch_filter:
+                # Attendance marking only applies to coaches with an assigned batch on an
+                # available/active course. Skip coaches with no schedulable assignment.
+                from utils.coach_batch_schedule import coach_ids_assigned_to_active_course_batches
+
+                scope_branch_ids = None
+                if managed_branch_ids is not None:
+                    scope_branch_ids = list(managed_branch_ids)
+                elif partner_bids is not None:
+                    scope_branch_ids = list(partner_bids or [])
+                elif branch_id:
+                    scope_branch_ids = [branch_id]
+
+                eligible_coach_ids = await coach_ids_assigned_to_active_course_batches(
+                    db, branch_ids=scope_branch_ids
+                )
+                if eligible_coach_ids:
+                    coaches = [
+                        c
+                        for c in coaches
+                        if str(c.get("id") or "") in eligible_coach_ids
+                        or str(c.get("user_id") or "").strip() in eligible_coach_ids
+                    ]
+                else:
+                    coaches = []
 
             # If single date is provided, return format compatible with branch manager attendance page
             if date:

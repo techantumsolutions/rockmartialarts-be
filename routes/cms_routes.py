@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query, status
 from controllers.cms_controller import CMSController
 from controllers.cms_residential_camp_controller import CMSResidentialCampController
-from models.cms_models import CMSContentUpdate, CMSContentResponse
+from models.cms_models import CMSContentUpdate, CMSContentResponse, BrandingSettings
 from models.cms_residential_camp_models import CampEventFields, ResidentialCampContent, ResidentialCampResponse
 from models.user_models import UserRole
 from utils.unified_auth import require_role_unified
@@ -29,6 +29,31 @@ async def get_residential_camp_public():
 async def get_cms_content_public():
     """Get CMS content for public website (no auth required)"""
     return await CMSController.get_cms_content_public()
+
+
+@router.get("/public/platform-branding")
+async def get_platform_branding_public():
+    """Platform name, logos, and colors for website + all portals (no auth)."""
+    return await CMSController.get_platform_branding_public()
+
+
+@router.get("/platform-branding")
+async def get_platform_branding(
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: read platform branding settings."""
+    return await CMSController.get_platform_branding_public()
+
+
+@router.put("/platform-branding")
+async def update_platform_branding(
+    data: BrandingSettings,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: update platform name, logos, and brand colors."""
+    return await CMSController.update_platform_branding(
+        data.dict(exclude_unset=True), current_user
+    )
 
 
 @router.put("/camp-events/{event_id}")

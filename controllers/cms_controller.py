@@ -82,7 +82,14 @@ class CMSController:
             if data.footer is not None:
                 update_data["footer"] = data.footer.dict()
             if data.branding is not None:
-                update_data["branding"] = data.branding.dict()
+                from utils.platform_branding import normalize_platform_branding_patch
+
+                existing_branding = (existing or {}).get("branding") if existing else {}
+                if not isinstance(existing_branding, dict):
+                    existing_branding = {}
+                update_data["branding"] = normalize_platform_branding_patch(
+                    {**existing_branding, **data.branding.dict(exclude_unset=True)}
+                )
             if data.page_seo is not None:
                 update_data["page_seo"] = {k: v.dict() for k, v in data.page_seo.items()}
 
@@ -106,6 +113,25 @@ class CMSController:
                     update_data["page_seo"] = {}
                 result = await collection.insert_one(update_data)
                 updated = await collection.find_one({"_id": result.inserted_id})
+
+            # Keep invoice system_name aligned with platform legal/display name
+            if "branding" in update_data:
+                try:
+                    branding = update_data["branding"] or {}
+                    await db.system_settings.update_one(
+                        {},
+                        {
+                            "$set": {
+                                "system_name": branding.get("legal_name")
+                                or branding.get("platform_name")
+                                or "Rock Martial Arts Academy",
+                                "updated_at": datetime.utcnow(),
+                            }
+                        },
+                        upsert=True,
+                    )
+                except Exception:
+                    pass
 
             return CMSController._to_response(updated)
         except HTTPException:
@@ -162,10 +188,12 @@ class CMSController:
 
     @staticmethod
     def _to_response(doc: Dict[str, Any]) -> CMSContentResponse:
+        from utils.platform_branding import branding_from_cms_doc
+
         serialized = serialize_doc(doc)
         homepage_data = serialized.get("homepage", {})
         footer_data = serialized.get("footer", {})
-        branding_data = serialized.get("branding", {})
+        branding_data = branding_from_cms_doc(serialized)
         page_seo_data = serialized.get("page_seo", {})
 
         seo_dict = {}
@@ -182,3 +210,16 @@ class CMSController:
             created_at=serialized.get("created_at"),
             updated_at=serialized.get("updated_at"),
         )
+
+    @staticmethod
+    async def get_platform_branding_public():
+        from utils.platform_branding import get_platform_branding
+
+        return {"branding": await get_platform_branding()}
+
+    @staticmethod
+    async def update_platform_branding(data: dict, current_user: dict):
+        from utils.platform_branding import save_platform_branding
+
+        branding = await save_platform_branding(data or {})
+        return {"message": "Platform branding updated", "branding": branding}

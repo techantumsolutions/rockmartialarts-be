@@ -390,25 +390,50 @@ class CoachController:
         return coach_response.dict()
 
     @staticmethod
-    async def get_public_homepage_coaches(limit: int = 8):
-        """Active coaches for homepage: display_order ASC (unset last), then created_at DESC. Max 8."""
+    async def get_public_homepage_coaches(limit: int = 8, branch_id: str = None):
+        """Active coaches for homepage / academy pages.
+
+        display_order ASC (unset last), then created_at DESC. Max 8.
+        Optional branch_id filters to coaches assigned to that physical academy.
+        """
         db = get_db()
         safe_limit = max(1, min(int(limit), 8))
+        match = {
+            "is_active": True,
+            "$or": [
+                {"approval_status": {"$exists": False}},
+                {"approval_status": "approved"},
+                {"approval_status": None},
+            ],
+        }
+        bid = str(branch_id or "").strip()
+        if bid:
+            match["branch_id"] = bid
         pipeline = [
-            {"$match": {
-                "is_active": True,
-                "$or": [
-                    {"approval_status": {"$exists": False}},
-                    {"approval_status": "approved"},
-                    {"approval_status": None},
-                ],
-            }},
+            {"$match": match},
             {"$addFields": {"_sort_ord": {"$ifNull": ["$display_order", 999999]}}},
             {"$sort": {"_sort_ord": 1, "created_at": -1}},
             {"$limit": safe_limit},
             {"$project": {"_sort_ord": 0}},
         ]
         coaches = await db.coaches.aggregate(pipeline).to_list(length=safe_limit)
+
+        # Resolve designation labels from master dropdown settings
+        designation_name: dict = {}
+        try:
+            desig_doc = await db.dropdown_settings.find_one({"category": "designations"})
+            for opt in (desig_doc or {}).get("options") or []:
+                if not isinstance(opt, dict):
+                    continue
+                oid = str(opt.get("id") or opt.get("value") or "").strip()
+                label = str(opt.get("label") or opt.get("name") or opt.get("value") or "").strip()
+                if oid and label:
+                    designation_name[oid] = label
+                if label:
+                    designation_name[label.lower()] = label
+        except Exception:
+            designation_name = {}
+
         out = []
         for c in coaches:
             pi = c.get("personal_info") or {}
@@ -417,13 +442,21 @@ class CoachController:
             about = (c.get("about_short") or "").strip()
             if len(about) > 280:
                 about = about[:277] + "..."
+            desig_id = str(prof.get("designation_id") or "").strip()
+            desig_label = (
+                designation_name.get(desig_id)
+                or designation_name.get(desig_id.lower())
+                or desig_id
+                or ""
+            )
             out.append({
                 "id": c.get("id"),
                 "full_name": name or "Coach",
-                "designation": prof.get("designation_id") or "",
+                "designation": desig_label,
                 "about_short": about,
                 "profile_image_url": c.get("profile_image_url"),
                 "rating": c.get("homepage_rating"),
+                "branch_id": c.get("branch_id"),
             })
         return {"coaches": out}
 

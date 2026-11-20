@@ -484,6 +484,14 @@ class LocationController:
         if matched_city and not location:
             location = matched_city
 
+        # Same public academy rules as /branches/public* (no stubs; honor is_public;
+        # hide academies whose partner org is disabled/expired).
+        from utils.academy_visibility import merge_public_academy_clause_for_db
+
+        branch_query = await merge_public_academy_clause_for_db(
+            db, branch_query, active_only=active_only
+        )
+
         if limit > 100:
             limit = 100
 

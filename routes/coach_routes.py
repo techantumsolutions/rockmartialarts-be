@@ -320,9 +320,12 @@ async def coach_availability_put(
 @router.get("/public/homepage")
 async def get_public_homepage_coaches(
     limit: int = Query(8, ge=1, le=8, description="Max coaches for homepage (ordered by display_order)"),
+    branch_id: Optional[str] = Query(
+        None, description="Optional academy id — return coaches assigned to that branch"
+    ),
 ):
-    """Public homepage coaches (display_order, then created_at). No authentication."""
-    return await CoachController.get_public_homepage_coaches(limit)
+    """Public homepage / academy coaches (display_order, then created_at). No authentication."""
+    return await CoachController.get_public_homepage_coaches(limit, branch_id=branch_id)
 
 @router.put("/me")
 async def update_my_profile(

@@ -15,6 +15,7 @@ from models.partner_branding_approval_models import (
     BrandingEditReviewBody,
 )
 from models.partner_org_models import (
+    PartnerAdminResetPassword,
     PartnerCoursePermissionsUpdate,
     PartnerFeaturePermissionsUpdate,
     PartnerLogin,
@@ -23,6 +24,7 @@ from models.partner_org_models import (
     PartnerOrgUpdateStatus,
     PartnerOrgVerifyPayment,
     PartnerProfileUpdate,
+    PartnerPublicSiteSettingsUpdate,
     PartnerSetPassword,
     PartnerValidityUpdate,
 )
@@ -107,10 +109,13 @@ async def upsert_my_partner_branding(
 
 @router.get("/me/branding-edit-permission")
 async def get_my_branding_edit_permission(
+    branch_id: Optional[str] = Query(None, description="Academy id for per-academy branding scope"),
     current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
 ):
-    """Partner Super Admin: current branding edit permission state."""
-    return await PartnerOrgBrandingController.get_my_branding_edit_permission(current_user)
+    """Partner Super Admin: branding edit permission (org or academy scope)."""
+    return await PartnerOrgBrandingController.get_my_branding_edit_permission(
+        current_user, branch_id=branch_id
+    )
 
 
 @router.post("/me/branding-edit-request")
@@ -118,9 +123,11 @@ async def request_branding_edit_access(
     body: BrandingEditRequestCreate = Body(default=BrandingEditRequestCreate()),
     current_user: dict = Depends(require_role_unified([UserRole.PARTNER_SUPER_ADMIN])),
 ):
-    """Partner Super Admin: request permission to edit branding page."""
+    """Partner Super Admin: request permission to edit org or academy branding."""
     return await PartnerOrgBrandingController.request_branding_edit(
-        current_user, note=(body.note if body else None)
+        current_user,
+        note=(body.note if body else None),
+        branch_id=(body.branch_id if body else None),
     )
 
 
@@ -163,10 +170,35 @@ async def reject_branding_edit_request(
 async def revoke_branding_edit_access(
     partner_org_id: str,
     body: BrandingEditReviewBody = Body(default=BrandingEditReviewBody()),
+    branch_id: Optional[str] = Query(None, description="Revoke academy-scoped branding only"),
     current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
 ):
     return await PartnerOrgBrandingController.revoke_branding_edit_access(
-        partner_org_id, current_user, reason=(body.reason if body else None)
+        partner_org_id,
+        current_user,
+        reason=(body.reason if body else None),
+        branch_id=branch_id,
+    )
+
+
+@router.get("/{partner_org_id}/branding")
+async def get_partner_org_branding_admin(
+    partner_org_id: str,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Rock Super Admin: read partner Page CMS / org branding."""
+    return await PartnerOrgBrandingController.get_admin_branding(partner_org_id, current_user)
+
+
+@router.put("/{partner_org_id}/branding")
+async def upsert_partner_org_branding_admin(
+    partner_org_id: str,
+    body: PartnerOrgBrandingUpsert,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Rock Super Admin: create/update partner Page CMS / org branding."""
+    return await PartnerOrgBrandingController.upsert_admin_branding(
+        partner_org_id, body, current_user
     )
 
 
@@ -228,6 +260,18 @@ async def resend_partner_invite(
 ):
     """Re-send partner set-password invitation email."""
     return await PartnerOrgController.resend_invite(partner_org_id, current_user)
+
+
+@router.post("/{partner_org_id}/reset-password")
+async def admin_reset_partner_password(
+    partner_org_id: str,
+    body: PartnerAdminResetPassword,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Rock Super Admin sets/resets partner admin password in Partner Profiles."""
+    return await PartnerOrgController.admin_reset_password(
+        partner_org_id, body, current_user
+    )
 
 
 @router.patch("/{partner_org_id}/status")
@@ -300,6 +344,18 @@ async def patch_partner_course_permissions(
 ):
     """Super Admin: grant/revoke Partner course create/edit permissions."""
     return await PartnerOrgController.patch_course_permissions(
+        partner_org_id, body, current_user
+    )
+
+
+@router.patch("/{partner_org_id}/public-site-settings")
+async def patch_partner_public_site_settings(
+    partner_org_id: str,
+    body: PartnerPublicSiteSettingsUpdate,
+    current_user: dict = Depends(require_role_unified([UserRole.SUPER_ADMIN])),
+):
+    """Super Admin: enable/disable partner Page CMS and public website footer."""
+    return await PartnerOrgController.patch_public_site_settings(
         partner_org_id, body, current_user
     )
 

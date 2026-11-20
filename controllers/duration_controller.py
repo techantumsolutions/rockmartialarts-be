@@ -261,6 +261,7 @@ class DurationController:
         active_only: bool = True,
         include_pricing: bool = True,
         branch_id: Optional[str] = None,
+        batch_ref: Optional[str] = None,
     ):
         """Get available durations for a specific course - Public endpoint"""
         db = get_db()
@@ -284,26 +285,29 @@ class DurationController:
             from controllers.payment_controller import (
                 _course_branch_pricing_map,
                 _course_fee_per_duration_map,
+                _batches_for_course_on_branch,
+                _resolve_branch_batch,
             )
 
             branch = await db.branches.find_one({"id": branch_id})
             if not branch:
+                # Also allow slug resolution for academy dashboard URLs
+                from controllers.branch_controller import BranchController
+
+                branch = await BranchController.resolve_branch_doc(db, branch_id)
+            if not branch:
                 raise HTTPException(status_code=404, detail="Branch not found")
 
             branch_pricing_all = _course_branch_pricing_map(course)
-            bp_entry = branch_pricing_all.get(branch_id)
+            bp_entry = branch_pricing_all.get(branch.get("id") or branch_id)
             if isinstance(bp_entry, dict):
                 branch_pricing_for_course = bp_entry
 
-            assignments = branch.get("assignments", {}) or {}
-            course_schedule = assignments.get("course_schedule", []) or []
-            for entry in course_schedule:
-                if str(entry.get("course_id", "")) != str(course_id):
-                    continue
-                batches = entry.get("batches", []) or []
-                if batches:
-                    branch_batch = batches[0]
-                break
+            batches = _batches_for_course_on_branch(branch, course_id)
+            if batch_ref and str(batch_ref).strip():
+                branch_batch = _resolve_branch_batch(batches, batch_ref)
+            if branch_batch is None and batches:
+                branch_batch = batches[0]
 
         # Enrich durations with pricing calculations
         enriched_durations = []
@@ -328,8 +332,8 @@ class DurationController:
 
             duration_enabled = True
             price_raw = None
-            # Match payment_controller: fee_per_duration cells are package totals unless marked monthly.
-            pricing_type = "flat"
+            # Align with Course Assignments UI: default Monthly. Flat = fixed package.
+            pricing_type = "monthly"
             used_branch_config = False
 
             # Super-admin batch fees are the live price source. Course-level branch_pricing
@@ -352,7 +356,11 @@ class DurationController:
                     if key in batch_fee_per_duration:
                         price_raw = batch_fee_per_duration.get(key)
                         pt = batch_pricing_type_per_duration.get(key)
-                        pricing_type = pt if pt is not None and str(pt).strip() else "flat"
+                        pricing_type = (
+                            str(pt).strip().lower()
+                            if pt is not None and str(pt).strip()
+                            else "monthly"
+                        )
                         used_branch_config = True
                         break
 
@@ -368,11 +376,16 @@ class DurationController:
                     if key in course_fee_per_duration:
                         price_raw = course_fee_per_duration.get(key)
                         pt = course_pricing_type_per_duration.get(key)
-                        pricing_type = pt if pt is not None and str(pt).strip() else "flat"
+                        pricing_type = (
+                            str(pt).strip().lower()
+                            if pt is not None and str(pt).strip()
+                            else "monthly"
+                        )
                         break
 
             calculated_price = None
             if include_pricing:
+                months = float(duration.get("duration_months", 0) or 0) or float(multiplier or 1)
                 if price_raw is not None:
                     try:
                         parsed = float(price_raw)
@@ -383,8 +396,17 @@ class DurationController:
                         if str(pricing_type).lower() == "flat":
                             calculated_price = parsed
                         else:
-                            calculated_price = parsed * float(duration.get("duration_months", 0) or 0)
-                elif not branch_batch:
+                            calculated_price = parsed * months
+                elif branch_batch:
+                    # Tenure blank: monthly × months when a monthly base exists
+                    from controllers.payment_controller import _monthly_base_fee_from_batch
+
+                    monthly_base = _monthly_base_fee_from_batch(branch_batch, durations)
+                    if monthly_base is not None and monthly_base > 0 and months > 0:
+                        calculated_price = monthly_base * months
+                        pricing_type = "monthly"
+                        used_branch_config = True
+                else:
                     calculated_price = base_price * multiplier
 
             if branch_batch and used_branch_config:

@@ -233,13 +233,24 @@ async def pick_login_student(db, acc: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 
 async def sync_account_password(db, user: Dict[str, Any], password_hash: str) -> None:
-    """Keep account + sibling student hashes in sync after a password reset."""
+    """Keep account + sibling student hashes in sync after a password reset.
+
+    Partner org admins authenticate via ``password_hash`` (see login_partner).
+    Always write both ``password`` and ``password_hash`` so generic auth reset
+    and partner login stay compatible.
+    """
     account_id = user.get("account_id")
     acc = await get_account(db, account_id) if account_id else None
     if not acc:
         email = (user.get("email") or "").strip().lower()
         acc = await get_account_by_email(db, email) if email else None
     now = datetime.utcnow()
+    password_fields = {
+        "password": password_hash,
+        "password_hash": password_hash,
+        "must_set_password": False,
+        "updated_at": now,
+    }
     if acc:
         await db[COL_ACCOUNTS].update_one(
             {"id": acc["id"]},
@@ -247,12 +258,12 @@ async def sync_account_password(db, user: Dict[str, Any], password_hash: str) ->
         )
         await db.users.update_many(
             {"account_id": acc["id"]},
-            {"$set": {"password": password_hash, "updated_at": now}},
+            {"$set": password_fields},
         )
     else:
         await db.users.update_one(
             {"id": user["id"]},
-            {"$set": {"password": password_hash, "updated_at": now}},
+            {"$set": password_fields},
         )
 
 

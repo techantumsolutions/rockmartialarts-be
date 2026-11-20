@@ -157,3 +157,10 @@ class CampRegVerifyPayment(_CampReg):
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
+
+
+class CampRegAdminStatusUpdate(_CampReg):
+    """Admin lead/enquiry status update for campaign registrations."""
+
+    status: str
+    note: Optional[str] = None

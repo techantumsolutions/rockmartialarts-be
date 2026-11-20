@@ -57,9 +57,12 @@ class BranchCourseController:
     @staticmethod
     async def get_by_branch(branch_id: str, available_only: bool = False, current_user: dict = None):
         db = get_db()
-        branch = await db.branches.find_one({"id": branch_id})
+        from controllers.branch_controller import BranchController
+
+        branch = await BranchController.resolve_branch_doc(db, branch_id)
         if not branch:
             raise HTTPException(status_code=404, detail="Branch not found")
+        branch_id = branch["id"]
         query = {"branch_id": branch_id}
         if available_only:
             query["is_available"] = True

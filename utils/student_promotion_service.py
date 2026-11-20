@@ -113,9 +113,137 @@ def _rock_admin(user: Optional[dict]) -> bool:
     return role in {"super_admin", "superadmin", "coach_admin"}
 
 
+def _is_rock_super_admin(user: Optional[dict]) -> bool:
+    role = str((user or {}).get("role") or "").lower()
+    return role in {"super_admin", "superadmin"}
+
+
 async def _partner_creator_ids(db, org_id: str) -> List[str]:
     ids = await db.users.distinct("id", {"partner_org_id": org_id})
     return [str(i) for i in (ids or []) if i]
+
+
+async def _attach_promotion_attribution(db, promotions: List[Optional[dict]]) -> List[Optional[dict]]:
+    """Add posted_by_academy / partner_org_name for SA list visibility."""
+    rows = [p for p in promotions if isinstance(p, dict)]
+    if not rows:
+        return promotions
+
+    org_ids: set = set()
+    creator_ids: set = set()
+    branch_ids: set = set()
+    for p in rows:
+        oid = str(p.get("partner_org_id") or "").strip()
+        if oid:
+            org_ids.add(oid)
+        cid = str(p.get("created_by") or "").strip()
+        if cid:
+            creator_ids.add(cid)
+        target = p.get("target") or {}
+        for bid in target.get("branch_ids") or []:
+            if bid:
+                branch_ids.add(str(bid))
+
+    creators: Dict[str, dict] = {}
+    if creator_ids:
+        async for u in db.users.find(
+            {"id": {"$in": list(creator_ids)}},
+            {"id": 1, "partner_org_id": 1, "role": 1, "branch_id": 1, "full_name": 1},
+        ):
+            creators[str(u.get("id"))] = u
+            poid = str(u.get("partner_org_id") or "").strip()
+            if poid:
+                org_ids.add(poid)
+            bid = str(u.get("branch_id") or "").strip()
+            if bid:
+                branch_ids.add(bid)
+
+    orgs: Dict[str, str] = {}
+    if org_ids:
+        async for org in db.partner_organizations.find(
+            {"id": {"$in": list(org_ids)}},
+            {"id": 1, "name": 1, "display_name": 1},
+        ):
+            orgs[str(org.get("id"))] = str(
+                org.get("display_name") or org.get("name") or org.get("id")
+            )
+
+    branches: Dict[str, dict] = {}
+    if branch_ids:
+        async for br in db.branches.find(
+            {"id": {"$in": list(branch_ids)}},
+            {"id": 1, "name": 1, "partner_org_id": 1},
+        ):
+            branches[str(br.get("id"))] = br
+            poid = str(br.get("partner_org_id") or "").strip()
+            if poid and poid not in orgs:
+                org_ids.add(poid)
+
+    if org_ids - set(orgs.keys()):
+        missing = list(org_ids - set(orgs.keys()))
+        async for org in db.partner_organizations.find(
+            {"id": {"$in": missing}},
+            {"id": 1, "name": 1, "display_name": 1},
+        ):
+            orgs[str(org.get("id"))] = str(
+                org.get("display_name") or org.get("name") or org.get("id")
+            )
+
+    for p in rows:
+        oid = str(p.get("partner_org_id") or "").strip()
+        creator = creators.get(str(p.get("created_by") or "").strip()) or {}
+        if not oid:
+            oid = str(creator.get("partner_org_id") or "").strip()
+        org_name = orgs.get(oid) if oid else None
+
+        branch_names: List[str] = []
+        for bid in (p.get("target") or {}).get("branch_ids") or []:
+            br = branches.get(str(bid))
+            if br:
+                name = str(br.get("name") or "").strip()
+                if name:
+                    branch_names.append(name)
+                if not oid:
+                    oid = str(br.get("partner_org_id") or "").strip()
+                    org_name = orgs.get(oid) if oid else org_name
+
+        creator_branch = ""
+        cbid = str(creator.get("branch_id") or "").strip()
+        if cbid and branches.get(cbid):
+            creator_branch = str(branches[cbid].get("name") or "").strip()
+
+        if org_name:
+            posted = org_name
+            owner = "partner"
+        elif creator_branch:
+            posted = creator_branch
+            owner = "academy"
+        elif branch_names:
+            posted = branch_names[0] if len(branch_names) == 1 else f"{len(branch_names)} academies"
+            owner = "academy"
+        else:
+            try:
+                from utils.email_layout import academy_display_name
+
+                posted = academy_display_name()
+            except Exception:
+                posted = "Rock Martial Arts Academy"
+            owner = "rock"
+
+        try:
+            from utils.platform_branding import format_academy_powered_by
+
+            posted = format_academy_powered_by(posted)
+        except Exception:
+            pass
+
+        p["partner_org_id"] = oid or None
+        p["partner_org_name"] = org_name
+        p["posted_by_academy"] = posted
+        p["owner_type"] = owner
+        p["source_branch_names"] = branch_names
+
+    return promotions
 
 
 async def partner_promotion_scope(db, user: Optional[dict]) -> Dict[str, Any]:
@@ -188,6 +316,9 @@ async def assert_promotion_access(db, doc: Optional[dict], user: Optional[dict])
         raise HTTPException(status_code=404, detail="Promotion not found")
     if not user:
         return
+    # Rock Super Admin can view/manage promotions from all academies / partners.
+    if _is_rock_super_admin(user):
+        return
     if is_partner_super_admin(user):
         if not await promotion_belongs_to_partner(db, doc, user):
             raise HTTPException(status_code=404, detail="Promotion not found")
@@ -236,6 +367,9 @@ async def list_student_promotions(
 
     if is_partner_super_admin(current_user):
         q = merge_and_clause(q, await partner_promotion_scope(db, current_user))
+    elif _is_rock_super_admin(current_user):
+        # Super Admin sees Rock + academy/partner promotions.
+        pass
     elif _rock_admin(current_user):
         q = merge_and_clause(q, await rock_promotion_scope(db))
 
@@ -265,6 +399,7 @@ async def list_student_promotions(
         .to_list(length=limit)
     )
     promotions = [enrich_student_promotion(r) for r in rows]
+    promotions = await _attach_promotion_attribution(db, promotions)
     if live_only:
         promotions = [p for p in promotions if p and p.get("is_live")]
         total = len(promotions)
@@ -290,7 +425,9 @@ async def get_student_promotion(
     if not doc:
         raise HTTPException(status_code=404, detail="Promotion not found")
     await assert_promotion_access(db, doc, current_user)
-    return {"promotion": enrich_student_promotion(doc)}
+    promo = enrich_student_promotion(doc)
+    await _attach_promotion_attribution(db, [promo])
+    return {"promotion": promo}
 
 
 async def create_student_promotion(

@@ -1,6 +1,7 @@
 from fastapi import HTTPException, Depends, status, Request, UploadFile
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
+from pathlib import Path
 import secrets
 import jwt
 import os
@@ -1181,20 +1182,32 @@ class AuthController:
         return {"message": "Profile updated successfully"}
 
     MAX_PROFILE_PHOTO_BYTES = 2 * 1024 * 1024  # ~2MB
-    PROFILE_PHOTO_TYPES = {"image/jpeg", "image/png"}
+    PROFILE_PHOTO_TYPES = {"image/jpeg", "image/png", "image/jpg", "image/webp"}
+    PROFILE_PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
 
     @staticmethod
     async def upload_student_profile_photo(file: UploadFile, current_user: dict):
-        """Save student profile photo (JPEG/PNG, max ~2MB); returns public path under /uploads/images/."""
-        if current_user.get("role") != "student":
+        """Save student profile photo (JPEG/PNG/WEBP, max ~2MB); returns public path under /uploads/images/."""
+        role = str(current_user.get("role") or "").lower().replace("-", "_")
+        if role != "student":
             raise HTTPException(status_code=403, detail="Only students can upload a profile photo")
 
+        filename = file.filename or "photo.jpg"
+        ext = Path(filename).suffix.lower().lstrip(".")
         content_type = (file.content_type or "").split(";")[0].strip().lower()
-        if content_type not in AuthController.PROFILE_PHOTO_TYPES:
+        # Browsers / WhatsApp often omit or send odd MIME — allow by extension too
+        type_ok = content_type in AuthController.PROFILE_PHOTO_TYPES or content_type in (
+            "",
+            "application/octet-stream",
+        )
+        ext_ok = ext in AuthController.PROFILE_PHOTO_EXTS
+        if not (ext_ok or (type_ok and content_type in AuthController.PROFILE_PHOTO_TYPES)):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid file type. Use JPG or PNG.",
+                detail="Invalid file type. Use JPG, PNG, or WEBP.",
             )
+        if not ext_ok:
+            ext = "jpg"
 
         data = await file.read()
         if len(data) > AuthController.MAX_PROFILE_PHOTO_BYTES:
@@ -1207,11 +1220,11 @@ class AuthController:
 
         dest_dir = UPLOAD_ROOT / "images"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        filename = file.filename or "photo.jpg"
         safe_name = _safe_filename(filename)
-        ext = safe_name.lower().rsplit(".", 1)[-1] if "." in safe_name else ""
-        if ext not in ("jpg", "jpeg", "png"):
-            safe_name = f"{safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name}.jpg"
+        cur_ext = safe_name.lower().rsplit(".", 1)[-1] if "." in safe_name else ""
+        if cur_ext not in AuthController.PROFILE_PHOTO_EXTS:
+            stem = safe_name.rsplit(".", 1)[0] if "." in safe_name else safe_name
+            safe_name = f"{stem}.{ext}"
 
         dest_path = dest_dir / safe_name
         dest_path.write_bytes(data)
